@@ -1,0 +1,205 @@
+package valhalla
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// Valhalla's native endpoint paths. Unlike the Stadia client this replaces,
+// both hang off one base URL: there is one server, not two vendor products.
+const (
+	isochronePath = "/isochrone"
+	matrixPath    = "/sources_to_targets"
+	statusPath    = "/status"
+)
+
+// DefaultTimeout bounds a single Valhalla call. A chain issues many of them
+// concurrently and the whole chain is bounded by the job's own context, so this
+// is about not letting one wedged request hold a slot in the fan-out
+// indefinitely.
+const DefaultTimeout = 30 * time.Second
+
+// HTTPClient talks to a Valhalla server over HTTP.
+//
+// There is no API key and no Authorization header. The server is a ClusterIP
+// service with no ingress, so the network is the authorization: only pods in
+// the cluster can reach it at all.
+type HTTPClient struct {
+	baseURL    string
+	httpClient *http.Client
+}
+
+var _ Client = (*HTTPClient)(nil)
+
+// NewHTTPClient builds a client for a Valhalla base URL, e.g.
+// http://valhalla:8002. A trailing slash is tolerated.
+func NewHTTPClient(baseURL string) *HTTPClient {
+	return &HTTPClient{
+		baseURL:    strings.TrimSuffix(baseURL, "/"),
+		httpClient: &http.Client{Timeout: DefaultTimeout},
+	}
+}
+
+// WithTimeout overrides the per-request timeout and returns the client for
+// chaining.
+func (c *HTTPClient) WithTimeout(d time.Duration) *HTTPClient {
+	c.httpClient.Timeout = d
+	return c
+}
+
+func (c *HTTPClient) Isochrone(ctx context.Context, req IsochroneRequest) (*IsochroneResponse, error) {
+	// Valhalla's contour time is in minutes and is minute-granular. The
+	// chainer never asks for less than a minute (see minIsoContourSecs there),
+	// so this truncation cannot produce the {"time": 0} that Valhalla rejects.
+	body := map[string]any{
+		"locations": []map[string]any{
+			{"lat": req.Origin.Lat, "lon": req.Origin.Lng},
+		},
+		"costing":  req.Costing,
+		"contours": []map[string]any{{"time": req.BudgetSecs / 60}},
+		"polygons": true,
+	}
+	var resp IsochroneResponse
+	if err := c.post(ctx, isochronePath, body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *HTTPClient) Matrix(ctx context.Context, req MatrixRequest) (*MatrixResponse, error) {
+	sources := make([]map[string]any, len(req.Origins))
+	for i, o := range req.Origins {
+		sources[i] = map[string]any{"lat": o.Lat, "lon": o.Lng}
+	}
+	targets := make([]map[string]any, len(req.Destinations))
+	for i, d := range req.Destinations {
+		targets[i] = map[string]any{"lat": d.Lat, "lon": d.Lng}
+	}
+	body := map[string]any{
+		"sources": sources,
+		"targets": targets,
+		"costing": req.Costing,
+	}
+	var resp MatrixResponse
+	if err := c.post(ctx, matrixPath, body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// statusBody is the default (non-verbose) /status response. Valhalla reports
+// more when service_limits.status.allow_verbose is on, which the deployed
+// container leaves off; the two fields below are present either way.
+type statusBody struct {
+	Version             string `json:"version"`
+	TilesetLastModified int64  `json:"tileset_last_modified"`
+}
+
+func (c *HTTPClient) Status(ctx context.Context) (Status, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+statusPath, nil)
+	if err != nil {
+		return Status{}, fmt.Errorf("%w: build status request: %v", ErrUpstream, err)
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return Status{}, fmt.Errorf("%w: %v", ErrUpstream, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return Status{}, classify(resp.StatusCode, readErrorBody(resp.Body))
+	}
+	var body statusBody
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return Status{}, fmt.Errorf("%w: decode status: %v", ErrUpstream, err)
+	}
+
+	out := Status{Version: body.Version}
+	if body.TilesetLastModified > 0 {
+		out.TilesetAt = time.Unix(body.TilesetLastModified, 0).UTC()
+	}
+	return out, nil
+}
+
+// errorBody is Valhalla's error shape. error_code is its own catalogue of
+// causes (150 is too many matrix pairs, 154 a pair too far apart); it is
+// carried into the message so a failed job says which limit it hit.
+type errorBody struct {
+	ErrorCode int    `json:"error_code"`
+	Error     string `json:"error"`
+}
+
+func (c *HTTPClient) post(ctx context.Context, path string, body, out any) error {
+	b, err := json.Marshal(body)
+	if err != nil {
+		// Marshalling a map we built ourselves cannot fail on input; treating
+		// this as permanent would misclassify a bug as the caller's fault.
+		return fmt.Errorf("%w: marshal request: %v", ErrUpstream, err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(b))
+	if err != nil {
+		return fmt.Errorf("%w: build request: %v", ErrUpstream, err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		// Unreachable, refused, timed out, context cancelled: all transient
+		// from this layer's point of view. A cancelled job is abandoned by the
+		// consumer before the retry decision is reached.
+		return fmt.Errorf("%w: %v", ErrUpstream, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return classify(resp.StatusCode, readErrorBody(resp.Body))
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("%w: decode response: %v", ErrUpstream, err)
+	}
+	return nil
+}
+
+// readErrorBody extracts Valhalla's error message, falling back to nothing
+// when the body is not the shape documented. Reads are bounded: an error body
+// is a sentence, and a server malfunctioning badly enough to stream megabytes
+// should not be able to exhaust this process's memory.
+func readErrorBody(r io.Reader) string {
+	raw, _ := io.ReadAll(io.LimitReader(r, 4096))
+	var body errorBody
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return strings.TrimSpace(string(raw))
+	}
+	if body.ErrorCode != 0 {
+		return fmt.Sprintf("%s (error_code %d)", body.Error, body.ErrorCode)
+	}
+	return body.Error
+}
+
+// classify maps an HTTP status onto the three failure modes callers act on.
+//
+// 400 is the only permanent one, and it is permanent because Valhalla returns
+// it for exactly the things that will not change on a retry: a contour past
+// the ceiling, too many matrix pairs, locations further apart than the costing
+// allows, a costing it does not implement. Everything else — including a 404,
+// which here means a path this client got wrong rather than a missing
+// resource — is treated as the server not answering, and retried.
+func classify(status int, msg string) error {
+	if msg == "" {
+		msg = fmt.Sprintf("status %d", status)
+	}
+	switch status {
+	case http.StatusBadRequest:
+		return fmt.Errorf("%w: %s", ErrBadRequest, msg)
+	case http.StatusTooManyRequests:
+		return fmt.Errorf("%w: %s", ErrRateLimit, msg)
+	default:
+		return fmt.Errorf("%w: status %d: %s", ErrUpstream, status, msg)
+	}
+}

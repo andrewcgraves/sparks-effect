@@ -1,0 +1,202 @@
+// Package valhalla is the routing seam: the isochrone and matrix calls the
+// chainer makes, the limits the server enforces on them, and two stand-in
+// implementations for when there is no server to call.
+//
+// It descends from the Stadia Maps client in sparks-effect-api. Stadia's API is
+// Valhalla's, so the request and response shapes carried over unchanged; what
+// changed is that there is no vendor to authenticate to any more. The server is
+// a ClusterIP service inside the home cluster, reachable only from the pod this
+// worker runs in, which is the whole reason the worker exists.
+package valhalla
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+)
+
+// The three failure modes a caller has to tell apart, because they decide
+// whether a routing job is retried or abandoned.
+//
+// The split is by cause, not by status code, and getting it wrong is the
+// failure mode that leaves a user watching a spinner forever: a permanent
+// failure requeued loops against a server with room for one chain, and a
+// transient failure abandoned fails a job that would have succeeded a second
+// later.
+var (
+	// ErrBadRequest is a request Valhalla refused to answer — a contour past
+	// the configured ceiling, too many matrix pairs, locations further apart
+	// than the mode allows. Permanent: the same bytes will be refused again.
+	ErrBadRequest = errors.New("valhalla: bad request")
+	// ErrRateLimit is the server declining to take more work right now.
+	// Transient by definition.
+	ErrRateLimit = errors.New("valhalla: rate limit exceeded")
+	// ErrUpstream is the server failing to answer — a 5xx, an unreachable
+	// address, a timeout. Transient: the server may well be back.
+	ErrUpstream = errors.New("valhalla: upstream error")
+)
+
+// Costing is Valhalla's word for a travel mode, and this package is the only
+// place the translation from the domain's own vocabulary happens. See
+// transit.TravelMode.
+type Costing string
+
+const (
+	CostingPedestrian Costing = "pedestrian"
+	CostingBicycle    Costing = "bicycle"
+	CostingAuto       Costing = "auto"
+)
+
+// LatLng is a WGS84 position. Lng, not Lon: the field is spelled the way the
+// rest of this codebase spells it, and the wire spelling is applied at the
+// point of marshalling.
+type LatLng struct {
+	Lat float64
+	Lng float64
+}
+
+type IsochroneRequest struct {
+	Origin     LatLng
+	Costing    Costing
+	BudgetSecs int
+}
+
+// IsochroneResponse is the raw GeoJSON FeatureCollection Valhalla returns.
+// Features carry polygon geometry and are preserved as raw JSON: nothing here
+// reads inside one, and parsing a polygon only to re-emit it would be a lossy
+// round trip for no gain.
+type IsochroneResponse struct {
+	Type     string            `json:"type"`
+	Features []json.RawMessage `json:"features"`
+}
+
+type MatrixRequest struct {
+	Origins      []LatLng
+	Destinations []LatLng
+	Costing      Costing
+}
+
+// MatrixCell holds travel time (seconds) for one origin→destination pair.
+// Time == -1 means unreachable.
+type MatrixCell struct {
+	Time     int     `json:"time"`
+	Distance float64 `json:"distance"`
+}
+
+type MatrixResponse struct {
+	// SourcesToTargets[i][j] is origin i → destination j.
+	SourcesToTargets [][]MatrixCell `json:"sources_to_targets"`
+}
+
+// Status is what /status reports about the server and the tiles it is serving.
+//
+// TilesetAt is the reason this call exists. It is the timestamp the isochrone
+// cache records alongside a cached polygon, so "is this shape from before the
+// last OSM refresh?" can be answered after the fact. Valhalla exposes it in the
+// default (non-verbose) response, so no server-side configuration is needed to
+// get at it.
+type Status struct {
+	Version   string
+	TilesetAt time.Time
+}
+
+// Client is the routing seam. Three calls, all of them read-only.
+type Client interface {
+	Isochrone(ctx context.Context, req IsochroneRequest) (*IsochroneResponse, error)
+	Matrix(ctx context.Context, req MatrixRequest) (*MatrixResponse, error)
+	// Status reports the server version and tileset timestamp. It is the one
+	// call that may legitimately be unsupported — the stand-in client has no
+	// tiles to describe — in which case it returns ErrNoStatus.
+	Status(ctx context.Context) (Status, error)
+}
+
+// ErrNoStatus reports a client with no tileset to describe. It is not a
+// failure of anything: the synthetic client computes polygons from arithmetic
+// and has never seen a tile.
+var ErrNoStatus = errors.New("valhalla: client reports no tileset status")
+
+// Limits are the request ceilings the server enforces, expressed as
+// configuration rather than constants.
+//
+// They were constants in sparks-effect-api, and the values there were Stadia
+// plan allowances rather than anything Valhalla does. The deployed container
+// enforces its own, some patched and some left at upstream defaults, and the
+// defaults below are those actual values. A limit exceeded is a 400, which is
+// permanent, so a wrong value here fails jobs rather than merely slowing them.
+type Limits struct {
+	// MaxMatrixPairs caps sources × targets in one matrix request. The chainer
+	// sends a single source, so in practice this caps destinations.
+	MaxMatrixPairs int
+	// MaxIsoContourMins caps a single isochrone time contour.
+	MaxIsoContourMins int
+	// MatrixBLineAutoKm and MatrixBLineOtherKm cap the straight-line distance
+	// between a matrix source and any target. Valhalla checks every pair and
+	// rejects the whole request on the first one over, so the chainer
+	// pre-filters destinations by this rather than discovering it as a 400.
+	MatrixBLineAutoKm  float64
+	MatrixBLineOtherKm float64
+	// MaxConcurrency bounds how many requests one chain has in flight at once.
+	// It is not a Valhalla limit but a courtesy to it: the egress fan-out is
+	// unbounded in the number of stations, and the server is small.
+	MaxConcurrency int
+}
+
+// Default limits, each matching what the deployed container actually enforces.
+//
+// The isochrone ceiling is patched. kustomize-config's valhalla.env sets
+// ISOCHRONE_MAX_TIME_MINUTES=320, applied to
+// service_limits.isochrone.max_time_contour by an init container on every pod
+// start. The 120 that sparks-effect-api hard-coded was Stadia's plan limit and
+// is nearly three times too strict here.
+//
+// The matrix limits are not patched, so Valhalla's own defaults apply.
+// max_matrix_location_pairs is 2500 for auto, pedestrian and bicycle alike, and
+// is enforced as sources × targets — so with one source, 2500 destinations. The
+// 600 inherited from Stadia was *tighter*, not looser: raising it to Valhalla's
+// real ceiling is what stops a large authored scenario being silently truncated
+// to its 600 nearest stations.
+//
+// max_matrix_distance is 400 km for auto and 200 km for pedestrian and bicycle,
+// which is exactly what the Stadia constants said. Those two numbers were right
+// all along, for a different reason than the comment beside them gave.
+//
+// One caveat on the matrix ceiling, and it is the reason this is configuration.
+// 2500 is read from current Valhalla — loki's matrix handler rejects
+// sources x targets > max_matrix_location_pairs — while kustomize-config's
+// deployment pins no version, running ghcr.io/valhalla/valhalla-scripted:latest.
+// Older builds enforced max_matrix_locations, default 50. If the running
+// container turns out to be one of those, this default converts what used to be
+// silent truncation into a 400 that fails whole chains, and
+// VALHALLA_MAX_MATRIX_PAIRS is how that is corrected without a release. Worth
+// confirming against the deployed pod rather than left to inference.
+const (
+	DefaultMaxMatrixPairs     = 2500
+	DefaultMaxIsoContourMins  = 320
+	DefaultMatrixBLineAutoKm  = 400.0
+	DefaultMatrixBLineOtherKm = 200.0
+	// DefaultMaxConcurrency matches the eight threads the routing host is sized
+	// for. Note that kustomize-config currently sets server_threads=2; a
+	// deployment that keeps that should lower this to match, which is exactly
+	// why it is configuration and not a constant.
+	DefaultMaxConcurrency = 8
+)
+
+// DefaultLimits returns the limits the deployed container enforces.
+func DefaultLimits() Limits {
+	return Limits{
+		MaxMatrixPairs:     DefaultMaxMatrixPairs,
+		MaxIsoContourMins:  DefaultMaxIsoContourMins,
+		MatrixBLineAutoKm:  DefaultMatrixBLineAutoKm,
+		MatrixBLineOtherKm: DefaultMatrixBLineOtherKm,
+		MaxConcurrency:     DefaultMaxConcurrency,
+	}
+}
+
+// BLineLimitKm reports the matrix b-line ceiling for one costing.
+func (l Limits) BLineLimitKm(c Costing) float64 {
+	if c == CostingAuto {
+		return l.MatrixBLineAutoKm
+	}
+	return l.MatrixBLineOtherKm
+}

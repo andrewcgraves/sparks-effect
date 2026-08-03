@@ -113,6 +113,11 @@ type GraphData interface {
 	// split into time aboard and time waiting to board, plus the service the
 	// rider boards. ok is false when no path exists.
 	TravelTimeBetween(fromSlug, toSlug string) (seconds, waitSecs int, serviceID string, ok bool)
+	// HasWait reports whether any service charges a boarding wait. It is on
+	// this interface, rather than read off the graph at the call site, because
+	// the chainer reports it as metadata and has no other reason to look
+	// inside a graph it is otherwise happy to treat as opaque.
+	HasWait() bool
 }
 
 // CompiledGraph adapts a decoded TransitGraph onto GraphData. It is the only

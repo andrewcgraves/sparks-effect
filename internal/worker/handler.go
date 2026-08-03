@@ -1,0 +1,206 @@
+// Package worker turns a queued message into a completed routing job.
+//
+// It is split in two on purpose. Handler owns what a job *is* — decode it,
+// compute it, record it — and reports how its failure should be treated.
+// Consumer owns the broker conversation: prefetch, acknowledgement, redelivery,
+// dead-lettering. Keeping them apart is what lets the whole of the job
+// lifecycle be tested without a broker, which is most of what there is to get
+// wrong here.
+package worker
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/routing"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/transit"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
+)
+
+// Outcome says what the broker should do with a delivery.
+//
+// The three-way split exists because the two failure cases need opposite
+// handling, and confusing them is the failure mode that leaves a user watching
+// a spinner forever. A permanent failure requeued loops against a server with
+// room for one chain at a time; a transient failure abandoned fails a job that
+// would have succeeded on the next attempt.
+type Outcome int
+
+const (
+	// OutcomeSucceeded: the result is written. Ack.
+	OutcomeSucceeded Outcome = iota
+	// OutcomePermanent: the job cannot be completed, ever, and has been marked
+	// failed. Ack — redelivering it would only reach the same conclusion.
+	OutcomePermanent
+	// OutcomeTransient: the job might succeed on another attempt. Requeue, up
+	// to a bound; on exhaustion the consumer dead-letters it and calls Fail.
+	OutcomeTransient
+)
+
+func (o Outcome) String() string {
+	switch o {
+	case OutcomeSucceeded:
+		return "succeeded"
+	case OutcomePermanent:
+		return "permanent"
+	case OutcomeTransient:
+		return "transient"
+	default:
+		return "unknown"
+	}
+}
+
+// Result is what one delivery came to.
+//
+// JobID is reported separately from the outcome because the consumer needs it
+// to mark the job failed once retries are exhausted, and by then the message
+// has already been decoded and discarded. It is empty only when the message was
+// too malformed to name a job — the one case where nothing can be recorded
+// anywhere, since there is no row to record it against.
+type Result struct {
+	Outcome Outcome
+	JobID   string
+	Err     error
+}
+
+// Handler computes one routing job per delivery.
+type Handler struct {
+	store   store.RoutingJobStore
+	routing valhalla.Client
+	limits  valhalla.Limits
+	log     *logger.Logger
+}
+
+// NewHandler builds the job handler.
+func NewHandler(s store.RoutingJobStore, routingClient valhalla.Client, limits valhalla.Limits, log *logger.Logger) *Handler {
+	return &Handler{store: s, routing: routingClient, limits: limits, log: log}
+}
+
+// Handle runs one message end to end: decode, mark running, chain, record.
+//
+// It never returns an error for the caller to interpret — the Result says what
+// to do, and Err is there for the log. Every path that abandons a job has
+// already marked it failed by the time it returns, so a caller that only acts
+// on Outcome cannot leave a row stuck in running.
+func (h *Handler) Handle(ctx context.Context, body []byte) Result {
+	msg, err := routing.Decode(body)
+	if err != nil {
+		// A message with no job id cannot be recorded against anything, so the
+		// log is the only place its death is visible. Everything else gets a
+		// failed row, which is what stops the caller polling.
+		if msg.RoutingJobID == "" {
+			h.log.Printf("routing: discarding unreadable message: %v", err)
+			return Result{Outcome: OutcomePermanent, Err: err}
+		}
+		return h.fail(ctx, msg.RoutingJobID, err)
+	}
+
+	h.log.Debugf("routing: job %s: mode=%s budget_mins=%d compile_job=%s",
+		msg.RoutingJobID, msg.Mode, msg.BudgetMins, msg.CompileJobID)
+
+	if err := h.store.MarkRunning(ctx, msg.RoutingJobID); err != nil {
+		// A row that is gone is gone: its compile job cascaded away, and there
+		// is nothing left to answer. Anything else — the database being down,
+		// a connection dropped — is worth another attempt.
+		if errors.Is(err, store.ErrJobNotFound) {
+			h.log.Printf("routing: job %s has no row; discarding", msg.RoutingJobID)
+			return Result{Outcome: OutcomePermanent, JobID: msg.RoutingJobID, Err: err}
+		}
+		return Result{Outcome: OutcomeTransient, JobID: msg.RoutingJobID, Err: err}
+	}
+
+	graph := transit.CompiledGraph{Graph: msg.Graph}
+	chainer := isochrone.New(h.routing, graph, h.limits, h.log)
+
+	resp, err := chainer.Chain(ctx, isochrone.ChainRequest{
+		Lat:          msg.Lat,
+		Lng:          msg.Lng,
+		BudgetMins:   msg.BudgetMins,
+		Mode:         msg.Mode,
+		CompileJobID: msg.CompileJobID,
+	})
+	if err != nil {
+		if isPermanent(err) {
+			return h.fail(ctx, msg.RoutingJobID, err)
+		}
+		// Deliberately not marked failed: the job is going back on the queue,
+		// and marking it failed now would tell a polling client it was over
+		// while another attempt was still to come. The consumer marks it failed
+		// if and when the retries run out.
+		h.log.Printf("routing: job %s failed transiently: %v", msg.RoutingJobID, err)
+		return Result{Outcome: OutcomeTransient, JobID: msg.RoutingJobID, Err: err}
+	}
+
+	result, err := json.Marshal(resp)
+	if err != nil {
+		// A result that will not serialise will not serialise on retry either.
+		return h.fail(ctx, msg.RoutingJobID, fmt.Errorf("routing: marshal result: %w", err))
+	}
+
+	if err := h.store.MarkSucceeded(ctx, msg.RoutingJobID, result); err != nil {
+		if errors.Is(err, store.ErrJobNotFound) {
+			h.log.Printf("routing: job %s has no row to complete; discarding", msg.RoutingJobID)
+			return Result{Outcome: OutcomePermanent, JobID: msg.RoutingJobID, Err: err}
+		}
+		// The chain succeeded and only the write failed, so retrying is
+		// worthwhile — and cheap to get wrong in the other direction, since a
+		// job acked here would be lost with its answer computed.
+		return Result{Outcome: OutcomeTransient, JobID: msg.RoutingJobID, Err: err}
+	}
+
+	h.log.Debugf("routing: job %s succeeded: %d features, %d reachable stations",
+		msg.RoutingJobID, len(resp.Features), len(resp.Metadata.ReachableStations))
+	return Result{Outcome: OutcomeSucceeded, JobID: msg.RoutingJobID}
+}
+
+// Fail marks a job failed, for the consumer to call when retries are exhausted.
+//
+// It exists on Handler rather than being done by the consumer against the store
+// directly so that there is one spelling of "this job is over" — the same
+// wording, the same logging, whether the cause was permanent from the start or
+// became permanent by running out of attempts.
+func (h *Handler) Fail(ctx context.Context, jobID string, cause error) {
+	h.fail(ctx, jobID, cause)
+}
+
+func (h *Handler) fail(ctx context.Context, jobID string, cause error) Result {
+	h.log.Printf("routing: job %s failed: %v", jobID, cause)
+	if err := h.store.MarkFailed(ctx, jobID, cause.Error()); err != nil {
+		// The job cannot be marked failed, so a client will keep polling a row
+		// that says running. Requeueing gives the write another chance; the
+		// original cause is preserved in the log above either way.
+		if !errors.Is(err, store.ErrJobNotFound) {
+			h.log.Printf("routing: job %s: recording failure failed: %v", jobID, err)
+			return Result{Outcome: OutcomeTransient, JobID: jobID, Err: err}
+		}
+	}
+	return Result{Outcome: OutcomePermanent, JobID: jobID, Err: cause}
+}
+
+// isPermanent reports whether an error will still be an error next time.
+//
+// The list is explicit rather than defaulting to permanent, because the
+// asymmetry matters: an unrecognised error retried a bounded number of times
+// costs a few seconds and then fails the job anyway, while an unrecognised
+// error treated as permanent throws away work that might well have succeeded.
+// Unknown therefore means transient.
+func isPermanent(err error) bool {
+	switch {
+	case errors.Is(err, routing.ErrUnsupportedSchema),
+		errors.Is(err, routing.ErrMalformedMessage),
+		errors.Is(err, isochrone.ErrInvalidMode),
+		// A request Valhalla refused: a contour past the ceiling, too many
+		// matrix pairs, locations too far apart. The same bytes will be
+		// refused again.
+		errors.Is(err, isochrone.ErrRoutingRejected),
+		errors.Is(err, store.ErrJobNotFound):
+		return true
+	default:
+		return false
+	}
+}

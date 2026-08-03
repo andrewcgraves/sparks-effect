@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/andrewcgraves/sparks-effect-api/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
 )
 
 func TestDebugf_noopWhenOff(t *testing.T) {
