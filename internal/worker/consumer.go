@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -206,7 +207,7 @@ func (c *Consumer) publish(queue string, d amqp.Delivery, headers amqp.Table) er
 func (c *Consumer) connect() (<-chan amqp.Delivery, error) {
 	conn, err := amqp.Dial(c.url)
 	if err != nil {
-		return nil, fmt.Errorf("routing: dial broker: %w", err)
+		return nil, fmt.Errorf("routing: dial broker: %w", redactDialErr(c.url, err))
 	}
 	ch, err := conn.Channel()
 	if err != nil {
@@ -247,6 +248,42 @@ func (c *Consumer) connect() (<-chan amqp.Delivery, error) {
 	c.conn, c.ch = conn, ch
 	c.mu.Unlock()
 	return deliveries, nil
+}
+
+// redactDialErr strips the AMQP URL's credentials out of a dial error.
+//
+// amqp091-go parses the URL with net/url, whose own parse errors embed the
+// full input string — password included — in their Error() text. A password
+// with an unescaped reserved character (a literal '%', '"', '^', ...) would
+// otherwise put the plaintext credential in whatever log line reports the
+// failure.
+func redactDialErr(rawURL string, err error) error {
+	cred := userinfo(rawURL)
+	if cred == "" {
+		return err
+	}
+	return errors.New(strings.ReplaceAll(err.Error(), cred, "***"))
+}
+
+// userinfo extracts the "user:pass" portion of an amqp(s) URL by hand rather
+// than with net/url, since a password net/url itself refuses to parse is
+// exactly the case this exists to handle. The delimiter is the last '@'
+// before the authority ends: the password may itself contain '@', but the
+// host may not.
+func userinfo(rawURL string) string {
+	schemeEnd := strings.Index(rawURL, "://")
+	if schemeEnd == -1 {
+		return ""
+	}
+	authority := rawURL[schemeEnd+3:]
+	if slash := strings.IndexByte(authority, '/'); slash != -1 {
+		authority = authority[:slash]
+	}
+	at := strings.LastIndexByte(authority, '@')
+	if at == -1 {
+		return ""
+	}
+	return authority[:at]
 }
 
 func (c *Consumer) closeOnErr(conn *amqp.Connection, ch *amqp.Channel, err error) error {
