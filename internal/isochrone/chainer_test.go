@@ -83,10 +83,11 @@ func cannedIso() *valhalla.IsochroneResponse {
 	}
 }
 
-// newChainer builds a chainer at the limits the deployed container enforces.
-// Cases that are *about* a limit override the one they exercise.
+// newChainer builds a chainer at the limits the deployed container enforces,
+// caching nothing. Cases that are *about* a limit override the one they
+// exercise; cases about reuse live in cache_test.go and build their own.
 func newChainer(client valhalla.Client, graph transit.GraphData) isochrone.Chainer {
-	return isochrone.New(client, graph, valhalla.DefaultLimits(), logger.Discard())
+	return isochrone.New(client, graph, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.Discard())
 }
 
 func req(budgetMins int, mode transit.TravelMode) isochrone.ChainRequest {
@@ -320,7 +321,7 @@ func TestChainer_egressFanOutIsBoundedByConfiguration(t *testing.T) {
 
 	limits := valhalla.DefaultLimits()
 	limits.MaxConcurrency = concurrency
-	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes}, limits, logger.Discard())
+	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes}, limits, isochrone.EgressCache{}, logger.Discard())
 
 	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("Chain: %v", err)
@@ -464,7 +465,7 @@ func TestChainer_matrixPairCap_truncates(t *testing.T) {
 		IsochroneResp: cannedIso(),
 		MatrixResp:    &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{cells[:cap]}},
 	}
-	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes}, limits, logger.Discard())
+	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes}, limits, isochrone.EgressCache{}, logger.Discard())
 
 	if _, err := chainer.Chain(context.Background(), req(9999, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("Chain: %v", err)

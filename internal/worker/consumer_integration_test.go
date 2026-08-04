@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	amqp "github.com/rabbitmq/amqp091-go"
 
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/testsupport"
@@ -36,6 +37,9 @@ type harness struct {
 	ch     *amqp.Channel
 	client valhalla.Client
 	url    string
+	// tilesetAt is what main reads off the routing server once at startup and
+	// stamps on every cache row. Fixed here so a test can assert it landed.
+	tilesetAt time.Time
 }
 
 func newHarness(t *testing.T, client valhalla.Client) *harness {
@@ -43,7 +47,10 @@ func newHarness(t *testing.T, client valhalla.Client) *harness {
 	pool := testsupport.Postgres(t)
 	url, ch := testsupport.Broker(t)
 	testsupport.ResetQueues(t, ch, testQueue, testDeadLetter)
-	return &harness{pool: pool, ch: ch, client: client, url: url}
+	return &harness{
+		pool: pool, ch: ch, client: client, url: url,
+		tilesetAt: time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC),
+	}
 }
 
 // run starts a consumer and returns handles to stop it two ways.
@@ -54,7 +61,11 @@ func newHarness(t *testing.T, client valhalla.Client) *harness {
 // makes the broker redeliver it.
 func (h *harness) run(t *testing.T, maxRetries int) (stop, kill func()) {
 	t.Helper()
-	handler := worker.NewHandler(store.NewRepo(h.pool), h.client, valhalla.DefaultLimits(), logger.Discard())
+	// One repo in both roles, exactly as main wires it: results are written
+	// through it and egress polygons are reused through it.
+	repo := store.NewRepo(h.pool)
+	cache := isochrone.EgressCache{Store: repo, TilesetAt: h.tilesetAt}
+	handler := worker.NewHandler(repo, h.client, valhalla.DefaultLimits(), cache, logger.Discard())
 	consumer := worker.NewConsumer(h.url, testQueue, testDeadLetter, maxRetries, handler, logger.Discard())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -140,6 +151,92 @@ func TestEndToEnd_publishedJobIsComputedAndRecorded(t *testing.T) {
 	if got := testsupport.QueueDepth(t, h.ch, testDeadLetter); got != 0 {
 		t.Errorf("dead-letter depth = %d, want 0", got)
 	}
+}
+
+// countingClient counts the isochrone calls that reach the routing server. It
+// wraps a real client rather than replacing one because what a cached chain has
+// to produce is the same answer, not merely fewer calls.
+type countingClient struct {
+	valhalla.Client
+	isochroneCalls atomic.Int32
+}
+
+func (c *countingClient) Isochrone(ctx context.Context, req valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
+	c.isochroneCalls.Add(1)
+	return c.Client.Isochrone(ctx, req)
+}
+
+// Reuse, end to end: two routing jobs over one publication, through a real
+// broker and a real database. The second makes the single call the first one's
+// cache could not save it — the origin polygon, which starts where the user
+// clicked and is nobody else's to share.
+func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
+	const secondJobID = "7a0620ff-8b86-d011-b42d-00c04fc964ff"
+
+	client := &countingClient{Client: valhalla.NewSyntheticClient()}
+	h := newHarness(t, client)
+	testsupport.SeedRoutingJob(t, h.pool, goldenJobID, goldenCompileID)
+
+	stop, _ := h.run(t, 3)
+	defer stop()
+
+	testsupport.Publish(t, h.ch, testQueue, goldenMessage(t))
+	h.waitForStatus(t, goldenJobID, store.StatusSucceeded)
+	coldCalls := client.isochroneCalls.Load()
+
+	cached := testsupport.IsochroneCacheCount(t, h.pool, goldenCompileID)
+	if cached == 0 {
+		t.Fatal("the completed job cached no egress polygons")
+	}
+	// Everything but the origin call should have left a row behind.
+	if want := int(coldCalls) - 1; cached != want {
+		t.Errorf("cached %d polygons against %d isochrone calls, want %d (all but the origin)", cached, coldCalls, want)
+	}
+	for _, at := range testsupport.IsochroneCacheStamps(t, h.pool, goldenCompileID) {
+		if at == nil || !at.Equal(h.tilesetAt) {
+			t.Errorf("cache row stamped %v, want the server's tileset %s", at, h.tilesetAt)
+		}
+	}
+
+	// A second job: same publication, same click, same budget — a different
+	// user asking the same question.
+	testsupport.SeedRoutingJob(t, h.pool, secondJobID, goldenCompileID)
+	client.isochroneCalls.Store(0)
+	testsupport.Publish(t, h.ch, testQueue,
+		mutateGolden(t, func(m map[string]any) { m["routing_job_id"] = secondJobID }))
+	h.waitForStatus(t, secondJobID, store.StatusSucceeded)
+	warmCalls := client.isochroneCalls.Load()
+
+	if warmCalls >= coldCalls {
+		t.Errorf("warm job made %d isochrone calls against a cold %d; the cache saved nothing", warmCalls, coldCalls)
+	}
+	if warmCalls != 1 {
+		t.Errorf("warm job made %d isochrone calls, want 1 (the origin)", warmCalls)
+	}
+
+	// Cheaper, and the same answer.
+	_, _, coldResult := testsupport.RoutingJobStatus(t, h.pool, goldenJobID)
+	_, _, warmResult := testsupport.RoutingJobStatus(t, h.pool, secondJobID)
+	if len(features(t, coldResult)) != len(features(t, warmResult)) {
+		t.Errorf("warm result has %d features, cold has %d",
+			len(features(t, warmResult)), len(features(t, coldResult)))
+	}
+
+	// Nothing new to write the second time round.
+	if got := testsupport.IsochroneCacheCount(t, h.pool, goldenCompileID); got != cached {
+		t.Errorf("cache holds %d rows after the warm job, want the %d the cold one left", got, cached)
+	}
+}
+
+func features(t *testing.T, result []byte) []any {
+	t.Helper()
+	var parsed struct {
+		Features []any `json:"features"`
+	}
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("result is not valid JSON: %v", err)
+	}
+	return parsed.Features
 }
 
 // A permanent failure marks the job failed and does not requeue. Redelivering

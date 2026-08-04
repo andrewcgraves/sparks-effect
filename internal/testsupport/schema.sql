@@ -17,16 +17,15 @@
 -- The owning tables are cut down to what the foreign keys need. Keeping the
 -- keys real is the point — a cascade that deletes a routing job out from under
 -- an in-flight message is a case the worker has to handle, and it cannot be
--- exercised against a table with the references stripped out.
---
--- isochrone_cache is deliberately absent. The real migration creates it, but
--- nothing in this repository reads or writes it yet — the result cache is
--- SPA-186 — and a table here that no test touches would be scenery.
+-- exercised against a table with the references stripped out. The same goes for
+-- isochrone_cache: a cached polygon outliving the graph it was plotted over is
+-- exactly what the foreign key is there to prevent, so the key is real here too.
 
 -- CASCADE, because the throwaway database is not guaranteed to hold only what
 -- this file created: a run against a database an older schema touched — or one
 -- the real migration was applied to — leaves tables referencing jobs that are
 -- not named here, and a plain DROP would fail on them rather than resetting.
+DROP TABLE IF EXISTS isochrone_cache CASCADE;
 DROP TABLE IF EXISTS routing_jobs CASCADE;
 DROP TABLE IF EXISTS jobs CASCADE;
 DROP TABLE IF EXISTS users CASCADE;
@@ -55,3 +54,16 @@ CREATE TABLE routing_jobs (
 );
 
 CREATE INDEX routing_jobs_status_idx ON routing_jobs (status);
+
+CREATE TABLE isochrone_cache (
+    compile_job_id uuid NOT NULL REFERENCES jobs (id) ON DELETE CASCADE,
+    station_slug   text NOT NULL,
+    mode           text NOT NULL,
+    contour_mins   integer NOT NULL,
+    geometry       jsonb NOT NULL,
+    -- Diagnostic only, deliberately not part of the key. Nullable, because the
+    -- synthetic routing client has no tiles to describe.
+    tileset_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (compile_job_id, station_slug, mode, contour_mins)
+);

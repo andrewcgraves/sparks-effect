@@ -12,6 +12,7 @@ import (
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/geo"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/transit"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
@@ -72,6 +73,7 @@ type chainImpl struct {
 	routing valhalla.Client
 	graph   transit.GraphData
 	limits  valhalla.Limits
+	cache   EgressCache
 	log     *logger.Logger
 }
 
@@ -81,8 +83,12 @@ type chainImpl struct {
 // chainer's whole life is one message: the worker builds one, computes one
 // isochrone with it, and discards it. There is no store to consult and nothing
 // to resolve, which is what the queue message carrying the graph inline bought.
-func New(routingClient valhalla.Client, graph transit.GraphData, limits valhalla.Limits, log *logger.Logger) Chainer {
-	return &chainImpl{routing: routingClient, graph: graph, limits: limits, log: log}
+//
+// The cache outlives the chainer, unlike everything else here — it is shared
+// across messages, which is the entire point of it. A zero EgressCache disables
+// reuse; see its documentation.
+func New(routingClient valhalla.Client, graph transit.GraphData, limits valhalla.Limits, cache EgressCache, log *logger.Logger) Chainer {
+	return &chainImpl{routing: routingClient, graph: graph, limits: limits, cache: cache, log: log}
 }
 
 // approxAccessReachKm bounds how far a station can be and still be worth asking
@@ -146,7 +152,7 @@ func (c *chainImpl) Chain(ctx context.Context, req ChainRequest) (*ChainResponse
 	egressCandidates := c.bestEgressPerNode(req, nodes, accessSecs)
 	c.log.Debugf("chain: egress fan-out %d candidates", len(egressCandidates))
 
-	egressIsos, err := c.egressIsochrones(ctx, costing, egressCandidates)
+	egressIsos, err := c.egressIsochrones(ctx, req, costing, egressCandidates)
 	if err != nil {
 		return nil, err
 	}
@@ -315,19 +321,61 @@ func (c *chainImpl) bestEgressPerNode(
 	return candidates
 }
 
-// egressIsochrones fetches one polygon per reachable station, bounded.
+// egressIsochrones produces one polygon per reachable station, reusing whatever
+// the cache already holds and computing the rest.
 //
-// The bound is the reason this is not a plain errgroup: the fan-out is as wide
-// as the graph has reachable stations, and the routing server is a single small
-// container. Without it, one large scenario would open hundreds of concurrent
-// requests against a server sized for a handful.
+// This is where the caching pays: the fan-out is the bulk of a chain's routing
+// work — one call per reachable station against two for everything else — and
+// every one of those calls starts from a station the publication fixed in
+// place. See EgressCache.
+//
+// The computed remainder is bounded rather than run as a plain errgroup: the
+// fan-out is as wide as the graph has reachable stations, and the routing server
+// is a single small container. Without the bound, one large scenario would open
+// hundreds of concurrent requests against a server sized for a handful.
 func (c *chainImpl) egressIsochrones(
 	ctx context.Context,
+	req ChainRequest,
 	costing valhalla.Costing,
 	candidates []egressCandidate,
 ) ([]*valhalla.IsochroneResponse, error) {
 	isos := make([]*valhalla.IsochroneResponse, len(candidates))
 	if len(candidates) == 0 {
+		return isos, nil
+	}
+
+	// Truncation to the contour ceiling is silent and unflagged: it needs a
+	// budget over the ceiling plus access time to trigger, and a ceiling-sized
+	// egress polygon is a fine answer to an over-ceiling ask. Only the origin
+	// reports clamping, since that is the number the caller actually chose.
+	//
+	// The clamped value is also what the key carries, so every budget that
+	// clamps to the same contour shares one row rather than storing the same
+	// shape once per budget. The key is therefore the only place the contour is
+	// kept: what was asked of Valhalla and what was cached cannot drift apart
+	// if there is only one of them.
+	keys := make([]store.IsochroneKey, len(candidates))
+	for i, ec := range candidates {
+		keys[i] = store.IsochroneKey{
+			CompileJobID: req.CompileJobID,
+			StationSlug:  ec.node.Slug,
+			Mode:         string(req.Mode),
+			ContourMins:  c.clampToContourCeilingSecs(ec.remainingMins*60) / 60,
+		}
+	}
+
+	hits := c.cache.lookup(ctx, keys, c.log)
+
+	var misses []int
+	for i := range candidates {
+		if iso, ok := hits[keys[i]]; ok {
+			isos[i] = iso
+			continue
+		}
+		misses = append(misses, i)
+	}
+	c.log.Debugf("chain: egress cache %d hits, %d misses", len(candidates)-len(misses), len(misses))
+	if len(misses) == 0 {
 		return isos, nil
 	}
 
@@ -339,18 +387,12 @@ func (c *chainImpl) egressIsochrones(
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
 
-	for i, ec := range candidates {
-		i, ec := i, ec
+	for _, i := range misses {
 		g.Go(func() error {
-			// Truncation here is silent and unflagged: it needs a budget over
-			// the contour ceiling plus access time to trigger, and a
-			// ceiling-sized egress polygon is a fine answer to an over-ceiling
-			// ask. Only the origin reports clamping, since that is the number
-			// the caller actually chose.
 			iso, isoErr := c.routing.Isochrone(gctx, valhalla.IsochroneRequest{
-				Origin:     valhalla.LatLng{Lat: ec.node.Lat, Lng: ec.node.Lng},
+				Origin:     valhalla.LatLng{Lat: candidates[i].node.Lat, Lng: candidates[i].node.Lng},
 				Costing:    costing,
-				BudgetSecs: c.clampToContourCeilingSecs(ec.remainingMins * 60),
+				BudgetSecs: keys[i].ContourMins * 60,
 			})
 			if isoErr != nil {
 				return wrapRoutingErr(isoErr)
@@ -363,6 +405,11 @@ func (c *chainImpl) egressIsochrones(
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
+
+	// Written on ctx rather than gctx: the errgroup's context is cancelled the
+	// moment Wait returns, and cancelling the write would discard work that has
+	// already succeeded.
+	c.cache.record(ctx, keys, isos, misses, c.log)
 	return isos, nil
 }
 

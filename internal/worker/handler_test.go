@@ -10,11 +10,16 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/worker"
 )
+
+// goldenCompileJobID is the compile job the golden message names — the identity
+// every cache key from that message has to carry.
+const goldenCompileJobID = "0f3b7c2a-4d1e-4a5b-9c8d-2e6f1a0b3c4d"
 
 // fakeStore records the transitions a job was driven through, in order.
 //
@@ -99,7 +104,59 @@ func mutateGolden(t *testing.T, mut func(m map[string]any)) []byte {
 }
 
 func newHandler(s store.RoutingJobStore, client valhalla.Client) *worker.Handler {
-	return worker.NewHandler(s, client, valhalla.DefaultLimits(), logger.Discard())
+	return worker.NewHandler(s, client, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.Discard())
+}
+
+// recordingCache is the thinnest thing that answers as a cache: it holds
+// nothing and remembers what it was asked. Whether reuse *works* is settled in
+// internal/isochrone against a real one; what is in question here is only
+// whether the handler hands its cache down to the chain it builds.
+type recordingCache struct {
+	mu   sync.Mutex
+	gets []store.IsochroneKey
+}
+
+var _ store.IsochroneCache = (*recordingCache)(nil)
+
+func (r *recordingCache) Get(_ context.Context, keys []store.IsochroneKey) (map[store.IsochroneKey]json.RawMessage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gets = append(r.gets, keys...)
+	return nil, nil
+}
+
+func (r *recordingCache) Put(context.Context, []store.CachedIsochrone) error { return nil }
+
+func (r *recordingCache) asked() []store.IsochroneKey {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]store.IsochroneKey(nil), r.gets...)
+}
+
+// The cache is configured on the handler but consulted by the chainer it builds
+// per message, so the two are only connected if the handler passes it through.
+func TestHandle_consultsTheEgressCacheForTheMessagesCompileJob(t *testing.T) {
+	s := &fakeStore{}
+	cache := &recordingCache{}
+	h := worker.NewHandler(s, valhalla.NewSyntheticClient(), valhalla.DefaultLimits(),
+		isochrone.EgressCache{Store: cache}, logger.Discard())
+
+	if res := h.Handle(context.Background(), goldenMessage(t)); res.Outcome != worker.OutcomeSucceeded {
+		t.Fatalf("Outcome = %v (err %v), want succeeded", res.Outcome, res.Err)
+	}
+
+	asked := cache.asked()
+	if len(asked) == 0 {
+		t.Fatal("the cache was never consulted; the handler is not passing it to the chainer")
+	}
+	for _, k := range asked {
+		if k.CompileJobID != goldenCompileJobID {
+			t.Errorf("looked up compile job %q, want the message's %q", k.CompileJobID, goldenCompileJobID)
+		}
+		if k.Mode != "walk" {
+			t.Errorf("looked up mode %q, want the message's walk", k.Mode)
+		}
+	}
 }
 
 // The whole point of the worker: a message the API published becomes a

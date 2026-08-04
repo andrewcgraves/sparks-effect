@@ -73,12 +73,26 @@ type Handler struct {
 	store   store.RoutingJobStore
 	routing valhalla.Client
 	limits  valhalla.Limits
+	cache   isochrone.EgressCache
 	log     *logger.Logger
 }
 
 // NewHandler builds the job handler.
-func NewHandler(s store.RoutingJobStore, routingClient valhalla.Client, limits valhalla.Limits, log *logger.Logger) *Handler {
-	return &Handler{store: s, routing: routingClient, limits: limits, log: log}
+//
+// The cache is passed in rather than derived from s, even though in production
+// both are the same *store.Repo. The two are separate concerns — one is where
+// the answer goes, the other is a saving on how it is arrived at — and a
+// handler wired for one is legitimately run without the other, which a shared
+// argument would make impossible to express. A zero EgressCache computes every
+// polygon; see its documentation.
+func NewHandler(
+	s store.RoutingJobStore,
+	routingClient valhalla.Client,
+	limits valhalla.Limits,
+	cache isochrone.EgressCache,
+	log *logger.Logger,
+) *Handler {
+	return &Handler{store: s, routing: routingClient, limits: limits, cache: cache, log: log}
 }
 
 // Handle runs one message end to end: decode, mark running, chain, record.
@@ -115,7 +129,7 @@ func (h *Handler) Handle(ctx context.Context, body []byte) Result {
 	}
 
 	graph := transit.CompiledGraph{Graph: msg.Graph}
-	chainer := isochrone.New(h.routing, graph, h.limits, h.log)
+	chainer := isochrone.New(h.routing, graph, h.limits, h.cache, h.log)
 
 	resp, err := chainer.Chain(ctx, isochrone.ChainRequest{
 		Lat:          msg.Lat,

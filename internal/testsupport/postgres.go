@@ -13,6 +13,7 @@ import (
 	_ "embed"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -67,16 +68,86 @@ func Postgres(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// SeedCompileJob inserts the compile job row that routing_jobs and
+// isochrone_cache both reference. Standalone because the cache is keyed on a
+// compile job and has no interest in any particular routing job.
+func SeedCompileJob(t *testing.T, pool *pgxpool.Pool, compileJobID string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO jobs (id) VALUES ($1) ON CONFLICT DO NOTHING`, compileJobID); err != nil {
+		t.Fatalf("seeding compile job: %v", err)
+	}
+}
+
+// DeleteCompileJob removes a compile job, exercising the cascade that a deleted
+// scenario or service triggers in the real schema.
+func DeleteCompileJob(t *testing.T, pool *pgxpool.Pool, compileJobID string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		`DELETE FROM jobs WHERE id = $1`, compileJobID); err != nil {
+		t.Fatalf("deleting compile job: %v", err)
+	}
+}
+
+// IsochroneCacheTilesetAt reads back the tileset stamp on one cache row, which
+// is written but never read by the lookup path — so only a test that goes
+// behind the store can see whether it landed.
+func IsochroneCacheTilesetAt(t *testing.T, pool *pgxpool.Pool, compileJobID, stationSlug, mode string, contourMins int) *time.Time {
+	t.Helper()
+	var at *time.Time
+	row := pool.QueryRow(context.Background(),
+		`SELECT tileset_at FROM isochrone_cache
+		  WHERE compile_job_id = $1 AND station_slug = $2 AND mode = $3 AND contour_mins = $4`,
+		compileJobID, stationSlug, mode, contourMins)
+	if err := row.Scan(&at); err != nil {
+		t.Fatalf("reading tileset_at for %s/%s: %v", compileJobID, stationSlug, err)
+	}
+	return at
+}
+
+// IsochroneCacheStamps returns the tileset stamp on every row held for one
+// compile job, nulls included.
+func IsochroneCacheStamps(t *testing.T, pool *pgxpool.Pool, compileJobID string) []*time.Time {
+	t.Helper()
+	rows, err := pool.Query(context.Background(),
+		`SELECT tileset_at FROM isochrone_cache WHERE compile_job_id = $1`, compileJobID)
+	if err != nil {
+		t.Fatalf("reading tileset stamps for %s: %v", compileJobID, err)
+	}
+	defer rows.Close()
+
+	var stamps []*time.Time
+	for rows.Next() {
+		var at *time.Time
+		if err := rows.Scan(&at); err != nil {
+			t.Fatalf("scanning tileset stamp: %v", err)
+		}
+		stamps = append(stamps, at)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("reading tileset stamps for %s: %v", compileJobID, err)
+	}
+	return stamps
+}
+
+// IsochroneCacheCount counts the rows held for one compile job.
+func IsochroneCacheCount(t *testing.T, pool *pgxpool.Pool, compileJobID string) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM isochrone_cache WHERE compile_job_id = $1`, compileJobID).Scan(&n); err != nil {
+		t.Fatalf("counting cache rows for %s: %v", compileJobID, err)
+	}
+	return n
+}
+
 // SeedRoutingJob inserts a queued routing job — and the compile job its foreign
 // key requires — mirroring what sparks-effect-api does before it publishes.
 func SeedRoutingJob(t *testing.T, pool *pgxpool.Pool, jobID, compileJobID string) {
 	t.Helper()
 	ctx := context.Background()
 
-	if _, err := pool.Exec(ctx,
-		`INSERT INTO jobs (id) VALUES ($1) ON CONFLICT DO NOTHING`, compileJobID); err != nil {
-		t.Fatalf("seeding compile job: %v", err)
-	}
+	SeedCompileJob(t, pool, compileJobID)
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO routing_jobs (id, status, compile_job_id, lat, lng, budget_mins, mode)
 		 VALUES ($1, $2, $3, 37.79, -122.397, 45, 'walk')`,

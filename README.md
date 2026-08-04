@@ -42,6 +42,52 @@ stops the two hand-maintained copies of the struct drifting apart.
   unioned into one reachability surface. Moved here wholesale from the API.
 - **The graph model** (`internal/transit`) — enough of the compiled-graph types
   to decode one and run Dijkstra over it, and no more.
+- **The egress cache** (`internal/store`) — the polygons a chain would otherwise
+  recompute, keyed on the publication.
+
+## Caching egress polygons
+
+A chain makes three kinds of routing call, and they are not equally cacheable.
+The origin isochrone and the access matrix both start from wherever the user
+clicked, so they are as particular as the click is. The egress isochrones start
+from station positions, which the publication fixed — and they are the bulk of
+the work, one call per reachable station against two for everything else.
+
+The key is `(compile_job_id, station_slug, mode, contour_mins)`.
+
+Keying on the publication is what makes this correct with no invalidation
+machinery at all. A published scenario is frozen and its stations cannot move,
+and editing an authored service produces a *new* compile with a new id — so a
+recompile rotates the whole cache generation on its own and the previous one
+simply stops being read. Nothing is ever purged, and there is no invalidation
+step for anyone to forget to fire. Rows disappear with their compile job, by
+foreign key.
+
+`contour_mins` is the contour actually asked of Valhalla, after clamping to the
+server's ceiling, so every budget that clamps to the same contour shares one row.
+`mode` is the domain's vocabulary — walk / bike / drive — matching the column;
+Valhalla's "costing" stays at the client boundary.
+
+**Accepted risk.** A Valhalla tile rebuild changes every polygon without
+changing any compile job, and nothing here detects that. Rebuilds are rare and
+are already a deliberate operator ritual. To keep it diagnosable, each row
+records the server's tileset timestamp as *data only* — never part of the key,
+because keying on it would silently invalidate the entire cache on every rebuild.
+The stamp is read once at startup, so a rebuild under a running worker keeps
+stamping the old timestamp until the pod restarts.
+
+The cache is an optimisation over work the worker can always do itself, so
+nothing about it can fail a job: a miss, an entry that will not parse, or a
+database that cannot be reached all mean the same thing — compute the polygon,
+and log that the cache is not working.
+
+**Synthetic and real polygons share one keyspace.** Nothing in the key says
+which backend drew the shape, so a worker started with `VALHALLA_URL` unset
+against a database another worker warmed will serve real polygons, and one
+started *with* it against a database warmed synthetically will serve circles.
+Locally that is what the throwaway database is for; anywhere shared, treat
+switching `VALHALLA_URL` as needing the cache cleared. A NULL `tileset_at` is
+the tell — synthetic rows have never seen a tile.
 
 ## Failure handling
 
