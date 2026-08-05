@@ -59,6 +59,26 @@ type ReachableStation struct {
 	ViaService    string `json:"via_service,omitempty"`
 }
 
+// StarterWalk is the routed access leg: the walk from the request's origin to
+// the station the rider boards at.
+//
+// It exists because the matrix that timed that leg reports time and distance
+// and nothing else. Valhalla did follow the street network to produce the
+// number, and this is the same leg asked again as a route so that the shape is
+// kept. Drawing it rather than a straight segment closes three gaps at once:
+// the line follows streets instead of cutting across them, it starts where
+// Valhalla snapped the origin rather than at the raw point the user gave, and
+// it ends at the graph node the timing was measured to rather than at whatever
+// the station's row says now.
+//
+// Only the starter station has one. Every other station is reached by riding,
+// and its egress isochrone already says what that buys.
+type StarterWalk struct {
+	StationSlug string `json:"station_slug"`
+	// Geometry is a GeoJSON LineString in [lng, lat] order, ready to draw.
+	Geometry json.RawMessage `json:"geometry"`
+}
+
 // ChainMetadata describes how the surface below it was arrived at.
 //
 // CompileJobID replaces the scenario slug the API's version reported. The
@@ -74,6 +94,10 @@ type ChainMetadata struct {
 	WaitModel          string             `json:"wait_model"`
 	OriginIsoClamped   bool               `json:"origin_iso_clamped,omitempty"`
 	OriginIsoAvailable bool               `json:"origin_iso_available"`
+	// StarterWalk is absent when there was no station to walk to, and also
+	// when the route call for one failed. Its absence is never a reason to
+	// distrust the surface above it — see chainer.starterWalk.
+	StarterWalk *StarterWalk `json:"starter_walk,omitempty"`
 }
 
 // ChainResponse is a GeoJSON FeatureCollection plus the accounting behind it.

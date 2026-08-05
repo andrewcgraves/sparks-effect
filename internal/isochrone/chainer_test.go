@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -959,4 +960,314 @@ func findStation(t *testing.T, resp *isochrone.ChainResponse, slug string) isoch
 	}
 	t.Fatalf("%q not in ReachableStations (%+v)", slug, resp.Metadata.ReachableStations)
 	return isochrone.ReachableStation{}
+}
+
+// cannedRoute is a routed shape that is unmistakably not a two-point segment:
+// it bends, the way a walk along streets does, and its endpoints are Valhalla's
+// snapped ones rather than either of the points that were asked about.
+func cannedRoute() *valhalla.RouteResponse {
+	return &valhalla.RouteResponse{Shape: []valhalla.LatLng{
+		{Lat: 37.7001, Lng: -122.4002},
+		{Lat: 37.7040, Lng: -122.4002},
+		{Lat: 37.7040, Lng: -122.3930},
+		{Lat: 37.7098, Lng: -122.3901},
+	}}
+}
+
+// starterWalkGeometry decodes the LineString the chain reports, so a case can
+// assert on coordinates rather than on bytes.
+func starterWalkGeometry(t *testing.T, walk *isochrone.StarterWalk) [][]float64 {
+	t.Helper()
+	if walk == nil {
+		t.Fatal("StarterWalk is nil")
+	}
+	var geom struct {
+		Type        string      `json:"type"`
+		Coordinates [][]float64 `json:"coordinates"`
+	}
+	if err := json.Unmarshal(walk.Geometry, &geom); err != nil {
+		t.Fatalf("unmarshal starter walk geometry: %v", err)
+	}
+	if geom.Type != "LineString" {
+		t.Errorf("geometry type = %q, want LineString", geom.Type)
+	}
+	return geom.Coordinates
+}
+
+// The point of the whole ticket: what is drawn is the shape that was walked,
+// not the chord across whatever lies between the two points.
+func TestChainer_starterWalkCarriesTheRoutedShape(t *testing.T) {
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteResp:     cannedRoute(),
+		MatrixResp: &valhalla.MatrixResponse{
+			SourcesToTargets: [][]valhalla.MatrixCell{{
+				{Time: 600, Distance: 1.0},  // station-a: 10 mins on foot
+				{Time: 3000, Distance: 5.0}, // station-b: 50 mins on foot
+			}},
+		},
+	}
+	chainer := newChainer(fc, newTestGraph())
+
+	resp, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk))
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	walk := resp.Metadata.StarterWalk
+	if walk == nil {
+		t.Fatal("StarterWalk: want the walk to station-a, got nil")
+	}
+	if walk.StationSlug != "station-a" {
+		t.Errorf("StarterWalk.StationSlug = %q, want station-a", walk.StationSlug)
+	}
+
+	coords := starterWalkGeometry(t, walk)
+	if len(coords) != 4 {
+		t.Fatalf("geometry has %d points, want the 4 Valhalla routed: %v", len(coords), coords)
+	}
+	// Endpoints are Valhalla's, not the request origin (37.7, -122.4) or the
+	// graph node (37.71, -122.39): the line starts and ends where the timing
+	// actually started and ended.
+	if coords[0][0] != -122.4002 || coords[0][1] != 37.7001 {
+		t.Errorf("first point = %v, want Valhalla's snapped origin [-122.4002 37.7001]", coords[0])
+	}
+	if coords[3][0] != -122.3901 || coords[3][1] != 37.7098 {
+		t.Errorf("last point = %v, want Valhalla's snapped station [-122.3901 37.7098]", coords[3])
+	}
+}
+
+// Only the starter station gets a route. Every other station's access time
+// comes from the matrix and none of them need geometry: they are reached by
+// riding, and their egress isochrones already say what that buys.
+func TestChainer_onlyTheStarterStationIsRouted(t *testing.T) {
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteResp:     cannedRoute(),
+		MatrixResp: &valhalla.MatrixResponse{
+			SourcesToTargets: [][]valhalla.MatrixCell{{
+				{Time: 600, Distance: 1.0},
+				{Time: 3000, Distance: 5.0},
+			}},
+		},
+	}
+	chainer := newChainer(fc, newTestGraph())
+
+	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	routes := fc.RouteCalls()
+	if len(routes) != 1 {
+		t.Fatalf("Route calls = %d, want exactly 1", len(routes))
+	}
+	// Asked from the request's own origin and to the graph node's coordinates:
+	// the two ends of the leg the matrix timed.
+	if routes[0].Origin != (valhalla.LatLng{Lat: 37.7, Lng: -122.4}) {
+		t.Errorf("route origin = %v, want the request origin", routes[0].Origin)
+	}
+	if routes[0].Destination != (valhalla.LatLng{Lat: 37.71, Lng: -122.39}) {
+		t.Errorf("route destination = %v, want station-a's graph node", routes[0].Destination)
+	}
+	if routes[0].Costing != valhalla.CostingPedestrian {
+		t.Errorf("route costing = %q, want pedestrian", routes[0].Costing)
+	}
+}
+
+// A plot that reached no station on foot has no walking leg to draw, and asking
+// Valhalla to route to nowhere would be a request with no destination.
+//
+// This is also the only shape that case takes. Every station in the accounting
+// was reached from some station walked to from the origin, and that station's
+// own remaining budget is the largest of any it reaches — so a plot with any
+// reachable station at all has a walked-to one among them.
+func TestChainer_noReachedStation_noStarterWalk(t *testing.T) {
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteResp:     cannedRoute(),
+		MatrixResp: &valhalla.MatrixResponse{
+			SourcesToTargets: [][]valhalla.MatrixCell{{
+				{Time: -1, Distance: 0},
+				{Time: -1, Distance: 0},
+			}},
+		},
+	}
+	chainer := newChainer(fc, newTestGraph())
+
+	resp, err := chainer.Chain(context.Background(), req(30, transit.TravelModeWalk))
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	if resp.Metadata.StarterWalk != nil {
+		t.Errorf("StarterWalk = %+v, want nil", resp.Metadata.StarterWalk)
+	}
+	if len(fc.RouteCalls()) != 0 {
+		t.Errorf("Route calls = %d, want 0", len(fc.RouteCalls()))
+	}
+}
+
+// The starter is the shortest walk, and whole-minute ties are broken by slug so
+// the same plot names the same station every time. Access times are truncated
+// to minutes before the comparison, which is what makes those ties common —
+// station-b is 12 seconds nearer here and still loses, because both walks are
+// reported as 10 minutes and the slug decides.
+func TestChainer_starterIsTheShortestWalkThenTheSlug(t *testing.T) {
+	graph := &fakeGraph{
+		nodes: []transit.Node{
+			node("station-a", -122.39, 37.71),
+			node("station-b", -122.41, 37.69),
+		},
+	}
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteResp:     cannedRoute(),
+		MatrixResp: &valhalla.MatrixResponse{
+			SourcesToTargets: [][]valhalla.MatrixCell{{
+				{Time: 612, Distance: 1.0}, // station-a: 10 mins
+				{Time: 600, Distance: 1.0}, // station-b: 10 mins
+			}},
+		},
+	}
+
+	resp, err := newChainer(fc, graph).Chain(context.Background(), req(90, transit.TravelModeWalk))
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	if resp.Metadata.StarterWalk == nil || resp.Metadata.StarterWalk.StationSlug != "station-a" {
+		t.Errorf("StarterWalk = %+v, want station-a on the slug tie-break", resp.Metadata.StarterWalk)
+	}
+
+	// And a station a clear minute nearer wins outright, tie-break or not.
+	fc2 := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteResp:     cannedRoute(),
+		MatrixResp: &valhalla.MatrixResponse{
+			SourcesToTargets: [][]valhalla.MatrixCell{{
+				{Time: 660, Distance: 1.0}, // station-a: 11 mins
+				{Time: 600, Distance: 1.0}, // station-b: 10 mins
+			}},
+		},
+	}
+	resp2, err := newChainer(fc2, graph).Chain(context.Background(), req(90, transit.TravelModeWalk))
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	if resp2.Metadata.StarterWalk == nil || resp2.Metadata.StarterWalk.StationSlug != "station-b" {
+		t.Errorf("StarterWalk = %+v, want station-b as the shorter walk", resp2.Metadata.StarterWalk)
+	}
+}
+
+// A station reached by riding is never the starter, however short the hop: the
+// walking line is the leg before boarding anything.
+func TestChainer_starterIsNeverAStationReachedByRiding(t *testing.T) {
+	graph := &fakeGraph{
+		nodes: []transit.Node{
+			node("hub", -122.40, 37.70),
+			node("station-a", -122.39, 37.71),
+		},
+		travelTimes: map[[2]string]int{{"hub", "station-a"}: 60},
+	}
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteResp:     cannedRoute(),
+		MatrixResp: &valhalla.MatrixResponse{
+			SourcesToTargets: [][]valhalla.MatrixCell{{{Time: 540, Distance: 1.0}, {Time: -1, Distance: 0}}},
+		},
+	}
+
+	resp, err := newChainer(fc, graph).Chain(context.Background(), req(60, transit.TravelModeWalk))
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	if resp.Metadata.StarterWalk == nil || resp.Metadata.StarterWalk.StationSlug != "hub" {
+		t.Errorf("StarterWalk = %+v, want hub — station-a was reached by riding", resp.Metadata.StarterWalk)
+	}
+}
+
+// The routed leg is annotation on a surface that is already complete without
+// it. An origin dropped somewhere Valhalla cannot route from — a lake, an
+// island — must lose the line, not the plot.
+func TestChainer_routeFailureLeavesTheChainIntact(t *testing.T) {
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteErr:      fmt.Errorf("%w: no path could be found", valhalla.ErrBadRequest),
+		MatrixResp: &valhalla.MatrixResponse{
+			SourcesToTargets: [][]valhalla.MatrixCell{{
+				{Time: 600, Distance: 1.0},
+				{Time: 3000, Distance: 5.0},
+			}},
+		},
+	}
+	chainer := newChainer(fc, newTestGraph())
+
+	resp, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk))
+	if err != nil {
+		t.Fatalf("Chain: %v, want the chain to survive a failed route", err)
+	}
+	if resp.Metadata.StarterWalk != nil {
+		t.Errorf("StarterWalk = %+v, want nil after a failed route", resp.Metadata.StarterWalk)
+	}
+	// The accounting the surface rests on is untouched.
+	if len(resp.Metadata.ReachableStations) != 2 {
+		t.Errorf("ReachableStations = %d, want 2", len(resp.Metadata.ReachableStations))
+	}
+	if len(resp.Features) != 2 {
+		t.Errorf("Features = %d, want 2", len(resp.Features))
+	}
+}
+
+// The extra call is issued alongside the egress fan-out rather than after it.
+// The fan-out is the bulk of a chain's routing work, so a route that waited for
+// it would add its own latency to every plot for nothing.
+//
+// It cannot be issued alongside the matrix, as SPA-196 supposed: which station
+// is the starter is only known once the matrix has said how long each walk
+// takes. Alongside the fan-out is the earliest it can go.
+func TestChainer_starterRouteRunsAlongsideTheEgressFanOut(t *testing.T) {
+	const stationCount = 4
+	nodes := make([]transit.Node, stationCount+1)
+	cells := make([]valhalla.MatrixCell, stationCount+1)
+	tt := make(map[[2]string]int)
+
+	nodes[0] = node("hub", -122.40, 37.70)
+	cells[0] = valhalla.MatrixCell{Time: 600, Distance: 1.0}
+	for i := range stationCount {
+		slug := fmt.Sprintf("station-%d", i)
+		nodes[i+1] = node(slug, -122.40+0.005*float64(i+1), 37.70+0.005*float64(i+1))
+		cells[i+1] = valhalla.MatrixCell{Time: -1, Distance: 0}
+		tt[[2]string{"hub", slug}] = 600
+	}
+
+	routeIssued := make(chan struct{})
+	var serialised atomic.Bool
+
+	fc := &valhalla.StubClient{
+		MatrixResp: &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{cells}},
+		RouteFn: func(valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+			close(routeIssued)
+			return cannedRoute(), nil
+		},
+		IsochroneFn: func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
+			// The origin polygon precedes the matrix, so it precedes any
+			// knowledge of which station the starter is; only the fan-out is
+			// the thing the route should overlap.
+			if r.Origin.Lat == 37.7 && r.Origin.Lng == -122.4 {
+				return cannedIso(), nil
+			}
+			select {
+			case <-routeIssued:
+			case <-time.After(2 * time.Second):
+				serialised.Store(true)
+			}
+			return cannedIso(), nil
+		},
+	}
+
+	if _, err := newChainer(fc, &fakeGraph{nodes: nodes, travelTimes: tt}).
+		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	if serialised.Load() {
+		t.Error("the starter route did not go out until the egress fan-out had finished")
+	}
 }

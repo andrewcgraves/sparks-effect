@@ -152,12 +152,149 @@ func (c *chainImpl) Chain(ctx context.Context, req ChainRequest) (*ChainResponse
 	egressCandidates := c.bestEgressPerNode(req, nodes, accessSecs)
 	c.log.Debugf("chain: egress fan-out %d candidates", len(egressCandidates))
 
-	egressIsos, err := c.egressIsochrones(ctx, req, costing, egressCandidates)
+	egressIsos, starterWalk, err := c.egressAndStarterWalk(ctx, req, costing, egressCandidates)
 	if err != nil {
 		return nil, err
 	}
 
-	return c.assemble(req, originIso, originIsoClamped, egressCandidates, egressIsos)
+	return c.assemble(req, originIso, originIsoClamped, egressCandidates, egressIsos, starterWalk)
+}
+
+// egressAndStarterWalk runs the egress fan-out and the starter station's route
+// call together.
+//
+// The route cannot go out any earlier than this. Which station the rider walks
+// to is decided by the access times, and those are the matrix's answer, so the
+// destination is not known until the matrix has returned — SPA-196 hoped to
+// issue it alongside the matrix, and that is the reason it cannot be. Running
+// it against the fan-out instead costs nothing measurable: the fan-out is one
+// call per station reached by transit and is what a chain's latency is made of,
+// so one more call beside it does not show.
+func (c *chainImpl) egressAndStarterWalk(
+	ctx context.Context,
+	req ChainRequest,
+	costing valhalla.Costing,
+	candidates []egressCandidate,
+) ([]*valhalla.IsochroneResponse, *StarterWalk, error) {
+	var (
+		egressIsos  []*valhalla.IsochroneResponse
+		starterWalk *StarterWalk
+	)
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		isos, err := c.egressIsochrones(gctx, req, costing, candidates)
+		if err != nil {
+			return err
+		}
+		egressIsos = isos
+		return nil
+	})
+
+	if starter := pickStarter(candidates); starter != nil {
+		g.Go(func() error {
+			starterWalk = c.starterWalk(gctx, req, costing, *starter)
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, nil, err
+	}
+	return egressIsos, starterWalk, nil
+}
+
+// pickStarter names the station the rider walks to before boarding anything.
+//
+// It is the shortest walk among the stations reached on foot — every other
+// candidate was arrived at by riding — with the slug breaking ties so that the
+// same plot names the same station every time rather than following whatever
+// order the graph happened to list its nodes in.
+//
+// The comparison is on whole minutes, which is what makes those ties common:
+// accessMins is the access time truncated, so 119 seconds and 60 seconds are
+// both one minute. That is the number the response reports and the number the
+// frontend used to sort on, so ranking on anything finer here would have the
+// worker name a station a reader of the response could not arrive at. SPA-196
+// records the truncation as a wrinkle of its own, left alone here.
+func pickStarter(candidates []egressCandidate) *egressCandidate {
+	var starter *egressCandidate
+	for i := range candidates {
+		ec := &candidates[i]
+		if ec.viaTransit {
+			continue
+		}
+		if starter == nil ||
+			ec.accessMins < starter.accessMins ||
+			(ec.accessMins == starter.accessMins && ec.node.Slug < starter.node.Slug) {
+			starter = ec
+		}
+	}
+	return starter
+}
+
+// starterWalk routes the access leg and shapes it into a drawable LineString,
+// reporting nil rather than an error when it cannot.
+//
+// A failed route loses the line, never the plot. The surface is complete
+// without it — the origin polygon already covers how far that walk reaches —
+// and the routing failures most likely here are the ones a whole class of
+// origins provokes: a point dropped in a lake or on an island is a permanent
+// 400 from Valhalla, and failing the job over it would turn a plot that used to
+// render into one that does not.
+//
+// This is the one place in the chain that does not act on the transient /
+// permanent split the routing client is at pains to draw, and dropping it is
+// deliberate rather than an oversight. That distinction exists to decide
+// whether to requeue a job, and there is no job to requeue here: every other
+// call in the chain has already succeeded by the time this one is judged, so
+// retrying would mean re-running the whole chain to recover an annotation on a
+// surface that is already correct. The next plot asks again anyway.
+func (c *chainImpl) starterWalk(
+	ctx context.Context,
+	req ChainRequest,
+	costing valhalla.Costing,
+	starter egressCandidate,
+) *StarterWalk {
+	route, err := c.routing.Route(ctx, valhalla.RouteRequest{
+		Origin:      valhalla.LatLng{Lat: req.Lat, Lng: req.Lng},
+		Destination: valhalla.LatLng{Lat: starter.node.Lat, Lng: starter.node.Lng},
+		Costing:     costing,
+	})
+	if err != nil {
+		c.log.Debugf("chain: starter walk to %s not routed, drawing none: %v", starter.node.Slug, err)
+		return nil
+	}
+	// A shape of fewer than two positions is not a line. The HTTP client
+	// rejects one already; this is what keeps a stand-in client that does not
+	// from putting a degenerate LineString on the wire.
+	if route == nil || len(route.Shape) < 2 {
+		c.log.Debugf("chain: starter walk to %s came back without a line, drawing none", starter.node.Slug)
+		return nil
+	}
+
+	geometry, err := lineStringFrom(route.Shape)
+	if err != nil {
+		c.log.Debugf("chain: starter walk to %s not encodable, drawing none: %v", starter.node.Slug, err)
+		return nil
+	}
+	c.log.Debugf("chain: starter walk to %s routed over %d points", starter.node.Slug, len(route.Shape))
+
+	return &StarterWalk{StationSlug: starter.node.Slug, Geometry: geometry}
+}
+
+// lineStringFrom renders a routed shape as GeoJSON, in the [lng, lat] order
+// GeoJSON requires and the rest of this response already uses.
+func lineStringFrom(shape []valhalla.LatLng) (json.RawMessage, error) {
+	coords := make([][2]float64, len(shape))
+	for i, p := range shape {
+		coords[i] = [2]float64{p.Lng, p.Lat}
+	}
+	return json.Marshal(map[string]any{
+		"type":        "LineString",
+		"coordinates": coords,
+	})
 }
 
 // nearbyNodes narrows the graph to the stations worth putting in the matrix:
@@ -464,6 +601,7 @@ func (c *chainImpl) assemble(
 	originIsoClamped bool,
 	candidates []egressCandidate,
 	egressIsos []*valhalla.IsochroneResponse,
+	starterWalk *StarterWalk,
 ) (*ChainResponse, error) {
 	features := make([]json.RawMessage, 0)
 	if originIso != nil {
@@ -518,6 +656,7 @@ func (c *chainImpl) assemble(
 			// skipped — a routing failure returns an error instead. Kept on the
 			// wire for compatibility with clients that already read it.
 			OriginIsoAvailable: originIso != nil,
+			StarterWalk:        starterWalk,
 		},
 	}, nil
 }

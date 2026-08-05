@@ -16,6 +16,7 @@ import (
 const (
 	isochronePath = "/isochrone"
 	matrixPath    = "/sources_to_targets"
+	routePath     = "/route"
 	statusPath    = "/status"
 )
 
@@ -91,6 +92,58 @@ func (c *HTTPClient) Matrix(ctx context.Context, req MatrixRequest) (*MatrixResp
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// routeBody is the slice of Valhalla's /route response this client reads. The
+// rest of it — maneuvers, narrative, per-leg summaries — is a turn-by-turn
+// answer to a question nobody here is asking.
+type routeBody struct {
+	Trip struct {
+		Legs []struct {
+			Shape string `json:"shape"`
+		} `json:"legs"`
+	} `json:"trip"`
+}
+
+// minDrawableShapePoints is the fewest positions that are a line rather than a
+// point. Valhalla answering with less than this is a malfunction, not a walk of
+// zero length: a route it could not find is a 400, which never reaches here.
+const minDrawableShapePoints = 2
+
+func (c *HTTPClient) Route(ctx context.Context, req RouteRequest) (*RouteResponse, error) {
+	body := map[string]any{
+		"locations": []map[string]any{
+			{"lat": req.Origin.Lat, "lon": req.Origin.Lng},
+			{"lat": req.Destination.Lat, "lon": req.Destination.Lng},
+		},
+		"costing": req.Costing,
+	}
+	var resp routeBody
+	if err := c.post(ctx, routePath, body, &resp); err != nil {
+		return nil, err
+	}
+
+	var shape []LatLng
+	for _, leg := range resp.Trip.Legs {
+		points, err := decodePolyline6(leg.Shape)
+		if err != nil {
+			return nil, fmt.Errorf("%w: decode route shape: %v", ErrUpstream, err)
+		}
+		// A leg begins on the point the one before it ended on, so the shared
+		// position is dropped rather than emitted twice. Two locations produce
+		// one leg, so this only matters if Valhalla ever splits the walk.
+		if len(shape) > 0 && len(points) > 0 {
+			points = points[1:]
+		}
+		shape = append(shape, points...)
+	}
+	if len(shape) < minDrawableShapePoints {
+		// Transient rather than permanent: the request was well-formed and was
+		// answered 200, so what went wrong is the server, and the same bytes
+		// may well be answered properly a moment later.
+		return nil, fmt.Errorf("%w: route carried no drawable shape", ErrUpstream)
+	}
+	return &RouteResponse{Shape: shape}, nil
 }
 
 // statusBody is the default (non-verbose) /status response. Valhalla reports

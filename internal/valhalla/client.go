@@ -89,6 +89,34 @@ type MatrixResponse struct {
 	SourcesToTargets [][]MatrixCell `json:"sources_to_targets"`
 }
 
+// RouteRequest is one origin/destination pair to route between.
+//
+// It exists because a matrix answers with time and distance and nothing else:
+// Valhalla genuinely walks the street network to produce that number, then
+// throws the shape away. Where the shape is the point — the walking leg drawn
+// on the map — the same pair has to be asked as a route instead.
+type RouteRequest struct {
+	Origin      LatLng
+	Destination LatLng
+	Costing     Costing
+}
+
+// RouteResponse is the routed path, as positions.
+//
+// Decoded rather than raw, unlike IsochroneResponse's features: Valhalla sends
+// the shape as an encoded polyline rather than as geometry, so there is no
+// GeoJSON here to pass through untouched. Decoding is what this package is for
+// — the wire format is Valhalla's business, and a caller that had to know about
+// polyline6 would be reaching through the seam.
+//
+// The endpoints are Valhalla's own. It snaps each location to the nearest
+// routable edge before routing, so Shape[0] is where the walk actually began
+// rather than the point that was asked about, which may be inside a building or
+// a lake.
+type RouteResponse struct {
+	Shape []LatLng
+}
+
 // Status is what /status reports about the server and the tiles it is serving.
 //
 // TilesetAt is the reason this call exists. It is the timestamp the isochrone
@@ -101,10 +129,13 @@ type Status struct {
 	TilesetAt time.Time
 }
 
-// Client is the routing seam. Three calls, all of them read-only.
+// Client is the routing seam. Four calls, all of them read-only.
 type Client interface {
 	Isochrone(ctx context.Context, req IsochroneRequest) (*IsochroneResponse, error)
 	Matrix(ctx context.Context, req MatrixRequest) (*MatrixResponse, error)
+	// Route walks one pair and returns the shape it took. It is the matrix
+	// call's answer to a single pair, kept rather than discarded.
+	Route(ctx context.Context, req RouteRequest) (*RouteResponse, error)
 	// Status reports the server version and tileset timestamp. It is the one
 	// call that may legitimately be unsupported — the stand-in client has no
 	// tiles to describe — in which case it returns ErrNoStatus.

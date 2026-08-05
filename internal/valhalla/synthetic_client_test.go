@@ -156,6 +156,39 @@ func TestSyntheticRejectsUnknownCosting(t *testing.T) {
 	if !errors.Is(err, valhalla.ErrBadRequest) {
 		t.Errorf("Matrix error = %v, want ErrBadRequest", err)
 	}
+
+	_, err = client.Route(context.Background(), valhalla.RouteRequest{
+		Origin: valhalla.LatLng{Lat: 1, Lng: 2}, Destination: valhalla.LatLng{Lat: 3, Lng: 4},
+		Costing: valhalla.Costing("teleport"),
+	})
+	if !errors.Is(err, valhalla.ErrBadRequest) {
+		t.Errorf("Route error = %v, want ErrBadRequest", err)
+	}
+}
+
+// The synthetic route is the b-line the synthetic isochrone's circles already
+// imply: this client has no street network to follow, and pretending otherwise
+// by inventing bends would put a fiction on the map that reads as a real walk.
+func TestSyntheticRouteIsTheStraightSegment(t *testing.T) {
+	client := valhalla.NewSyntheticClient()
+
+	resp, err := client.Route(context.Background(), valhalla.RouteRequest{
+		Origin:      valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+		Destination: valhalla.LatLng{Lat: 37.71, Lng: -122.39},
+		Costing:     valhalla.CostingPedestrian,
+	})
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	want := []valhalla.LatLng{{Lat: 37.7, Lng: -122.4}, {Lat: 37.71, Lng: -122.39}}
+	if len(resp.Shape) != len(want) {
+		t.Fatalf("Shape = %v, want the two endpoints", resp.Shape)
+	}
+	for i, w := range want {
+		if resp.Shape[i] != w {
+			t.Errorf("Shape[%d] = %v, want %v", i, resp.Shape[i], w)
+		}
+	}
 }
 
 // There is no tileset behind the synthetic client, and inventing a timestamp

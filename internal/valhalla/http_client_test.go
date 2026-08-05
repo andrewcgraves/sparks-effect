@@ -270,6 +270,171 @@ func TestStatusWithoutTilesetLeavesTheTimeZero(t *testing.T) {
 	}
 }
 
+// shapeThreePoints is a genuine polyline6 encoding of
+//
+//	(37.700000, -122.400000) → (37.700500, -122.401000) → (37.701000, -122.400500)
+//
+// written out rather than produced by an encoder here on purpose: an encoder
+// written alongside the decoder would agree with it whether or not either
+// matches what Valhalla actually sends.
+const shapeThreePoints = `_y_|fA~numhFg^n}@g^g^`
+
+func okRoute(shape string) string {
+	return `{"trip":{"legs":[{"shape":"` + shape + `"}],"summary":{"time":420,"length":0.5}}}`
+}
+
+func TestRoute_requestShape(t *testing.T) {
+	srv := newCaptureServer(t, http.StatusOK, okRoute(shapeThreePoints))
+	client := valhalla.NewHTTPClient(srv.URL)
+
+	resp, err := client.Route(context.Background(), valhalla.RouteRequest{
+		Origin:      valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+		Destination: valhalla.LatLng{Lat: 37.701, Lng: -122.4005},
+		Costing:     valhalla.CostingPedestrian,
+	})
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+
+	if srv.path != "/route" {
+		t.Errorf("path = %q, want /route", srv.path)
+	}
+	if got := srv.body["costing"]; got != "pedestrian" {
+		t.Errorf("costing = %v, want pedestrian", got)
+	}
+	locations, _ := srv.body["locations"].([]any)
+	if len(locations) != 2 {
+		t.Fatalf("locations: want 2, got %v", srv.body["locations"])
+	}
+	// lon, not lng: the wire spelling is Valhalla's, applied here rather than
+	// in the domain types.
+	first, _ := locations[0].(map[string]any)
+	if first["lat"] != 37.7 || first["lon"] != -122.4 {
+		t.Errorf("locations[0] = %v, want lat 37.7 lon -122.4", first)
+	}
+	last, _ := locations[1].(map[string]any)
+	if last["lat"] != 37.701 || last["lon"] != -122.4005 {
+		t.Errorf("locations[1] = %v, want lat 37.701 lon -122.4005", last)
+	}
+
+	want := []valhalla.LatLng{
+		{Lat: 37.7, Lng: -122.4},
+		{Lat: 37.7005, Lng: -122.401},
+		{Lat: 37.701, Lng: -122.4005},
+	}
+	if len(resp.Shape) != len(want) {
+		t.Fatalf("Shape len = %d, want %d: %v", len(resp.Shape), len(want), resp.Shape)
+	}
+	for i, w := range want {
+		if !nearly(resp.Shape[i].Lat, w.Lat) || !nearly(resp.Shape[i].Lng, w.Lng) {
+			t.Errorf("Shape[%d] = %v, want %v", i, resp.Shape[i], w)
+		}
+	}
+}
+
+// Valhalla's shape is polyline6, not the polyline5 most encoders default to.
+// Decoding it at five digits puts the walk ten degrees away, which is exactly
+// the kind of failure that looks like a routing bug rather than a decoding one.
+func TestRouteShapeIsDecodedAtSixDigitPrecision(t *testing.T) {
+	srv := newCaptureServer(t, http.StatusOK, okRoute(shapeThreePoints))
+
+	resp, err := valhalla.NewHTTPClient(srv.URL).Route(context.Background(), valhalla.RouteRequest{
+		Origin:      valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+		Destination: valhalla.LatLng{Lat: 37.701, Lng: -122.4005},
+		Costing:     valhalla.CostingPedestrian,
+	})
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	if !nearly(resp.Shape[0].Lat, 37.7) {
+		t.Errorf("first point lat = %v, want 37.7 (decoded at 1e6, not 1e5)", resp.Shape[0].Lat)
+	}
+}
+
+// Legs are joined rather than concatenated: the point a leg ends on is the one
+// the next begins on, and emitting it twice would put a zero-length segment in
+// the middle of the walk.
+func TestRouteJoinsLegsWithoutRepeatingTheSharedPoint(t *testing.T) {
+	two := `{"trip":{"legs":[{"shape":"` + shapeThreePoints + `"},{"shape":"` + shapeThreePoints + `"}]}}`
+	srv := newCaptureServer(t, http.StatusOK, two)
+
+	resp, err := valhalla.NewHTTPClient(srv.URL).Route(context.Background(), valhalla.RouteRequest{
+		Origin: valhalla.LatLng{Lat: 1, Lng: 2}, Destination: valhalla.LatLng{Lat: 3, Lng: 4},
+		Costing: valhalla.CostingPedestrian,
+	})
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	if len(resp.Shape) != 5 {
+		t.Errorf("Shape len = %d, want 5 (3 + 3 sharing one point)", len(resp.Shape))
+	}
+}
+
+// A response the client cannot draw a line from is an upstream failure, not a
+// route with an empty shape: the caller's choice is to retry or to give up, and
+// silently returning nothing would look like the former succeeding.
+func TestRouteWithoutADrawableShapeIsUpstream(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"no legs", `{"trip":{"legs":[]}}`},
+		{"empty shape", `{"trip":{"legs":[{"shape":""}]}}`},
+		{"single point", `{"trip":{"legs":[{"shape":"_y_|fA~numhF"}]}}`},
+		// A latitude with no longitude after it: positions come in pairs, and
+		// half of one is not a position.
+		{"truncated pair", `{"trip":{"legs":[{"shape":"_y_|fA"}]}}`},
+		// Every byte a continuation byte, so the value never terminates.
+		{"unterminated value", `{"trip":{"legs":[{"shape":"~~~~~~~~~~~~~~~~"}]}}`},
+		// Bytes outside the 63..126 an encoder emits are not a polyline at all.
+		// A low one is the case that has to be rejected rather than merely
+		// survived: it masks down to a valid-looking five-bit chunk with the
+		// continuation bit clear, so it terminates a value instead of failing
+		// it. The shape below is otherwise well-formed and pairs up exactly, so
+		// without the range check it decodes to two positions — one of them
+		// nowhere near the walk — and is drawn as a route rather than refused.
+		{"byte below the encodable range", `{"trip":{"legs":[{"shape":"_y_|fA ~numhFg^"}]}}`},
+		{"byte above the encodable range", `{"trip":{"legs":[{"shape":"_y_|fAÿÿ"}]}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newCaptureServer(t, http.StatusOK, tt.body)
+
+			_, err := valhalla.NewHTTPClient(srv.URL).Route(context.Background(), valhalla.RouteRequest{
+				Origin: valhalla.LatLng{Lat: 1, Lng: 2}, Destination: valhalla.LatLng{Lat: 3, Lng: 4},
+				Costing: valhalla.CostingPedestrian,
+			})
+			if !errors.Is(err, valhalla.ErrUpstream) {
+				t.Errorf("err = %v, want ErrUpstream", err)
+			}
+		})
+	}
+}
+
+// Valhalla answers "no path could be found" with a 400, which is permanent —
+// an origin in the middle of a lake will be refused again on a retry.
+func TestRouteWithNoPathIsABadRequest(t *testing.T) {
+	srv := newCaptureServer(t, http.StatusBadRequest,
+		`{"error_code":442,"error":"No path could be found for input"}`)
+
+	_, err := valhalla.NewHTTPClient(srv.URL).Route(context.Background(), valhalla.RouteRequest{
+		Origin: valhalla.LatLng{Lat: 1, Lng: 2}, Destination: valhalla.LatLng{Lat: 3, Lng: 4},
+		Costing: valhalla.CostingPedestrian,
+	})
+	if !errors.Is(err, valhalla.ErrBadRequest) {
+		t.Errorf("err = %v, want ErrBadRequest", err)
+	}
+}
+
+// Coordinates are compared with a tolerance rather than for equality: they
+// arrive as a fixed-point integer divided by 1e6, which is not exactly the
+// decimal literal a test writes.
+func nearly(got, want float64) bool {
+	const tolerance = 1e-9
+	d := got - want
+	return d < tolerance && d > -tolerance
+}
+
 func TestTrailingSlashInBaseURLIsTolerated(t *testing.T) {
 	srv := newCaptureServer(t, http.StatusOK, okIsochrone)
 

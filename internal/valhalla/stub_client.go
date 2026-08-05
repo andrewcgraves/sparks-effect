@@ -22,6 +22,8 @@ type StubClient struct {
 	IsochroneErr  error
 	MatrixResp    *MatrixResponse
 	MatrixErr     error
+	RouteResp     *RouteResponse
+	RouteErr      error
 	StatusResp    Status
 	StatusErr     error
 
@@ -29,16 +31,21 @@ type StubClient struct {
 	// It is how a test makes one station in a fan-out fail while the rest
 	// succeed, which a single canned response cannot express.
 	IsochroneFn func(req IsochroneRequest) (*IsochroneResponse, error)
+	// RouteFn, when set, takes precedence over RouteResp/RouteErr. It is how a
+	// test observes *when* the route went out relative to the rest of the
+	// chain, which a canned response cannot express.
+	RouteFn func(req RouteRequest) (*RouteResponse, error)
 
-	IsochroneCalls []IsochroneRequest
-	MatrixCalls    []MatrixRequest
+	isochroneCalls []IsochroneRequest
+	matrixCalls    []MatrixRequest
+	routeCalls     []RouteRequest
 }
 
 var _ Client = (*StubClient)(nil)
 
 func (s *StubClient) Isochrone(_ context.Context, req IsochroneRequest) (*IsochroneResponse, error) {
 	s.mu.Lock()
-	s.IsochroneCalls = append(s.IsochroneCalls, req)
+	s.isochroneCalls = append(s.isochroneCalls, req)
 	fn := s.IsochroneFn
 	s.mu.Unlock()
 	if fn != nil {
@@ -49,21 +56,41 @@ func (s *StubClient) Isochrone(_ context.Context, req IsochroneRequest) (*Isochr
 
 func (s *StubClient) Matrix(_ context.Context, req MatrixRequest) (*MatrixResponse, error) {
 	s.mu.Lock()
-	s.MatrixCalls = append(s.MatrixCalls, req)
+	s.matrixCalls = append(s.matrixCalls, req)
 	s.mu.Unlock()
 	return s.MatrixResp, s.MatrixErr
+}
+
+func (s *StubClient) Route(_ context.Context, req RouteRequest) (*RouteResponse, error) {
+	s.mu.Lock()
+	s.routeCalls = append(s.routeCalls, req)
+	fn := s.RouteFn
+	s.mu.Unlock()
+	if fn != nil {
+		return fn(req)
+	}
+	return s.RouteResp, s.RouteErr
 }
 
 func (s *StubClient) Status(context.Context) (Status, error) {
 	return s.StatusResp, s.StatusErr
 }
 
-// Calls returns copies of what the stub was asked, safe to read while a chain
-// that is still running holds the stub.
+// Calls returns copies of the isochrone and matrix requests the stub was asked,
+// safe to read while a chain that is still running holds the stub.
 func (s *StubClient) Calls() (isochrone []IsochroneRequest, matrix []MatrixRequest) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	isochrone = append(isochrone, s.IsochroneCalls...)
-	matrix = append(matrix, s.MatrixCalls...)
+	isochrone = append(isochrone, s.isochroneCalls...)
+	matrix = append(matrix, s.matrixCalls...)
 	return isochrone, matrix
+}
+
+// RouteCalls returns copies of the route requests, on its own rather than as a
+// third return from Calls so that adding it did not have to touch every case
+// that already reads the other two.
+func (s *StubClient) RouteCalls() []RouteRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]RouteRequest(nil), s.routeCalls...)
 }

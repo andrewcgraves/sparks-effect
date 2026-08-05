@@ -109,6 +109,19 @@ func (c *SyntheticClient) Matrix(_ context.Context, req MatrixRequest) (*MatrixR
 	return &MatrixResponse{SourcesToTargets: rows}, nil
 }
 
+// Route answers with the straight segment between the two points.
+//
+// That is the honest answer from a client with no street network: its
+// isochrones are circles for the same reason, and inventing bends would put a
+// shape on the map that reads as a real walk. The costing is still checked, so
+// an unknown one is refused here exactly as the real server refuses it.
+func (c *SyntheticClient) Route(_ context.Context, req RouteRequest) (*RouteResponse, error) {
+	if _, err := c.speed(req.Costing); err != nil {
+		return nil, err
+	}
+	return &RouteResponse{Shape: []LatLng{req.Origin, req.Destination}}, nil
+}
+
 // Status reports ErrNoStatus: there is no tileset behind this client, and
 // inventing a timestamp for one would put a fiction in the cache's diagnostic
 // column that later reads as fact.
