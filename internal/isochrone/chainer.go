@@ -250,6 +250,11 @@ type egressCandidate struct {
 	remainingMins int
 	accessMins    int
 	serviceID     string
+	// viaTransit reports whether reaching this station's best path boards a
+	// service, as opposed to walking straight to it from the origin. Only a
+	// via-transit candidate gets an egress polygon computed for it — see
+	// egressIsochrones.
+	viaTransit bool
 }
 
 // bestEgressPerNode works out, for every node in the graph, the access station
@@ -273,6 +278,7 @@ func (c *chainImpl) bestEgressPerNode(
 		accessMins    int
 		remainingMins int
 		serviceID     string
+		viaTransit    bool
 	}
 
 	bestPaths := make(map[string]pathResult, len(nodes))
@@ -282,7 +288,8 @@ func (c *chainImpl) bestEgressPerNode(
 		for accessSlug, aSecs := range accessSecs {
 			var rSecs int
 			var serviceID string
-			if accessSlug == egress.Slug {
+			viaTransit := accessSlug != egress.Slug
+			if !viaTransit {
 				rSecs = budgetSecs - aSecs
 			} else {
 				transitSecs, transitWait, transitService, ok := c.graph.TravelTimeBetween(accessSlug, egress.Slug)
@@ -294,7 +301,7 @@ func (c *chainImpl) bestEgressPerNode(
 			}
 			if rSecs >= minIsoContourSecs && (best == nil || rSecs > bestRSecs) {
 				bestRSecs = rSecs
-				p := pathResult{accessMins: aSecs / 60, remainingMins: rSecs / 60, serviceID: serviceID}
+				p := pathResult{accessMins: aSecs / 60, remainingMins: rSecs / 60, serviceID: serviceID, viaTransit: viaTransit}
 				best = &p
 			}
 		}
@@ -315,24 +322,33 @@ func (c *chainImpl) bestEgressPerNode(
 				remainingMins: p.remainingMins,
 				accessMins:    p.accessMins,
 				serviceID:     p.serviceID,
+				viaTransit:    p.viaTransit,
 			})
 		}
 	}
 	return candidates
 }
 
-// egressIsochrones produces one polygon per reachable station, reusing whatever
-// the cache already holds and computing the rest.
+// egressIsochrones produces one polygon per station reached by riding transit,
+// reusing whatever the cache already holds and computing the rest.
+//
+// A walk-only candidate — reached without boarding any service — gets no
+// polygon at all: it would just restate how far the rider can walk from a
+// station they already walked to, which the origin polygon already covers.
+// Excluding it here means it never enters the fan-out, is never asked of
+// Valhalla, and is never written to the cache; assemble still lists it, since
+// bestEgressPerNode already worked out its access time.
 //
 // This is where the caching pays: the fan-out is the bulk of a chain's routing
-// work — one call per reachable station against two for everything else — and
-// every one of those calls starts from a station the publication fixed in
-// place. See EgressCache.
+// work — one call per station reached by transit against two for everything
+// else — and every one of those calls starts from a station the publication
+// fixed in place. See EgressCache.
 //
 // The computed remainder is bounded rather than run as a plain errgroup: the
-// fan-out is as wide as the graph has reachable stations, and the routing server
-// is a single small container. Without the bound, one large scenario would open
-// hundreds of concurrent requests against a server sized for a handful.
+// fan-out is as wide as the graph has stations reached by transit, and the
+// routing server is a single small container. Without the bound, one large
+// scenario would open hundreds of concurrent requests against a server sized
+// for a handful.
 func (c *chainImpl) egressIsochrones(
 	ctx context.Context,
 	req ChainRequest,
@@ -341,6 +357,16 @@ func (c *chainImpl) egressIsochrones(
 ) ([]*valhalla.IsochroneResponse, error) {
 	isos := make([]*valhalla.IsochroneResponse, len(candidates))
 	if len(candidates) == 0 {
+		return isos, nil
+	}
+
+	var served []int
+	for i, ec := range candidates {
+		if ec.viaTransit {
+			served = append(served, i)
+		}
+	}
+	if len(served) == 0 {
 		return isos, nil
 	}
 
@@ -354,27 +380,41 @@ func (c *chainImpl) egressIsochrones(
 	// shape once per budget. The key is therefore the only place the contour is
 	// kept: what was asked of Valhalla and what was cached cannot drift apart
 	// if there is only one of them.
-	keys := make([]store.IsochroneKey, len(candidates))
-	for i, ec := range candidates {
-		keys[i] = store.IsochroneKey{
+	//
+	// keys and subIsos are indexed by position in served, not in candidates —
+	// walk-only candidates have no key at all, so candidates' own indices
+	// would leave gaps for the cache and the fan-out to trip over.
+	keys := make([]store.IsochroneKey, len(served))
+	for j, i := range served {
+		keys[j] = store.IsochroneKey{
 			CompileJobID: req.CompileJobID,
-			StationSlug:  ec.node.Slug,
+			StationSlug:  candidates[i].node.Slug,
 			Mode:         string(req.Mode),
-			ContourMins:  c.clampToContourCeilingSecs(ec.remainingMins*60) / 60,
+			ContourMins:  c.clampToContourCeilingSecs(candidates[i].remainingMins*60) / 60,
 		}
 	}
 
 	hits := c.cache.lookup(ctx, keys, c.log)
 
+	// Scattered back into isos, at candidates' own indices, on every return
+	// below — including the all-hits one, so served's callers see one
+	// candidate-indexed result regardless of how much of it came from cache.
+	subIsos := make([]*valhalla.IsochroneResponse, len(served))
+	defer func() {
+		for j, i := range served {
+			isos[i] = subIsos[j]
+		}
+	}()
+
 	var misses []int
-	for i := range candidates {
-		if iso, ok := hits[keys[i]]; ok {
-			isos[i] = iso
+	for j := range served {
+		if iso, ok := hits[keys[j]]; ok {
+			subIsos[j] = iso
 			continue
 		}
-		misses = append(misses, i)
+		misses = append(misses, j)
 	}
-	c.log.Debugf("chain: egress cache %d hits, %d misses", len(candidates)-len(misses), len(misses))
+	c.log.Debugf("chain: egress cache %d hits, %d misses", len(served)-len(misses), len(misses))
 	if len(misses) == 0 {
 		return isos, nil
 	}
@@ -387,17 +427,18 @@ func (c *chainImpl) egressIsochrones(
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
 
-	for _, i := range misses {
+	for _, j := range misses {
+		i := served[j]
 		g.Go(func() error {
 			iso, isoErr := c.routing.Isochrone(gctx, valhalla.IsochroneRequest{
 				Origin:     valhalla.LatLng{Lat: candidates[i].node.Lat, Lng: candidates[i].node.Lng},
 				Costing:    costing,
-				BudgetSecs: keys[i].ContourMins * 60,
+				BudgetSecs: keys[j].ContourMins * 60,
 			})
 			if isoErr != nil {
 				return wrapRoutingErr(isoErr)
 			}
-			isos[i] = iso
+			subIsos[j] = iso
 			return nil
 		})
 	}
@@ -409,7 +450,8 @@ func (c *chainImpl) egressIsochrones(
 	// Written on ctx rather than gctx: the errgroup's context is cancelled the
 	// moment Wait returns, and cancelling the write would discard work that has
 	// already succeeded.
-	c.cache.record(ctx, keys, isos, misses, c.log)
+	c.cache.record(ctx, keys, subIsos, misses, c.log)
+
 	return isos, nil
 }
 
@@ -436,19 +478,21 @@ func (c *chainImpl) assemble(
 
 	reachableStations := make([]ReachableStation, 0, len(candidates))
 	for i, ec := range candidates {
-		if egressIsos[i] == nil {
-			continue
-		}
-		for _, f := range egressIsos[i].Features {
-			injected, err := injectProperties(f, map[string]any{
-				"source":         "egress",
-				"station_slug":   ec.node.Slug,
-				"remaining_mins": ec.remainingMins,
-			})
-			if err != nil {
-				return nil, fmt.Errorf("isochrone: inject egress: %w", err)
+		// A walk-only candidate has no egress polygon by design (see
+		// egressIsochrones) and stays out of the feature set, but it is still a
+		// station the rider reached, so it stays in the list below.
+		if egressIsos[i] != nil {
+			for _, f := range egressIsos[i].Features {
+				injected, err := injectProperties(f, map[string]any{
+					"source":         "egress",
+					"station_slug":   ec.node.Slug,
+					"remaining_mins": ec.remainingMins,
+				})
+				if err != nil {
+					return nil, fmt.Errorf("isochrone: inject egress: %w", err)
+				}
+				features = append(features, injected)
 			}
-			features = append(features, injected)
 		}
 		reachableStations = append(reachableStations, ReachableStation{
 			StationSlug:   ec.node.Slug,

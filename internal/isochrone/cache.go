@@ -16,8 +16,9 @@ import (
 // Only the egress leg is cached, and the split is not arbitrary: the origin
 // isochrone and the access matrix start from wherever the user clicked, while
 // the egress polygons start from station positions the publication fixed. The
-// fan-out is also the bulk of the work, one call per reachable station against
-// two for everything else. README's "Caching egress polygons" has the full
+// fan-out is also the bulk of the work, one call per station reached by riding
+// transit against two for everything else — a walk-only station gets no call
+// and nothing to cache. README's "Caching egress polygons" has the full
 // argument, including why the key needs no invalidation machinery.
 //
 // The tileset stamp rides on this struct rather than being read per chain

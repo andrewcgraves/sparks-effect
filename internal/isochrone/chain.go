@@ -4,8 +4,11 @@
 // The shape of the answer: from where the caller is standing, walk/cycle/drive
 // to any station within the budget, ride to anywhere the graph reaches, and
 // spend whatever budget is left travelling out from there. The union of the
-// origin polygon and one polygon per reachable station is where a person could
-// actually get to.
+// origin polygon and one polygon per station reached by riding transit is
+// where a person could actually get to. A station reached without boarding
+// anything contributes no polygon of its own — the origin polygon already
+// covers how far a walk from it would go, since that is a walk from the same
+// starting point — but it still appears among the reachable stations.
 //
 // This package moved here from sparks-effect-api unchanged in behaviour. What
 // changed is where its inputs come from: the graph arrives inline on a queue

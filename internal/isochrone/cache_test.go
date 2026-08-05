@@ -80,17 +80,43 @@ func (f *fakeCache) seed(k store.IsochroneKey, geometry json.RawMessage) {
 	f.entries[k] = geometry
 }
 
-// twoReachableStations is the fixture behind most of these cases: both stations
-// of newTestGraph reachable, so a cold chain makes three isochrone calls (the
-// origin and one per station) and a fully warm one makes a single call.
+// viaTransitGraph is the fixture behind most of these cases: a hub directly
+// reachable on foot, with station-a and station-b reachable only by riding a
+// service from it.
+//
+// The hub itself, not either station, is what a rider actually walks to — and
+// since SPA-188 a station reached without boarding anything gets no egress
+// polygon and nothing to cache. A fixture built on two directly-walkable
+// stations, which is what this used to be, no longer exercises the cache at
+// all: both would resolve as walk-only and neither would produce a polygon
+// worth reusing.
+func viaTransitGraph() *fakeGraph {
+	return &fakeGraph{
+		nodes: []transit.Node{
+			node("hub", -122.40, 37.70),
+			node("station-a", -122.39, 37.71),
+			node("station-b", -122.41, 37.69),
+		},
+		travelTimes: map[[2]string]int{
+			{"hub", "station-a"}: 60,
+			{"hub", "station-b"}: 300,
+		},
+	}
+}
+
+// twoReachableStations is the fixture behind most of these cases: the hub is
+// directly walkable, station-a and station-b are not — so a cold chain makes
+// three isochrone calls (the origin, plus one per station reached by transit)
+// and a fully warm one makes a single call.
 func twoReachableStations() *valhalla.StubClient {
 	return &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
 				{
-					{Time: 600, Distance: 1.0},  // station-a: 10 mins
-					{Time: 1200, Distance: 3.0}, // station-b: 20 mins
+					{Time: 600, Distance: 1.0}, // hub: 10 mins, directly walkable
+					{Time: -1, Distance: 0},    // station-a: only reachable via the hub
+					{Time: -1, Distance: 0},    // station-b: only reachable via the hub
 				},
 			},
 		},
@@ -119,7 +145,7 @@ func TestChainer_warmCacheReducesRoutingCalls(t *testing.T) {
 	egress := isochrone.EgressCache{Store: cache}
 
 	cold := twoReachableStations()
-	coldResp, err := newCachingChainer(cold, newTestGraph(), egress).
+	coldResp, err := newCachingChainer(cold, viaTransitGraph(), egress).
 		Chain(context.Background(), req(90, transit.TravelModeWalk))
 	if err != nil {
 		t.Fatalf("cold Chain: %v", err)
@@ -130,7 +156,7 @@ func TestChainer_warmCacheReducesRoutingCalls(t *testing.T) {
 	}
 
 	warm := twoReachableStations()
-	warmResp, err := newCachingChainer(warm, newTestGraph(), egress).
+	warmResp, err := newCachingChainer(warm, viaTransitGraph(), egress).
 		Chain(context.Background(), req(90, transit.TravelModeWalk))
 	if err != nil {
 		t.Fatalf("warm Chain: %v", err)
@@ -162,13 +188,13 @@ func TestChainer_originIsochroneIsNeverCached(t *testing.T) {
 	egress := isochrone.EgressCache{Store: cache}
 
 	cold := twoReachableStations()
-	if _, err := newCachingChainer(cold, newTestGraph(), egress).
+	if _, err := newCachingChainer(cold, viaTransitGraph(), egress).
 		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("cold Chain: %v", err)
 	}
 
 	warm := twoReachableStations()
-	if _, err := newCachingChainer(warm, newTestGraph(), egress).
+	if _, err := newCachingChainer(warm, viaTransitGraph(), egress).
 		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("warm Chain: %v", err)
 	}
@@ -194,7 +220,7 @@ func TestChainer_originIsochroneIsNeverCached(t *testing.T) {
 func TestChainer_cacheKeyIsCompileStationModeAndContour(t *testing.T) {
 	cache := newFakeCache()
 	fc := twoReachableStations()
-	chainer := newCachingChainer(fc, newTestGraph(), isochrone.EgressCache{Store: cache})
+	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache})
 
 	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeBike)); err != nil {
 		t.Fatalf("Chain: %v", err)
@@ -205,8 +231,8 @@ func TestChainer_cacheKeyIsCompileStationModeAndContour(t *testing.T) {
 		t.Fatalf("cached %d polygons, want 2 (one per reachable station)", len(written))
 	}
 
-	// station-a: 90 - 10 access = 80 left. station-b: 90 - 20 = 70.
-	want := map[string]int{"station-a": 80, "station-b": 70}
+	// station-a: 90 - 10 access - 1 transit = 79 left. station-b: 90 - 10 - 5 = 75.
+	want := map[string]int{"station-a": 79, "station-b": 75}
 	for _, e := range written {
 		contour, known := want[e.Key.StationSlug]
 		if !known {
@@ -236,7 +262,7 @@ func TestChainer_cachedEntriesCarryTheTilesetStamp(t *testing.T) {
 	built := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 	cache := newFakeCache()
 	fc := twoReachableStations()
-	chainer := newCachingChainer(fc, newTestGraph(), isochrone.EgressCache{Store: cache, TilesetAt: built})
+	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache, TilesetAt: built})
 
 	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("Chain: %v", err)
@@ -262,7 +288,7 @@ func TestChainer_recompiledGraphMissesThePreviousGeneration(t *testing.T) {
 	egress := isochrone.EgressCache{Store: cache}
 
 	first := twoReachableStations()
-	if _, err := newCachingChainer(first, newTestGraph(), egress).
+	if _, err := newCachingChainer(first, viaTransitGraph(), egress).
 		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("first Chain: %v", err)
 	}
@@ -271,7 +297,7 @@ func TestChainer_recompiledGraphMissesThePreviousGeneration(t *testing.T) {
 	recompiled.CompileJobID = "compile-2"
 
 	second := twoReachableStations()
-	if _, err := newCachingChainer(second, newTestGraph(), egress).
+	if _, err := newCachingChainer(second, viaTransitGraph(), egress).
 		Chain(context.Background(), recompiled); err != nil {
 		t.Fatalf("second Chain: %v", err)
 	}
@@ -291,9 +317,9 @@ func TestChainer_cacheKeyUsesTheClampedContour(t *testing.T) {
 	cache := newFakeCache()
 	egress := isochrone.EgressCache{Store: cache}
 
-	// 90 - 10 = 80 minutes left at station-a, clamped to the 40-minute ceiling.
+	// 90 - 10 - 1 = 79 minutes left at station-a, clamped to the 40-minute ceiling.
 	first := twoReachableStations()
-	if _, err := isochrone.New(first, newTestGraph(), limits, egress, logger.Discard()).
+	if _, err := isochrone.New(first, viaTransitGraph(), limits, egress, logger.Discard()).
 		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("first Chain: %v", err)
 	}
@@ -308,7 +334,7 @@ func TestChainer_cacheKeyUsesTheClampedContour(t *testing.T) {
 	// A larger budget clamps to the same contour, so it should hit the rows the
 	// smaller one wrote rather than compute its own.
 	larger := twoReachableStations()
-	if _, err := isochrone.New(larger, newTestGraph(), limits, egress, logger.Discard()).
+	if _, err := isochrone.New(larger, viaTransitGraph(), limits, egress, logger.Discard()).
 		Chain(context.Background(), req(120, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("second Chain: %v", err)
 	}
@@ -323,7 +349,7 @@ func TestChainer_unavailableCacheDegradesToComputing(t *testing.T) {
 	cache := newFakeCache()
 	cache.getErr = errors.New("connection refused")
 	fc := twoReachableStations()
-	chainer := newCachingChainer(fc, newTestGraph(), isochrone.EgressCache{Store: cache})
+	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache})
 
 	resp, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk))
 	if err != nil {
@@ -343,7 +369,7 @@ func TestChainer_uncacheableResultDoesNotFailTheJob(t *testing.T) {
 	cache := newFakeCache()
 	cache.putErr = errors.New("compile job cascaded away")
 	fc := twoReachableStations()
-	chainer := newCachingChainer(fc, newTestGraph(), isochrone.EgressCache{Store: cache})
+	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache})
 
 	resp, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk))
 	if err != nil {
@@ -352,8 +378,10 @@ func TestChainer_uncacheableResultDoesNotFailTheJob(t *testing.T) {
 	if len(resp.Features) != 3 {
 		t.Errorf("Features = %d, want 3", len(resp.Features))
 	}
-	if len(resp.Metadata.ReachableStations) != 2 {
-		t.Errorf("ReachableStations = %d, want 2", len(resp.Metadata.ReachableStations))
+	// The hub, station-a and station-b: the hub is walk-only and carries no
+	// polygon, but it is still a station the rider reached.
+	if len(resp.Metadata.ReachableStations) != 3 {
+		t.Errorf("ReachableStations = %d, want 3", len(resp.Metadata.ReachableStations))
 	}
 }
 
@@ -371,18 +399,18 @@ func TestChainer_corruptEntryIsRecomputed(t *testing.T) {
 			// station-a corrupt, station-b sound: only the corrupt one should
 			// cost a call.
 			cache.seed(store.IsochroneKey{
-				CompileJobID: "compile-1", StationSlug: "station-a", Mode: "walk", ContourMins: 80,
+				CompileJobID: "compile-1", StationSlug: "station-a", Mode: "walk", ContourMins: 79,
 			}, geometry)
 			sound, err := json.Marshal(cannedIso())
 			if err != nil {
 				t.Fatalf("marshalling fixture: %v", err)
 			}
 			cache.seed(store.IsochroneKey{
-				CompileJobID: "compile-1", StationSlug: "station-b", Mode: "walk", ContourMins: 70,
+				CompileJobID: "compile-1", StationSlug: "station-b", Mode: "walk", ContourMins: 75,
 			}, sound)
 
 			fc := twoReachableStations()
-			chainer := newCachingChainer(fc, newTestGraph(), isochrone.EgressCache{Store: cache})
+			chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache})
 
 			resp, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk))
 			if err != nil {
@@ -415,7 +443,7 @@ func TestChainer_featurelessPolygonIsNotCached(t *testing.T) {
 		}
 		return cannedIso(), nil
 	}
-	chainer := newCachingChainer(fc, newTestGraph(), isochrone.EgressCache{Store: cache})
+	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache})
 
 	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("Chain: %v", err)
@@ -440,7 +468,7 @@ func TestChainer_featurelessPolygonIsNotCached(t *testing.T) {
 // A chainer built without a cache is a supported configuration, not a crash.
 func TestChainer_zeroCacheIsSupported(t *testing.T) {
 	fc := twoReachableStations()
-	chainer := newCachingChainer(fc, newTestGraph(), isochrone.EgressCache{})
+	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{})
 
 	resp, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk))
 	if err != nil {
@@ -481,13 +509,13 @@ func TestChainer_fullyWarmChainWritesNothing(t *testing.T) {
 	cache := newFakeCache()
 	egress := isochrone.EgressCache{Store: cache}
 
-	if _, err := newCachingChainer(twoReachableStations(), newTestGraph(), egress).
+	if _, err := newCachingChainer(twoReachableStations(), viaTransitGraph(), egress).
 		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("cold Chain: %v", err)
 	}
 	writesAfterCold := len(cache.written())
 
-	if _, err := newCachingChainer(twoReachableStations(), newTestGraph(), egress).
+	if _, err := newCachingChainer(twoReachableStations(), viaTransitGraph(), egress).
 		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("warm Chain: %v", err)
 	}
@@ -508,7 +536,7 @@ func TestChainer_fanOutFailureStillFailsTheChain(t *testing.T) {
 		}
 		return cannedIso(), nil
 	}
-	chainer := newCachingChainer(fc, newTestGraph(), isochrone.EgressCache{Store: cache})
+	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache})
 
 	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk)); err == nil {
 		t.Fatal("Chain succeeded despite a rejected egress request")

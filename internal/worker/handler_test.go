@@ -141,7 +141,13 @@ func TestHandle_consultsTheEgressCacheForTheMessagesCompileJob(t *testing.T) {
 	h := worker.NewHandler(s, valhalla.NewSyntheticClient(), valhalla.DefaultLimits(),
 		isochrone.EgressCache{Store: cache}, logger.Discard())
 
-	if res := h.Handle(context.Background(), goldenMessage(t)); res.Outcome != worker.OutcomeSucceeded {
+	// The golden fixture's 45-minute budget only reaches "north" on foot —
+	// exactly the walk-only case SPA-188 stops caching. Widened here so
+	// "south" is reached by riding svc-express from north, which is what
+	// this test needs the cache to be asked about.
+	msg := mutateGolden(t, func(m map[string]any) { m["budget_mins"] = 90 })
+
+	if res := h.Handle(context.Background(), msg); res.Outcome != worker.OutcomeSucceeded {
 		t.Fatalf("Outcome = %v (err %v), want succeeded", res.Outcome, res.Err)
 	}
 

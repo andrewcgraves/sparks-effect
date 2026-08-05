@@ -51,7 +51,9 @@ A chain makes three kinds of routing call, and they are not equally cacheable.
 The origin isochrone and the access matrix both start from wherever the user
 clicked, so they are as particular as the click is. The egress isochrones start
 from station positions, which the publication fixed — and they are the bulk of
-the work, one call per reachable station against two for everything else.
+the work, one call per station reached by riding transit against two for
+everything else. A station reached by walking alone gets no egress call, and
+nothing to cache: its own reach is already covered by the origin polygon.
 
 The key is `(compile_job_id, station_slug, mode, contour_mins)`.
 

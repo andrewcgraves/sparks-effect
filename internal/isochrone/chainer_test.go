@@ -121,9 +121,11 @@ func TestChainer_happyPath_twoStations(t *testing.T) {
 		t.Errorf("Type: want FeatureCollection, got %q", resp.Type)
 	}
 
-	// 1 origin feature + 2 egress features (one per station)
-	if len(resp.Features) != 3 {
-		t.Errorf("Features len: want 3, got %d", len(resp.Features))
+	// 1 origin feature + 1 egress feature: station-a's best path is a direct
+	// walk (no polygon, since SPA-188), station-b's is via transit through
+	// station-a (gets one).
+	if len(resp.Features) != 2 {
+		t.Errorf("Features len: want 2, got %d", len(resp.Features))
 	}
 	if len(resp.Metadata.ReachableStations) != 2 {
 		t.Errorf("ReachableStations len: want 2, got %d", len(resp.Metadata.ReachableStations))
@@ -209,7 +211,8 @@ func TestChainer_zeroRemainingExcludesStation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Chain: %v", err)
 	}
-	// origin + station-a egress only; station-b excluded (1800-600-1800 = -600s ≤ 0)
+	// station-a listed, reached by direct walk (no egress polygon, per
+	// SPA-188); station-b excluded entirely (1800-600-1800 = -600s ≤ 0).
 	if len(resp.Metadata.ReachableStations) != 1 {
 		t.Fatalf("ReachableStations: want 1, got %d", len(resp.Metadata.ReachableStations))
 	}
@@ -218,6 +221,11 @@ func TestChainer_zeroRemainingExcludesStation(t *testing.T) {
 	}
 }
 
+// SPA-188: a station reached purely by walking — no transit boarded — is just
+// "how far you can walk from a station you already walked to," which the
+// origin polygon already covers. It gets no isochrone feature of its own, but
+// it still stays in the reachable-stations list: a later ticket (SPA-191)
+// draws a walking path to it off that entry.
 func TestChainer_directAccess_AequalsB(t *testing.T) {
 	// Single station, directly reachable; no transit leg.
 	graph := &fakeGraph{nodes: []transit.Node{node("station-a", -122.39, 37.71)}}
@@ -245,31 +253,50 @@ func TestChainer_directAccess_AequalsB(t *testing.T) {
 	if rs.RemainingMins != 50 { // 60 - 10
 		t.Errorf("remaining: want 50, got %d", rs.RemainingMins)
 	}
-	// origin feature + egress feature
-	if len(resp.Features) != 2 {
-		t.Errorf("Features len: want 2, got %d", len(resp.Features))
+	if rs.ViaService != "" {
+		t.Errorf("ViaService: want empty (no service boarded), got %q", rs.ViaService)
+	}
+	// Origin feature only — no egress polygon for a walk-only station.
+	if len(resp.Features) != 1 {
+		t.Errorf("Features len: want 1 (origin only), got %d", len(resp.Features))
+	}
+	for _, f := range resp.Features {
+		var feat map[string]any
+		if err := json.Unmarshal(f, &feat); err != nil {
+			t.Fatalf("unmarshal feature: %v", err)
+		}
+		props, _ := feat["properties"].(map[string]any)
+		if props["source"] == "egress" {
+			t.Errorf("found an egress feature for a walk-only station: %v", props)
+		}
+	}
+	if iso, _ := fc.Calls(); len(iso) != 1 {
+		t.Errorf("isochrone calls: want 1 (origin only, no egress request for a walk-only station), got %d", len(iso))
 	}
 }
 
 func TestChainer_concurrentFanOut_noRace(t *testing.T) {
-	// 5 reachable stations to trigger concurrent egress fan-out.
-	nodes := make([]transit.Node, 5)
-	matrixCells := make([]valhalla.MatrixCell, 5)
+	// One hub reachable on foot, five stations reachable only by riding a
+	// service from it, to trigger concurrent egress fan-out. A directly
+	// walkable station gets no egress isochrone at all since SPA-188, so the
+	// fan-out this test means to exercise needs stations reached by transit.
+	const stationCount = 5
+	nodes := make([]transit.Node, stationCount+1)
+	cells := make([]valhalla.MatrixCell, stationCount+1)
 	tt := make(map[[2]string]int)
-	for i := range 5 {
-		slug := string(rune('a' + i))
-		nodes[i] = node("st-"+slug, -122.40+0.005*float64(i), 37.70+0.005*float64(i))
-		matrixCells[i] = valhalla.MatrixCell{Time: 600, Distance: 1.0}
-		for j := range 5 {
-			if i != j {
-				tt[[2]string{"st-" + slug, "st-" + string(rune('a'+j))}] = 600
-			}
-		}
+
+	nodes[0] = node("hub", -122.40, 37.70)
+	cells[0] = valhalla.MatrixCell{Time: 600, Distance: 1.0}
+	for i := range stationCount {
+		slug := "st-" + string(rune('a'+i))
+		nodes[i+1] = node(slug, -122.40+0.005*float64(i+1), 37.70+0.005*float64(i+1))
+		cells[i+1] = valhalla.MatrixCell{Time: -1, Distance: 0}
+		tt[[2]string{"hub", slug}] = 600
 	}
 
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
-		MatrixResp:    &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{matrixCells}},
+		MatrixResp:    &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{cells}},
 	}
 	chainer := newChainer(fc, &fakeGraph{nodes: nodes, travelTimes: tt})
 
@@ -278,19 +305,27 @@ func TestChainer_concurrentFanOut_noRace(t *testing.T) {
 	}
 }
 
-// The egress fan-out is as wide as the graph has reachable stations, and the
-// routing server is a single small container. Without a bound, one large
-// scenario would open hundreds of concurrent requests against a server sized
-// for a handful — so the bound is measured, not just configured.
+// The egress fan-out is as wide as the graph has stations reached by transit,
+// and the routing server is a single small container. Without a bound, one
+// large scenario would open hundreds of concurrent requests against a server
+// sized for a handful — so the bound is measured, not just configured.
 func TestChainer_egressFanOutIsBoundedByConfiguration(t *testing.T) {
 	const nodeCount = 40
 	const concurrency = 3
 
-	nodes := make([]transit.Node, nodeCount)
-	cells := make([]valhalla.MatrixCell, nodeCount)
+	// One hub reachable on foot; every other node reached only by riding a
+	// service from it, since a directly walkable station gets no egress
+	// isochrone since SPA-188 and so would never enter this fan-out.
+	nodes := make([]transit.Node, nodeCount+1)
+	cells := make([]valhalla.MatrixCell, nodeCount+1)
+	tt := make(map[[2]string]int)
+	nodes[0] = node("hub", -122.40, 37.70)
+	cells[0] = valhalla.MatrixCell{Time: 600, Distance: 1.0}
 	for i := range nodeCount {
-		nodes[i] = node(fmt.Sprintf("station-%d", i), -122.40+0.001*float64(i), 37.70)
-		cells[i] = valhalla.MatrixCell{Time: 600, Distance: 1.0}
+		slug := fmt.Sprintf("station-%d", i)
+		nodes[i+1] = node(slug, -122.40+0.001*float64(i), 37.70)
+		cells[i+1] = valhalla.MatrixCell{Time: -1, Distance: 0}
+		tt[[2]string{"hub", slug}] = 600
 	}
 
 	var (
@@ -321,7 +356,7 @@ func TestChainer_egressFanOutIsBoundedByConfiguration(t *testing.T) {
 
 	limits := valhalla.DefaultLimits()
 	limits.MaxConcurrency = concurrency
-	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes}, limits, isochrone.EgressCache{}, logger.Discard())
+	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes, travelTimes: tt}, limits, isochrone.EgressCache{}, logger.Discard())
 
 	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("Chain: %v", err)
@@ -554,27 +589,34 @@ func TestChainer_drive_largeBudget_originFeatureAtFullBudget(t *testing.T) {
 // SPA-136: egress polygons were silently clamped to 15 min for drive with no
 // metadata flag, so every station's drive coverage was undersized too.
 func TestChainer_drive_egressIsoUsesFullRemainingBudget(t *testing.T) {
-	graph := &fakeGraph{nodes: []transit.Node{node("station-a", -122.39, 37.71)}}
+	// station-a is directly reachable but, since SPA-188, a walk-only station
+	// gets no egress isochrone at all — so this needs a station reached by
+	// transit for there to be an egress budget to check.
+	graph := &fakeGraph{
+		nodes: []transit.Node{
+			node("hub", -122.40, 37.70),
+			node("station-a", -122.39, 37.71),
+		},
+		travelTimes: map[[2]string]int{{"hub", "station-a"}: 60},
+	}
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
-				{{Time: 600, Distance: 1.0}}, // 10 min access
+				{{Time: 600, Distance: 1.0}, {Time: -1, Distance: 0}}, // hub: 10 min access
 			},
 		},
 	}
 	chainer := newChainer(fc, graph)
 
-	// budget 90 min − 10 min access = 80 min remaining at station-a.
+	// budget 90 min − 10 min access − 1 min transit = 79 min remaining at station-a.
 	resp, err := chainer.Chain(context.Background(), req(90, transit.TravelModeDrive))
 	if err != nil {
 		t.Fatalf("Chain: %v", err)
 	}
-	if len(resp.Metadata.ReachableStations) != 1 {
-		t.Fatalf("ReachableStations: want 1, got %d", len(resp.Metadata.ReachableStations))
-	}
-	if got := resp.Metadata.ReachableStations[0].RemainingMins; got != 80 {
-		t.Fatalf("RemainingMins: want 80, got %d", got)
+	sa := findStation(t, resp, "station-a")
+	if sa.RemainingMins != 79 {
+		t.Fatalf("RemainingMins: want 79, got %d", sa.RemainingMins)
 	}
 	// Match on origin coordinates rather than call order, which errgroup doesn't fix.
 	iso, _ := fc.Calls()
@@ -584,8 +626,8 @@ func TestChainer_drive_egressIsoUsesFullRemainingBudget(t *testing.T) {
 			egressBudget = call.BudgetSecs
 		}
 	}
-	if egressBudget != 4800 {
-		t.Errorf("egress BudgetSecs: want 4800 (full 80 min remaining), got %d", egressBudget)
+	if egressBudget != 4740 {
+		t.Errorf("egress BudgetSecs: want 4740 (full 79 min remaining), got %d", egressBudget)
 	}
 }
 
@@ -674,14 +716,20 @@ func TestChainer_routingErrorsPropagateByCause(t *testing.T) {
 // than returning a surface with holes in it. A partial isochrone is worse than
 // none: it looks like an answer and understates reachability.
 func TestChainer_egressFailureFailsTheChain(t *testing.T) {
-	graph := &fakeGraph{nodes: []transit.Node{
-		node("station-a", -122.39, 37.71),
-		node("station-b", -122.41, 37.69),
-	}}
+	// station-b must be reached by transit, not walked to directly: a
+	// walk-only station makes no egress request at all since SPA-188, so it
+	// could never fail one.
+	graph := &fakeGraph{
+		nodes: []transit.Node{
+			node("station-a", -122.39, 37.71),
+			node("station-b", -122.41, 37.69),
+		},
+		travelTimes: map[[2]string]int{{"station-a", "station-b"}: 1800},
+	}
 	fc := &valhalla.StubClient{
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
-				{{Time: 600, Distance: 1.0}, {Time: 600, Distance: 1.0}},
+				{{Time: 600, Distance: 1.0}, {Time: -1, Distance: 0}},
 			},
 		},
 		IsochroneFn: func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
@@ -857,11 +905,19 @@ func TestChainer_graphWithWait_waitModelHeadway(t *testing.T) {
 // Every egress feature carries the station it was cut from, so a client can
 // attribute a polygon without matching it back by geometry.
 func TestChainer_egressFeaturesCarryTheirStation(t *testing.T) {
-	graph := &fakeGraph{nodes: []transit.Node{node("station-a", -122.39, 37.71)}}
+	// station-a must be reached by transit, not walked to directly: a
+	// walk-only station carries no egress feature at all since SPA-188.
+	graph := &fakeGraph{
+		nodes: []transit.Node{
+			node("hub", -122.40, 37.70),
+			node("station-a", -122.39, 37.71),
+		},
+		travelTimes: map[[2]string]int{{"hub", "station-a"}: 60},
+	}
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
-			SourcesToTargets: [][]valhalla.MatrixCell{{{Time: 600, Distance: 1.0}}},
+			SourcesToTargets: [][]valhalla.MatrixCell{{{Time: 540, Distance: 1.0}, {Time: -1, Distance: 0}}},
 		},
 	}
 	chainer := newChainer(fc, graph)
