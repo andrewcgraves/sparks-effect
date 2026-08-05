@@ -180,7 +180,12 @@ func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
 	stop, _ := h.run(t, 3)
 	defer stop()
 
-	testsupport.Publish(t, h.ch, testQueue, goldenMessage(t))
+	// The golden fixture's 45-minute budget only reaches "north" on foot —
+	// walk-only, so it caches nothing since SPA-188. Widened here so "south"
+	// is reached by riding svc-express from north, giving this test an
+	// egress polygon actually worth caching.
+	widerBudget := mutateGolden(t, func(m map[string]any) { m["budget_mins"] = 90 })
+	testsupport.Publish(t, h.ch, testQueue, widerBudget)
 	h.waitForStatus(t, goldenJobID, store.StatusSucceeded)
 	coldCalls := client.isochroneCalls.Load()
 
@@ -203,7 +208,10 @@ func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
 	testsupport.SeedRoutingJob(t, h.pool, secondJobID, goldenCompileID)
 	client.isochroneCalls.Store(0)
 	testsupport.Publish(t, h.ch, testQueue,
-		mutateGolden(t, func(m map[string]any) { m["routing_job_id"] = secondJobID }))
+		mutateGolden(t, func(m map[string]any) {
+			m["routing_job_id"] = secondJobID
+			m["budget_mins"] = 90
+		}))
 	h.waitForStatus(t, secondJobID, store.StatusSucceeded)
 	warmCalls := client.isochroneCalls.Load()
 
