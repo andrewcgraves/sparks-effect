@@ -128,6 +128,24 @@ cp .env.example .env   # set AMQP_URL and DATABASE_URL at minimum
 make run
 ```
 
+## Observability
+
+Every log line is a JSON object — level, timestamp, message, and structured
+fields — written via the standard library's `log/slog`. `LOG_LEVEL=debug` (or
+`VERBOSE=true`) additionally emits per-job debug detail: node counts, cache
+hits, per-candidate routing decisions. Anything else — including the
+default, unset — stays at info level: a job's arrival, the decisions that
+shape its result (contour clamping, matrix truncation, cache hits/misses),
+and its outcome, but not the blow-by-blow. This worker runs no migrations and
+ships no metrics exporter of its own; these logs are what SPA-193 exists to
+make queryable, ahead of the Grafana Alloy hookup that will ship them
+somewhere queryable.
+
+A `trace_id` field is attached to every log line written while a job is being
+processed, if the queued delivery carried one in its `x-trace-id` header. A
+message published with no such header — an older publisher, or one sent by
+hand — simply logs without the field; nothing about processing it changes.
+
 ## Development
 
 ```sh

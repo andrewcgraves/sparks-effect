@@ -13,6 +13,19 @@ import (
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
 )
 
+// traceIDHeader carries the caller's trace id, so a job's whole log trail —
+// worker and API alike, once sparks-effect-api starts setting it — can be
+// filtered on one value. It rides as a custom header rather than AMQP's
+// standard CorrelationId property: MessageId/CorrelationId are the queue's
+// own bookkeeping fields, easy for an intermediary to rewrite or drop, while
+// a plain header round-trips untouched through requeue and dead-lettering
+// alongside x-routing-attempts.
+//
+// Its absence is normal, not an error: a message published before the API
+// carries trace ids, or sent by hand, simply logs with no trace_id field. See
+// traceIDFromDelivery.
+const traceIDHeader = "x-trace-id"
+
 // retryHeader counts how many times a delivery has been requeued by this
 // worker.
 //
@@ -69,13 +82,13 @@ func (c *Consumer) Run(ctx context.Context) error {
 	defer c.Close()
 
 	closed := c.ch.NotifyClose(make(chan *amqp.Error, 1))
-	c.log.Printf("routing: consuming from %q (dead-letter %q, max retries %d)",
-		c.queue, c.deadLetter, c.maxRetries)
+	c.log.Info(ctx, "routing: consuming",
+		"queue", c.queue, "dead_letter_queue", c.deadLetter, "max_retries", c.maxRetries)
 
 	for {
 		select {
 		case <-ctx.Done():
-			c.log.Printf("routing: shutting down")
+			c.log.Info(ctx, "routing: shutting down")
 			return nil
 
 		case amqpErr := <-closed:
@@ -100,6 +113,8 @@ func (c *Consumer) Run(ctx context.Context) error {
 // a chain cancelled half-way through settles as a transient failure and is
 // redelivered, which is the intended behaviour for a worker killed mid-chain.
 func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
+	ctx = logger.WithTraceID(ctx, traceIDFromDelivery(d))
+
 	res := c.handler.Handle(ctx, d.Body)
 
 	switch res.Outcome {
@@ -108,12 +123,13 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 		// redelivers the message rather than silently losing the work, which is
 		// safe because every write is keyed by job id and recomputing over an
 		// immutable graph gives the same answer.
-		c.ack(d, res)
+		c.ack(ctx, d, res)
 
 	case OutcomeTransient:
 		attempts := attemptCount(d.Headers) + 1
 		if attempts > c.maxRetries {
-			c.log.Printf("routing: job %s exhausted %d retries; dead-lettering", res.JobID, c.maxRetries)
+			c.log.Warn(ctx, "routing: job exhausted retries; dead-lettering",
+				"job_id", res.JobID, "max_retries", c.maxRetries)
 			// Mark failed *before* dead-lettering, so the moment the message
 			// leaves the queue the row already says why. A client polling this
 			// job stops waiting here; without it, it would wait forever on a
@@ -121,14 +137,38 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 			if res.JobID != "" {
 				c.handler.Fail(ctx, res.JobID, fmt.Errorf("exhausted %d retries: %w", c.maxRetries, res.Err))
 			}
-			c.deadLetterDelivery(d, res)
+			c.deadLetterDelivery(ctx, d, res)
 			return
 		}
 
-		c.log.Printf("routing: job %s attempt %d/%d failed; requeueing: %v",
-			res.JobID, attempts, c.maxRetries, res.Err)
-		c.requeue(d, attempts)
+		c.log.Warn(ctx, "routing: job attempt failed; requeueing",
+			"job_id", res.JobID, "attempt", attempts, "max_retries", c.maxRetries, "err", errString(res.Err))
+		c.requeue(ctx, d, attempts)
 	}
+}
+
+// traceIDFromDelivery reads the caller's trace id off a delivery's headers.
+// An absent or non-string value is not an error — see traceIDHeader — and
+// simply yields no trace id.
+func traceIDFromDelivery(d amqp.Delivery) string {
+	v, ok := d.Headers[traceIDHeader]
+	if !ok {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return s
+}
+
+// errString reports err's message, or "" for a nil error — res.Err is nil on
+// a transient outcome the handler itself did not attach a cause to.
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // requeue publishes the delivery back onto its own queue with an incremented
@@ -140,21 +180,21 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 //
 // The ack comes after the publish, so a crash between the two redelivers the
 // original — one extra attempt, rather than a lost job.
-func (c *Consumer) requeue(d amqp.Delivery, attempts int) {
+func (c *Consumer) requeue(ctx context.Context, d amqp.Delivery, attempts int) {
 	headers := cloneHeaders(d.Headers)
 	headers[retryHeader] = int32(attempts)
 
 	if err := c.publish(c.queue, d, headers); err != nil {
-		c.log.Printf("routing: republishing for retry failed: %v", err)
+		c.log.Error(ctx, "routing: republishing for retry failed", "err", err.Error())
 		// Nack with requeue so the message is not lost. The counter does not
 		// advance, but the alternative is dropping a job outright.
 		if nackErr := d.Nack(false, true); nackErr != nil {
-			c.log.Printf("routing: nack failed: %v", nackErr)
+			c.log.Error(ctx, "routing: nack failed", "err", nackErr.Error())
 		}
 		return
 	}
 	if err := d.Ack(false); err != nil {
-		c.log.Printf("routing: ack after requeue failed: %v", err)
+		c.log.Error(ctx, "routing: ack after requeue failed", "err", err.Error())
 	}
 }
 
@@ -164,23 +204,23 @@ func (c *Consumer) requeue(d amqp.Delivery, attempts int) {
 // failed by this point, so the caller has its answer; keeping the message on
 // the live queue would only mean retrying, past its bound, work that has
 // already been reported as over.
-func (c *Consumer) deadLetterDelivery(d amqp.Delivery, res Result) {
+func (c *Consumer) deadLetterDelivery(ctx context.Context, d amqp.Delivery, res Result) {
 	headers := cloneHeaders(d.Headers)
 	if res.Err != nil {
 		headers[deadLetterReason] = res.Err.Error()
 	}
 
 	if err := c.publish(c.deadLetter, d, headers); err != nil {
-		c.log.Printf("routing: publishing to dead-letter queue failed: %v", err)
+		c.log.Error(ctx, "routing: publishing to dead-letter queue failed", "err", err.Error())
 	}
 	if err := d.Ack(false); err != nil {
-		c.log.Printf("routing: ack after dead-lettering failed: %v", err)
+		c.log.Error(ctx, "routing: ack after dead-lettering failed", "err", err.Error())
 	}
 }
 
-func (c *Consumer) ack(d amqp.Delivery, res Result) {
+func (c *Consumer) ack(ctx context.Context, d amqp.Delivery, res Result) {
 	if err := d.Ack(false); err != nil {
-		c.log.Printf("routing: ack for job %s failed: %v", res.JobID, err)
+		c.log.Error(ctx, "routing: ack failed", "job_id", res.JobID, "err", err.Error())
 	}
 }
 

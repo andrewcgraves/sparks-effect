@@ -121,22 +121,32 @@ func (c *chainImpl) Chain(ctx context.Context, req ChainRequest) (*ChainResponse
 		return nil, ErrInvalidMode
 	}
 
-	c.log.Debugf("chain: lat=%.6f lng=%.6f budget_mins=%d mode=%s compile_job=%s",
-		req.Lat, req.Lng, req.BudgetMins, req.Mode, req.CompileJobID)
+	c.log.Info(ctx, "chain: starting",
+		"compile_job_id", req.CompileJobID,
+		"mode", req.Mode,
+		"budget_mins", req.BudgetMins,
+		"lat", req.Lat,
+		"lng", req.Lng)
 
 	nodes := c.graph.Nodes()
-	c.log.Debugf("chain: %d nodes in graph", len(nodes))
+	c.log.Debug(ctx, "chain: graph loaded", "node_count", len(nodes))
 
-	nearbyNodes := c.nearbyNodes(req, costing, nodes)
+	nearbyNodes := c.nearbyNodes(ctx, req, costing, nodes)
 
 	originContourSecs := c.clampToContourCeilingSecs(req.BudgetMins * 60)
 	originIsoClamped := originContourSecs < req.BudgetMins*60
+	if originIsoClamped {
+		c.log.Info(ctx, "chain: origin contour clamped to ceiling",
+			"compile_job_id", req.CompileJobID,
+			"requested_secs", req.BudgetMins*60,
+			"clamped_secs", originContourSecs)
+	}
 
 	originIso, matrixResp, err := c.originAndMatrix(ctx, req, costing, originContourSecs, nearbyNodes)
 	if err != nil {
 		return nil, err
 	}
-	c.log.Debugf("chain: routing calls done (origin iso + matrix)")
+	c.log.Debug(ctx, "chain: origin isochrone and matrix calls done")
 
 	accessSecs := make(map[string]int)
 	if matrixResp != nil && len(matrixResp.SourcesToTargets) > 0 {
@@ -147,17 +157,17 @@ func (c *chainImpl) Chain(ctx context.Context, req ChainRequest) (*ChainResponse
 			}
 		}
 	}
-	c.log.Debugf("chain: matrix done, %d/%d nodes reachable", len(accessSecs), len(nodes))
+	c.log.Debug(ctx, "chain: matrix reachability", "reachable", len(accessSecs), "total_nodes", len(nodes))
 
 	egressCandidates := c.bestEgressPerNode(req, nodes, accessSecs)
-	c.log.Debugf("chain: egress fan-out %d candidates", len(egressCandidates))
+	c.log.Debug(ctx, "chain: egress candidates", "count", len(egressCandidates))
 
 	egressIsos, starterWalk, err := c.egressAndStarterWalk(ctx, req, costing, egressCandidates)
 	if err != nil {
 		return nil, err
 	}
 
-	return c.assemble(req, originIso, originIsoClamped, egressCandidates, egressIsos, starterWalk)
+	return c.assemble(ctx, req, originIso, originIsoClamped, egressCandidates, egressIsos, starterWalk)
 }
 
 // egressAndStarterWalk runs the egress fan-out and the starter station's route
@@ -263,23 +273,23 @@ func (c *chainImpl) starterWalk(
 		Costing:     costing,
 	})
 	if err != nil {
-		c.log.Debugf("chain: starter walk to %s not routed, drawing none: %v", starter.node.Slug, err)
+		c.log.Debug(ctx, "chain: starter walk not routed, drawing none", "station_slug", starter.node.Slug, "err", err.Error())
 		return nil
 	}
 	// A shape of fewer than two positions is not a line. The HTTP client
 	// rejects one already; this is what keeps a stand-in client that does not
 	// from putting a degenerate LineString on the wire.
 	if route == nil || len(route.Shape) < 2 {
-		c.log.Debugf("chain: starter walk to %s came back without a line, drawing none", starter.node.Slug)
+		c.log.Debug(ctx, "chain: starter walk came back without a line, drawing none", "station_slug", starter.node.Slug)
 		return nil
 	}
 
 	geometry, err := lineStringFrom(route.Shape)
 	if err != nil {
-		c.log.Debugf("chain: starter walk to %s not encodable, drawing none: %v", starter.node.Slug, err)
+		c.log.Debug(ctx, "chain: starter walk not encodable, drawing none", "station_slug", starter.node.Slug, "err", err.Error())
 		return nil
 	}
-	c.log.Debugf("chain: starter walk to %s routed over %d points", starter.node.Slug, len(route.Shape))
+	c.log.Debug(ctx, "chain: starter walk routed", "station_slug", starter.node.Slug, "points", len(route.Shape))
 
 	return &StarterWalk{StationSlug: starter.node.Slug, Geometry: geometry}
 }
@@ -299,7 +309,7 @@ func lineStringFrom(shape []valhalla.LatLng) (json.RawMessage, error) {
 
 // nearbyNodes narrows the graph to the stations worth putting in the matrix:
 // those within reach, and no more of them than the matrix will accept.
-func (c *chainImpl) nearbyNodes(req ChainRequest, costing valhalla.Costing, nodes []transit.Node) []transit.Node {
+func (c *chainImpl) nearbyNodes(ctx context.Context, req ChainRequest, costing valhalla.Costing, nodes []transit.Node) []transit.Node {
 	reachKm := c.approxAccessReachKm(req.Mode, costing, req.BudgetMins)
 
 	var nearby []transit.Node
@@ -308,7 +318,7 @@ func (c *chainImpl) nearbyNodes(req ChainRequest, costing valhalla.Costing, node
 			nearby = append(nearby, n)
 		}
 	}
-	c.log.Debugf("chain: %d/%d nodes within haversine reach (%.1f km)", len(nearby), len(nodes), reachKm)
+	c.log.Debug(ctx, "chain: nodes within haversine reach", "reachable", len(nearby), "total_nodes", len(nodes), "reach_km", reachKm)
 
 	// One source, so the pair limit is a destination limit. Truncating to the
 	// nearest is the least-bad way to lose stations: the ones dropped are the
@@ -321,7 +331,8 @@ func (c *chainImpl) nearbyNodes(req ChainRequest, costing valhalla.Costing, node
 			return di < dj
 		})
 		nearby = nearby[:max]
-		c.log.Debugf("chain: truncated to %d nodes (matrix pair cap)", max)
+		c.log.Info(ctx, "chain: nodes truncated to matrix pair cap",
+			"compile_job_id", req.CompileJobID, "cap", max)
 	}
 	return nearby
 }
@@ -551,7 +562,7 @@ func (c *chainImpl) egressIsochrones(
 		}
 		misses = append(misses, j)
 	}
-	c.log.Debugf("chain: egress cache %d hits, %d misses", len(served)-len(misses), len(misses))
+	c.log.Debug(ctx, "chain: egress cache lookup", "hits", len(served)-len(misses), "misses", len(misses))
 	if len(misses) == 0 {
 		return isos, nil
 	}
@@ -596,6 +607,7 @@ func (c *chainImpl) egressIsochrones(
 // feature with where it came from so a client can style origin and egress
 // differently.
 func (c *chainImpl) assemble(
+	ctx context.Context,
 	req ChainRequest,
 	originIso *valhalla.IsochroneResponse,
 	originIsoClamped bool,
@@ -640,7 +652,10 @@ func (c *chainImpl) assemble(
 		})
 	}
 
-	c.log.Debugf("chain: complete features=%d reachable_stations=%d", len(features), len(reachableStations))
+	c.log.Info(ctx, "chain: complete",
+		"compile_job_id", req.CompileJobID,
+		"features", len(features),
+		"reachable_stations", len(reachableStations))
 
 	return &ChainResponse{
 		Type:     "FeatureCollection",

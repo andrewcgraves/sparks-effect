@@ -54,7 +54,7 @@ func (e EgressCache) lookup(
 
 	rows, err := e.Store.Get(ctx, keys)
 	if err != nil {
-		log.Printf("isochrone: egress cache unavailable, computing instead: %v", err)
+		log.Warn(ctx, "isochrone: egress cache unavailable, computing instead", "err", err.Error())
 		return nil
 	}
 
@@ -62,11 +62,13 @@ func (e EgressCache) lookup(
 	for k, geometry := range rows {
 		var iso valhalla.IsochroneResponse
 		if err := json.Unmarshal(geometry, &iso); err != nil {
-			log.Printf("isochrone: discarding unreadable cache entry %s/%s: %v", k.CompileJobID, k.StationSlug, err)
+			log.Warn(ctx, "isochrone: discarding unreadable cache entry",
+				"compile_job_id", k.CompileJobID, "station_slug", k.StationSlug, "err", err.Error())
 			continue
 		}
 		if !usable(&iso) {
-			log.Printf("isochrone: discarding empty cache entry %s/%s", k.CompileJobID, k.StationSlug)
+			log.Warn(ctx, "isochrone: discarding empty cache entry",
+				"compile_job_id", k.CompileJobID, "station_slug", k.StationSlug)
 			continue
 		}
 		hits[k] = &iso
@@ -111,7 +113,7 @@ func (e EgressCache) record(
 		// rather than the cache's.
 		geometry, err := json.Marshal(isos[i])
 		if err != nil {
-			log.Printf("isochrone: not caching %s: %v", keys[i].StationSlug, err)
+			log.Warn(ctx, "isochrone: not caching", "station_slug", keys[i].StationSlug, "err", err.Error())
 			continue
 		}
 		entries = append(entries, store.CachedIsochrone{
@@ -125,7 +127,7 @@ func (e EgressCache) record(
 		return
 	}
 	if err := e.Store.Put(ctx, entries); err != nil {
-		log.Printf("isochrone: could not cache %d egress polygons: %v", len(entries), err)
+		log.Warn(ctx, "isochrone: could not cache egress polygons", "count", len(entries), "err", err.Error())
 	}
 }
 

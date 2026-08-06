@@ -4,6 +4,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 func TestUserinfo(t *testing.T) {
@@ -47,5 +49,26 @@ func TestRedactDialErrNoCredentials(t *testing.T) {
 
 	if err.Error() != underlying.Error() {
 		t.Fatalf("expected error unchanged when URL has no credentials, got %q", err.Error())
+	}
+}
+
+func TestTraceIDFromDelivery(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers amqp.Table
+		want    string
+	}{
+		{"present", amqp.Table{traceIDHeader: "trace-abc-123"}, "trace-abc-123"},
+		{"absent", amqp.Table{}, ""},
+		{"nil headers", nil, ""},
+		{"non-string value", amqp.Table{traceIDHeader: int32(7)}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := amqp.Delivery{Headers: tt.headers}
+			if got := traceIDFromDelivery(d); got != tt.want {
+				t.Errorf("traceIDFromDelivery(%+v) = %q, want %q", tt.headers, got, tt.want)
+			}
+		})
 	}
 }

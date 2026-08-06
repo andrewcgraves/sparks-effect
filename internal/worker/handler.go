@@ -108,21 +108,24 @@ func (h *Handler) Handle(ctx context.Context, body []byte) Result {
 		// log is the only place its death is visible. Everything else gets a
 		// failed row, which is what stops the caller polling.
 		if msg.RoutingJobID == "" {
-			h.log.Printf("routing: discarding unreadable message: %v", err)
+			h.log.Error(ctx, "routing: discarding unreadable message", "err", err.Error())
 			return Result{Outcome: OutcomePermanent, Err: err}
 		}
 		return h.fail(ctx, msg.RoutingJobID, err)
 	}
 
-	h.log.Debugf("routing: job %s: mode=%s budget_mins=%d compile_job=%s",
-		msg.RoutingJobID, msg.Mode, msg.BudgetMins, msg.CompileJobID)
+	h.log.Info(ctx, "routing: job received",
+		"job_id", msg.RoutingJobID,
+		"mode", msg.Mode,
+		"budget_mins", msg.BudgetMins,
+		"compile_job_id", msg.CompileJobID)
 
 	if err := h.store.MarkRunning(ctx, msg.RoutingJobID); err != nil {
 		// A row that is gone is gone: its compile job cascaded away, and there
 		// is nothing left to answer. Anything else — the database being down,
 		// a connection dropped — is worth another attempt.
 		if errors.Is(err, store.ErrJobNotFound) {
-			h.log.Printf("routing: job %s has no row; discarding", msg.RoutingJobID)
+			h.log.Warn(ctx, "routing: job has no row; discarding", "job_id", msg.RoutingJobID)
 			return Result{Outcome: OutcomePermanent, JobID: msg.RoutingJobID, Err: err}
 		}
 		return Result{Outcome: OutcomeTransient, JobID: msg.RoutingJobID, Err: err}
@@ -146,7 +149,7 @@ func (h *Handler) Handle(ctx context.Context, body []byte) Result {
 		// and marking it failed now would tell a polling client it was over
 		// while another attempt was still to come. The consumer marks it failed
 		// if and when the retries run out.
-		h.log.Printf("routing: job %s failed transiently: %v", msg.RoutingJobID, err)
+		h.log.Warn(ctx, "routing: job failed transiently", "job_id", msg.RoutingJobID, "err", err.Error())
 		return Result{Outcome: OutcomeTransient, JobID: msg.RoutingJobID, Err: err}
 	}
 
@@ -158,7 +161,7 @@ func (h *Handler) Handle(ctx context.Context, body []byte) Result {
 
 	if err := h.store.MarkSucceeded(ctx, msg.RoutingJobID, result); err != nil {
 		if errors.Is(err, store.ErrJobNotFound) {
-			h.log.Printf("routing: job %s has no row to complete; discarding", msg.RoutingJobID)
+			h.log.Warn(ctx, "routing: job has no row to complete; discarding", "job_id", msg.RoutingJobID)
 			return Result{Outcome: OutcomePermanent, JobID: msg.RoutingJobID, Err: err}
 		}
 		// The chain succeeded and only the write failed, so retrying is
@@ -167,8 +170,10 @@ func (h *Handler) Handle(ctx context.Context, body []byte) Result {
 		return Result{Outcome: OutcomeTransient, JobID: msg.RoutingJobID, Err: err}
 	}
 
-	h.log.Debugf("routing: job %s succeeded: %d features, %d reachable stations",
-		msg.RoutingJobID, len(resp.Features), len(resp.Metadata.ReachableStations))
+	h.log.Info(ctx, "routing: job succeeded",
+		"job_id", msg.RoutingJobID,
+		"features", len(resp.Features),
+		"reachable_stations", len(resp.Metadata.ReachableStations))
 	return Result{Outcome: OutcomeSucceeded, JobID: msg.RoutingJobID}
 }
 
@@ -183,13 +188,13 @@ func (h *Handler) Fail(ctx context.Context, jobID string, cause error) {
 }
 
 func (h *Handler) fail(ctx context.Context, jobID string, cause error) Result {
-	h.log.Printf("routing: job %s failed: %v", jobID, cause)
+	h.log.Error(ctx, "routing: job failed", "job_id", jobID, "err", cause.Error())
 	if err := h.store.MarkFailed(ctx, jobID, cause.Error()); err != nil {
 		// The job cannot be marked failed, so a client will keep polling a row
 		// that says running. Requeueing gives the write another chance; the
 		// original cause is preserved in the log above either way.
 		if !errors.Is(err, store.ErrJobNotFound) {
-			h.log.Printf("routing: job %s: recording failure failed: %v", jobID, err)
+			h.log.Error(ctx, "routing: recording job failure failed", "job_id", jobID, "err", err.Error())
 			return Result{Outcome: OutcomeTransient, JobID: jobID, Err: err}
 		}
 	}

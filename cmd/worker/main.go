@@ -34,7 +34,7 @@ func main() {
 	log := logger.Default(cfg.Debug)
 
 	if err := run(cfg, log); err != nil {
-		log.Printf("fatal: %v", err)
+		log.Error(context.Background(), "fatal", "err", err.Error())
 		os.Exit(1)
 	}
 }
@@ -66,7 +66,7 @@ func run(cfg config.Config, log *logger.Logger) error {
 	}
 	defer repo.Close()
 
-	routingClient, tilesetAt := newRoutingClient(cfg, log)
+	routingClient, tilesetAt := newRoutingClient(ctx, cfg, log)
 
 	// One repo, two roles: it is where results are written and where egress
 	// polygons are reused from. The tileset stamp is read once, here, because
@@ -92,16 +92,19 @@ func run(cfg config.Config, log *logger.Logger) error {
 // The synthetic client returns a zero tileset time because it has never seen a
 // tile. That is stored as NULL on the cache rows it produces, which is exactly
 // what it means.
-func newRoutingClient(cfg config.Config, log *logger.Logger) (valhalla.Client, time.Time) {
+func newRoutingClient(ctx context.Context, cfg config.Config, log *logger.Logger) (valhalla.Client, time.Time) {
 	if cfg.ValhallaURL == "" {
-		log.Printf("routing: VALHALLA_URL is unset — serving SYNTHETIC isochrones, not real ones")
+		log.Warn(ctx, "routing: VALHALLA_URL is unset — serving SYNTHETIC isochrones, not real ones")
 		return valhalla.NewSyntheticClient(), time.Time{}
 	}
 
 	client := valhalla.NewHTTPClient(cfg.ValhallaURL).WithTimeout(cfg.ValhallaTimeout)
-	log.Printf("routing: using Valhalla at %s (contour ceiling %d min, matrix pairs %d, concurrency %d)",
-		cfg.ValhallaURL, cfg.Limits.MaxIsoContourMins, cfg.Limits.MaxMatrixPairs, cfg.Limits.MaxConcurrency)
-	return client, reportTileset(client, log)
+	log.Info(ctx, "routing: using Valhalla",
+		"valhalla_url", cfg.ValhallaURL,
+		"max_iso_contour_mins", cfg.Limits.MaxIsoContourMins,
+		"max_matrix_pairs", cfg.Limits.MaxMatrixPairs,
+		"max_concurrency", cfg.Limits.MaxConcurrency)
+	return client, reportTileset(ctx, client, log)
 }
 
 // reportTileset logs the tiles the server is serving, once, at startup, and
@@ -126,19 +129,21 @@ func newRoutingClient(cfg config.Config, log *logger.Logger) (valhalla.Client, t
 // once Valhalla is up is the fix. Re-reading per chain would close the gap and
 // is not worth a call per message for a field nothing looks up — but if these
 // NULLs ever turn up in an investigation, this is why.
-func reportTileset(client valhalla.Client, log *logger.Logger) time.Time {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func reportTileset(ctx context.Context, client valhalla.Client, log *logger.Logger) time.Time {
+	statusCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
-	status, err := client.Status(ctx)
+	status, err := client.Status(statusCtx)
 	if err != nil {
-		log.Printf("routing: could not read Valhalla /status: %v", err)
+		log.Warn(ctx, "routing: could not read Valhalla /status", "err", err.Error())
 		return time.Time{}
 	}
 	if status.TilesetAt.IsZero() {
-		log.Printf("routing: Valhalla %s reports no tileset timestamp", status.Version)
+		log.Warn(ctx, "routing: Valhalla reports no tileset timestamp", "valhalla_version", status.Version)
 		return time.Time{}
 	}
-	log.Printf("routing: Valhalla %s, tileset built %s", status.Version, status.TilesetAt.Format(time.RFC3339))
+	log.Info(ctx, "routing: Valhalla tileset",
+		"valhalla_version", status.Version,
+		"tileset_at", status.TilesetAt.Format(time.RFC3339))
 	return status.TilesetAt
 }
