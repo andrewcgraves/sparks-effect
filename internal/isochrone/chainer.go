@@ -395,9 +395,15 @@ func (c *chainImpl) originAndMatrix(
 
 type egressCandidate struct {
 	node          transit.Node
+	remainingSecs int
 	remainingMins int
+	accessSecs    int
 	accessMins    int
-	serviceID     string
+	// journey is how the rider got here: the predecessor and hop the search
+	// settled on, and the one boarding that paid for it. legs is that same
+	// journey retraced from the station the rider boarded at.
+	journey transit.Reached
+	legs    []Leg
 	// viaTransit reports whether reaching this station's best path boards a
 	// service, as opposed to walking straight to it from the origin. Only a
 	// via-transit candidate gets an egress polygon computed for it — see
@@ -405,15 +411,17 @@ type egressCandidate struct {
 	viaTransit bool
 }
 
-// bestEgressPerNode works out, for every node in the graph, the access station
-// that leaves the most budget on arrival there.
+// bestEgressPerNode works out, for every node in the graph, the journey that
+// leaves the most budget on arrival there.
 //
-// Every reachable access station is tried against every node rather than
-// picking one nearest station and riding from it: the nearest station may be on
-// a slow service, and a station two minutes further away on an express reaches
-// more. Ties go to whichever leaves more budget, which is the whole point.
+// One search settles all of them at once, seeded with every access station the
+// matrix reached at the cost of reaching it, so the answer accounts for the
+// nearest station being on a slow service while one two minutes further away is
+// on an express. What it adds over reporting a duration is the path: the search
+// keeps the predecessor of every node it settles, which is what lets the
+// response describe the trip rather than only its length.
 //
-// A node whose best remaining budget is under a minute is dropped rather than
+// A node whose remaining budget is under a minute is dropped rather than
 // carried, because a sub-minute contour is a request Valhalla rejects.
 func (c *chainImpl) bestEgressPerNode(
 	req ChainRequest,
@@ -421,42 +429,7 @@ func (c *chainImpl) bestEgressPerNode(
 	accessSecs map[string]int,
 ) []egressCandidate {
 	budgetSecs := req.BudgetMins * 60
-
-	type pathResult struct {
-		accessMins    int
-		remainingMins int
-		serviceID     string
-		viaTransit    bool
-	}
-
-	bestPaths := make(map[string]pathResult, len(nodes))
-	for _, egress := range nodes {
-		var best *pathResult
-		bestRSecs := 0
-		for accessSlug, aSecs := range accessSecs {
-			var rSecs int
-			var serviceID string
-			viaTransit := accessSlug != egress.Slug
-			if !viaTransit {
-				rSecs = budgetSecs - aSecs
-			} else {
-				transitSecs, transitWait, transitService, ok := c.graph.TravelTimeBetween(accessSlug, egress.Slug)
-				if !ok {
-					continue
-				}
-				rSecs = budgetSecs - aSecs - transitSecs - transitWait
-				serviceID = transitService
-			}
-			if rSecs >= minIsoContourSecs && (best == nil || rSecs > bestRSecs) {
-				bestRSecs = rSecs
-				p := pathResult{accessMins: aSecs / 60, remainingMins: rSecs / 60, serviceID: serviceID, viaTransit: viaTransit}
-				best = &p
-			}
-		}
-		if best != nil {
-			bestPaths[egress.Slug] = *best
-		}
-	}
+	reached := c.graph.Search(accessSecs)
 
 	// Built by walking nodes rather than the map so the fan-out, the features
 	// and the reported stations all come out in graph order, which is stable
@@ -464,17 +437,63 @@ func (c *chainImpl) bestEgressPerNode(
 	// request.
 	var candidates []egressCandidate
 	for _, n := range nodes {
-		if p, ok := bestPaths[n.Slug]; ok {
-			candidates = append(candidates, egressCandidate{
-				node:          n,
-				remainingMins: p.remainingMins,
-				accessMins:    p.accessMins,
-				serviceID:     p.serviceID,
-				viaTransit:    p.viaTransit,
-			})
+		journey, ok := reached[n.Slug]
+		if !ok {
+			continue
 		}
+		rSecs := budgetSecs - journey.TotalSecs
+		if rSecs < minIsoContourSecs {
+			continue
+		}
+		aSecs := accessSecs[journey.SourceSlug]
+		candidates = append(candidates, egressCandidate{
+			node:          n,
+			remainingSecs: rSecs,
+			remainingMins: rSecs / 60,
+			accessSecs:    aSecs,
+			accessMins:    aSecs / 60,
+			journey:       journey,
+			legs:          legsTo(n.Slug, reached),
+			viaTransit:    journey.PredecessorSlug != "",
+		})
 	}
 	return candidates
+}
+
+// legsTo retraces the journey to one station, hop by hop, from the station the
+// rider boarded at to the station itself.
+//
+// The path is walked backwards off the predecessor pointers and then reversed,
+// which is the only reason those pointers are kept. A journey that rode nothing
+// has no legs at all.
+//
+// The bound is the settled set's own size: predecessors form a tree over
+// settled nodes and cannot cycle, but a graph with zero-second edges could in
+// principle produce one, and this response is built from bytes off a queue.
+func legsTo(slug string, reached map[string]transit.Reached) []Leg {
+	var reversed []Leg
+	for cur := slug; len(reversed) <= len(reached); {
+		r, ok := reached[cur]
+		if !ok || r.PredecessorSlug == "" {
+			break
+		}
+		reversed = append(reversed, Leg{
+			FromSlug:  r.PredecessorSlug,
+			ToSlug:    cur,
+			ServiceID: r.HopService,
+			Secs:      r.HopSecs,
+			DwellS:    r.HopDwellS,
+		})
+		cur = r.PredecessorSlug
+	}
+	if len(reversed) == 0 {
+		return nil
+	}
+	legs := make([]Leg, len(reversed))
+	for i, l := range reversed {
+		legs[len(reversed)-1-i] = l
+	}
+	return legs
 }
 
 // egressIsochrones produces one polygon per station reached by riding transit,
@@ -645,10 +664,16 @@ func (c *chainImpl) assemble(
 			}
 		}
 		reachableStations = append(reachableStations, ReachableStation{
-			StationSlug:   ec.node.Slug,
-			AccessMins:    ec.accessMins,
-			RemainingMins: ec.remainingMins,
-			ViaService:    ec.serviceID,
+			StationSlug:     ec.node.Slug,
+			AccessMins:      ec.accessMins,
+			AccessSecs:      ec.accessSecs,
+			RemainingMins:   ec.remainingMins,
+			RemainingSecs:   ec.remainingSecs,
+			ViaService:      ec.journey.BoardService,
+			PredecessorSlug: ec.journey.PredecessorSlug,
+			BoardSlug:       ec.journey.BoardSlug,
+			BoardWaitSecs:   ec.journey.BoardWaitSecs,
+			Legs:            ec.legs,
 		})
 	}
 

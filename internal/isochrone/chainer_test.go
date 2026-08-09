@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -38,16 +39,60 @@ var _ transit.GraphData = (*fakeGraph)(nil)
 
 func (f *fakeGraph) Nodes() []transit.Node { return f.nodes }
 
-func (f *fakeGraph) TravelTimeBetween(fromSlug, toSlug string) (int, int, string, bool) {
+func (f *fakeGraph) travelTime(fromSlug, toSlug string) (secs, wait int, ok bool) {
 	key := [2]string{fromSlug, toSlug}
 	rev := [2]string{toSlug, fromSlug}
 	if v, ok := f.travelTimes[key]; ok {
-		return v, f.waitTimes[key], "", true
+		return v, f.waitTimes[key], true
 	}
 	if v, ok := f.travelTimes[rev]; ok {
-		return v, f.waitTimes[rev], "", true
+		return v, f.waitTimes[rev], true
 	}
-	return 0, 0, "", false
+	return 0, 0, false
+}
+
+// Search settles what the travel-time table states directly: every access
+// station, and every node one stated ride away from one. The table is pairs
+// rather than edges, so there is nothing here to chain through — a case about a
+// multi-hop journey builds a real transit.CompiledGraph instead.
+func (f *fakeGraph) Search(accessSecs map[string]int) map[string]transit.Reached {
+	out := make(map[string]transit.Reached)
+	consider := func(slug string, r transit.Reached) {
+		if prev, seen := out[slug]; !seen || r.TotalSecs < prev.TotalSecs {
+			out[slug] = r
+		}
+	}
+	for _, src := range sortedSlugs(accessSecs) {
+		aSecs := accessSecs[src]
+		consider(src, transit.Reached{TotalSecs: aSecs, SourceSlug: src})
+		for _, n := range f.nodes {
+			if n.Slug == src {
+				continue
+			}
+			secs, wait, ok := f.travelTime(src, n.Slug)
+			if !ok {
+				continue
+			}
+			consider(n.Slug, transit.Reached{
+				TotalSecs:       aSecs + secs + wait,
+				SourceSlug:      src,
+				PredecessorSlug: src,
+				HopSecs:         secs,
+				BoardSlug:       src,
+				BoardWaitSecs:   wait,
+			})
+		}
+	}
+	return out
+}
+
+func sortedSlugs(m map[string]int) []string {
+	slugs := make([]string, 0, len(m))
+	for k := range m {
+		slugs = append(slugs, k)
+	}
+	sort.Strings(slugs)
+	return slugs
 }
 
 func (f *fakeGraph) HasWait() bool {
@@ -95,6 +140,209 @@ func req(budgetMins int, mode transit.TravelMode) isochrone.ChainRequest {
 	return isochrone.ChainRequest{
 		Lat: 37.7, Lng: -122.4, BudgetMins: budgetMins, Mode: mode,
 		CompileJobID: "compile-1",
+	}
+}
+
+// --- The journey the response describes ----------------------------------
+//
+// These cases drive the chainer over a real compiled graph rather than the
+// travel-time table above, because what they are about is the shape of a
+// journey across several hops and two services — which a table of pairs cannot
+// state.
+
+// interchangeGraph is a trunk with a spur off its middle station, the shape the
+// seeded California scenario has at Palmdale: a rider bound for the spur's end
+// boards the trunk, rides to the junction, and changes there.
+//
+//	alpha --trunk--> beta --trunk--> gamma
+//	                  \--spur--> delta
+//
+// The stations sit a kilometre or so apart so that all four are within walking
+// reach of the origin; which of them the rider can actually walk to is decided
+// by the matrix, not by the geography.
+func interchangeGraph() transit.CompiledGraph {
+	return transit.CompiledGraph{Graph: &transit.TransitGraph{
+		Nodes: []transit.GraphNode{
+			{Slug: "alpha", Lat: 37.70, Lng: -122.40},
+			{Slug: "beta", Lat: 37.71, Lng: -122.40},
+			{Slug: "gamma", Lat: 37.72, Lng: -122.40},
+			{Slug: "delta", Lat: 37.71, Lng: -122.41},
+		},
+		Services: []transit.ServiceGraph{
+			{ServiceID: "trunk", WaitSecs: 600, Edges: []transit.Edge{
+				{FromSlug: "alpha", ToSlug: "beta", Seconds: 900, DwellS: 60},
+				{FromSlug: "beta", ToSlug: "gamma", Seconds: 900, DwellS: 45},
+			}},
+			{ServiceID: "spur", WaitSecs: 1200, Edges: []transit.Edge{
+				{FromSlug: "beta", ToSlug: "delta", Seconds: 600, DwellS: 30},
+			}},
+		},
+	}}
+}
+
+// walkableFrom builds a matrix answer in which only the named station is within
+// walking reach; every other node of interchangeGraph is unreachable on foot.
+func walkableFrom(accessSecs int, index int) *valhalla.MatrixResponse {
+	row := make([]valhalla.MatrixCell, 4)
+	for i := range row {
+		row[i] = valhalla.MatrixCell{Time: -1}
+	}
+	row[index] = valhalla.MatrixCell{Time: accessSecs, Distance: 1.0}
+	return &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{row}}
+}
+
+func stationsBySlug(t *testing.T, resp *isochrone.ChainResponse) map[string]isochrone.ReachableStation {
+	t.Helper()
+	out := make(map[string]isochrone.ReachableStation, len(resp.Metadata.ReachableStations))
+	for _, s := range resp.Metadata.ReachableStations {
+		out[s.StationSlug] = s
+	}
+	return out
+}
+
+// Every station names the one it was ridden from, and following those names
+// arrives at a station the rider walked to. That is what makes the reported set
+// a tree rather than a list, and it is the whole reason the search keeps
+// predecessors.
+func TestChainer_reachableStationsFormATreeRootedAtTheAccessStations(t *testing.T) {
+	fc := &valhalla.StubClient{IsochroneResp: cannedIso(), MatrixResp: walkableFrom(300, 0)}
+	chainer := newChainer(fc, interchangeGraph())
+
+	resp, err := chainer.Chain(context.Background(), req(120, transit.TravelModeWalk))
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	stations := stationsBySlug(t, resp)
+	if len(stations) != 4 {
+		t.Fatalf("reached %d stations, want all 4: %+v", len(stations), resp.Metadata.ReachableStations)
+	}
+	want := map[string]string{"alpha": "", "beta": "alpha", "gamma": "beta", "delta": "beta"}
+	for slug, wantPred := range want {
+		if got := stations[slug].PredecessorSlug; got != wantPred {
+			t.Errorf("%s came from %q, want %q", slug, got, wantPred)
+		}
+	}
+	for slug, s := range stations {
+		if s.PredecessorSlug == "" {
+			continue
+		}
+		if _, ok := stations[s.PredecessorSlug]; !ok {
+			t.Errorf("%s names predecessor %q, which is not itself reported", slug, s.PredecessorSlug)
+		}
+	}
+}
+
+// A journey over an interchange is described hop by hop, each naming the
+// service actually ridden — which is what the single boarded-service field
+// cannot do, since it reports only the first.
+func TestChainer_legsNameTheServiceRiddenOnEachHop(t *testing.T) {
+	fc := &valhalla.StubClient{IsochroneResp: cannedIso(), MatrixResp: walkableFrom(300, 0)}
+	chainer := newChainer(fc, interchangeGraph())
+
+	resp, err := chainer.Chain(context.Background(), req(120, transit.TravelModeWalk))
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	stations := stationsBySlug(t, resp)
+
+	delta := stations["delta"]
+	wantLegs := []isochrone.Leg{
+		{FromSlug: "alpha", ToSlug: "beta", ServiceID: "trunk", Secs: 900, DwellS: 60},
+		{FromSlug: "beta", ToSlug: "delta", ServiceID: "spur", Secs: 600, DwellS: 30},
+	}
+	if len(delta.Legs) != len(wantLegs) {
+		t.Fatalf("delta legs = %+v, want two hops crossing two services", delta.Legs)
+	}
+	for i, want := range wantLegs {
+		if delta.Legs[i] != want {
+			t.Errorf("delta leg %d = %+v, want %+v", i, delta.Legs[i], want)
+		}
+	}
+	// A station the rider walked to rode nothing, so it has no legs at all.
+	if alpha := stations["alpha"]; len(alpha.Legs) != 0 {
+		t.Errorf("alpha legs = %+v, want none — the rider walked there", alpha.Legs)
+	}
+}
+
+// Boarding wait is paid once, at the station the rider gets on. Changing
+// service at the junction costs nothing, so the spur's longer wait is never
+// charged — which is the model this change was required to preserve exactly.
+func TestChainer_boardingWaitIsChargedOnceAndNotAgainOnAServiceChange(t *testing.T) {
+	fc := &valhalla.StubClient{IsochroneResp: cannedIso(), MatrixResp: walkableFrom(300, 0)}
+	chainer := newChainer(fc, interchangeGraph())
+
+	resp, err := chainer.Chain(context.Background(), req(120, transit.TravelModeWalk))
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	stations := stationsBySlug(t, resp)
+
+	for _, slug := range []string{"beta", "gamma", "delta"} {
+		s := stations[slug]
+		if s.BoardSlug != "alpha" {
+			t.Errorf("%s boarded at %q, want alpha", slug, s.BoardSlug)
+		}
+		if s.BoardWaitSecs != 600 {
+			t.Errorf("%s paid %d s of boarding wait, want the trunk's 600 s once", slug, s.BoardWaitSecs)
+		}
+	}
+	// 300 s walk + 600 s wait + 900 s to beta + 600 s on to delta, with the
+	// spur's 1200 s wait never charged.
+	if got := stations["delta"].RemainingSecs; got != 120*60-2400 {
+		t.Errorf("delta remaining = %d s, want %d — a transfer costs nothing", got, 120*60-2400)
+	}
+}
+
+// Seconds are reported alongside the whole minutes that were always there, so a
+// caller adding hop to hop down a journey does not lose a minute at every stop.
+// The minute fields keep meaning exactly what they meant.
+func TestChainer_reportsSecondsAlongsideWholeMinutes(t *testing.T) {
+	fc := &valhalla.StubClient{IsochroneResp: cannedIso(), MatrixResp: walkableFrom(743, 0)}
+	chainer := newChainer(fc, interchangeGraph())
+
+	resp, err := chainer.Chain(context.Background(), req(120, transit.TravelModeWalk))
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	for _, s := range resp.Metadata.ReachableStations {
+		if s.AccessSecs != 743 {
+			t.Errorf("%s access = %d s, want the matrix's own 743", s.StationSlug, s.AccessSecs)
+		}
+		if s.AccessMins != s.AccessSecs/60 {
+			t.Errorf("%s access = %d mins against %d s", s.StationSlug, s.AccessMins, s.AccessSecs)
+		}
+		if s.RemainingMins != s.RemainingSecs/60 {
+			t.Errorf("%s remaining = %d mins against %d s", s.StationSlug, s.RemainingMins, s.RemainingSecs)
+		}
+	}
+}
+
+// A graph compiled before the API reported dwell carries none, and the response
+// describes the journey anyway — minus the dwell, which is incomplete but never
+// wrong. No backfill is required to deploy this.
+func TestChainer_describesAJourneyOverAGraphWithNoDwell(t *testing.T) {
+	g := interchangeGraph()
+	for si := range g.Graph.Services {
+		for ei := range g.Graph.Services[si].Edges {
+			g.Graph.Services[si].Edges[ei].DwellS = 0
+		}
+	}
+	fc := &valhalla.StubClient{IsochroneResp: cannedIso(), MatrixResp: walkableFrom(300, 0)}
+
+	resp, err := newChainer(fc, g).Chain(context.Background(), req(120, transit.TravelModeWalk))
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	delta := stationsBySlug(t, resp)["delta"]
+	if len(delta.Legs) != 2 {
+		t.Fatalf("delta legs = %+v, want the journey still described", delta.Legs)
+	}
+	for _, l := range delta.Legs {
+		if l.DwellS != 0 {
+			t.Errorf("leg %s->%s reported %d s of dwell from a graph carrying none", l.FromSlug, l.ToSlug, l.DwellS)
+		}
 	}
 }
 

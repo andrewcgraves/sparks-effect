@@ -82,18 +82,22 @@ func TestDecodeGoldenFixtureGraphIsRoutable(t *testing.T) {
 		t.Fatalf("Nodes() has no %q; got %v", "south", byslug)
 	}
 
-	secs, wait, service, ok := data.TravelTimeBetween("north", "south")
+	south, ok := data.Search(map[string]int{"north": 0})["south"]
 	if !ok {
-		t.Fatal("TravelTimeBetween(north, south) not ok, want a path")
+		t.Fatal("Search from north did not reach south, want a path")
 	}
-	if secs != 1800 {
-		t.Errorf("vehicle seconds = %d, want 1800", secs)
+	// 1800 s of riding plus the service's 300 s boarding wait.
+	if south.TotalSecs != 2100 {
+		t.Errorf("TotalSecs = %d, want 2100", south.TotalSecs)
 	}
-	if wait != 300 {
-		t.Errorf("wait seconds = %d, want 300", wait)
+	if south.BoardWaitSecs != 300 {
+		t.Errorf("BoardWaitSecs = %d, want 300", south.BoardWaitSecs)
 	}
-	if service != "svc-express" {
-		t.Errorf("service = %q, want %q", service, "svc-express")
+	if south.HopService != "svc-express" {
+		t.Errorf("HopService = %q, want %q", south.HopService, "svc-express")
+	}
+	if south.PredecessorSlug != "north" {
+		t.Errorf("PredecessorSlug = %q, want north", south.PredecessorSlug)
 	}
 }
 

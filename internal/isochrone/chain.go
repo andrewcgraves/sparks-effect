@@ -50,13 +50,54 @@ type ChainRequest struct {
 	CompileJobID string
 }
 
+// Leg is one hop of a journey: the ride from one station to the next on one
+// service, and the dwell served on arrival.
+//
+// Secs is the whole hop, DwellS the part of it the vehicle spends standing at
+// ToSlug — so the ride itself is the difference. DwellS is absent on a graph
+// compiled before the API reported dwell, which is indistinguishable from a hop
+// that genuinely has none; such a journey reads as one with no dwell anywhere,
+// which is incomplete but never wrong.
+type Leg struct {
+	FromSlug  string `json:"from"`
+	ToSlug    string `json:"to"`
+	ServiceID string `json:"service_id,omitempty"`
+	Secs      int    `json:"secs"`
+	DwellS    int    `json:"dwell_s,omitempty"`
+}
+
 // ReachableStation is one station the rider can get to and out from, with the
-// budget accounting that got them there.
+// budget accounting that got them there and the journey it took.
+//
+// The seconds fields sit alongside the whole-minute ones rather than replacing
+// them: a caller adding hop to hop down a long journey accumulates a minute of
+// error per stop if it works in truncated minutes, and the minute fields are
+// what everything reading this response today already uses.
+//
+// PredecessorSlug is what makes the set a tree rather than a list. It names the
+// station ridden from on the last hop, and is empty exactly when the rider
+// walked here from the origin — so following it from any station arrives at one
+// the rider walked to, and the stations with none are the roots.
+//
+// ViaService reports only the first service boarded. It is kept for callers
+// that already read it and superseded by Legs, which names the service ridden
+// on every hop and so stays right across an interchange.
 type ReachableStation struct {
-	StationSlug   string `json:"station_slug"`
-	AccessMins    int    `json:"access_mins"`
-	RemainingMins int    `json:"remaining_mins"`
-	ViaService    string `json:"via_service,omitempty"`
+	StationSlug     string `json:"station_slug"`
+	AccessMins      int    `json:"access_mins"`
+	AccessSecs      int    `json:"access_secs"`
+	RemainingMins   int    `json:"remaining_mins"`
+	RemainingSecs   int    `json:"remaining_secs"`
+	ViaService      string `json:"via_service,omitempty"`
+	PredecessorSlug string `json:"predecessor_slug,omitempty"`
+	// BoardSlug is where the rider boarded and BoardWaitSecs what they waited
+	// there. The wait is charged once for the whole journey, so it belongs to
+	// that station and not to any later one — a transfer costs nothing.
+	BoardSlug     string `json:"board_slug,omitempty"`
+	BoardWaitSecs int    `json:"board_wait_secs,omitempty"`
+	// Legs is the journey retraced, boarding station first. It is empty for a
+	// station the rider walked to and rode nothing from.
+	Legs []Leg `json:"legs,omitempty"`
 }
 
 // StarterWalk is the routed access leg: the walk from the request's origin to
