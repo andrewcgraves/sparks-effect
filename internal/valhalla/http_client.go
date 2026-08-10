@@ -26,6 +26,37 @@ const (
 // indefinitely.
 const DefaultTimeout = 30 * time.Second
 
+// LocationRadiusM and LocationMinReachability widen every location Valhalla is
+// asked to correlate to its graph, on every call this client makes (SPA-234).
+//
+// Valhalla snaps a location to the nearest candidate edge within radius
+// metres, then discards any candidate reaching fewer than minimum_reachability
+// nodes — a disconnected island, such as a construction-site driveway not yet
+// linked to the public network — and searches again among what is left. Left
+// at Valhalla's own defaults (radius effectively 0, i.e. only the very nearest
+// edges; minimum_reachability 50), a point near nothing but a small isolated
+// fragment finds no candidate that survives, and the request is refused with
+// "Locations are in unconnected regions" rather than routed against a nearby
+// edge that actually leads somewhere.
+//
+// Widening radius is the primary lever: it is what gives Valhalla a real
+// connected edge to fall back to at all, a few hundred metres out, rather than
+// only the immediate fragment. minimum_reachability is lowered alongside it,
+// modestly rather than to zero, so a genuinely small but real local road
+// network (a short dead-end, a modest development) still qualifies — the
+// point is to stop rejecting isolated fragments near a point of interest, not
+// to accept routing onto something with no way out.
+//
+// This is general hardening, not specific to any one station: it helps every
+// point that happens to land near a small disconnected OSM fragment —
+// driveways, parking lots, construction sites — of which the Las Vegas
+// terminus (still mid-construction; see Station.RoutingLocation in
+// sparks-effect-api) is the first one this repository has actually hit.
+const (
+	LocationRadiusM         = 500
+	LocationMinReachability = 15
+)
+
 // HTTPClient talks to a Valhalla server over HTTP.
 //
 // There is no API key and no Authorization header. The server is a ClusterIP
@@ -54,17 +85,27 @@ func (c *HTTPClient) WithTimeout(d time.Duration) *HTTPClient {
 	return c
 }
 
+// location builds one Valhalla location object, widened by
+// LocationRadiusM/LocationMinReachability (see their doc comment) so a point
+// near a small disconnected OSM fragment still correlates to the graph.
+func location(p LatLng) map[string]any {
+	return map[string]any{
+		"lat":                  p.Lat,
+		"lon":                  p.Lng,
+		"radius":               LocationRadiusM,
+		"minimum_reachability": LocationMinReachability,
+	}
+}
+
 func (c *HTTPClient) Isochrone(ctx context.Context, req IsochroneRequest) (*IsochroneResponse, error) {
 	// Valhalla's contour time is in minutes and is minute-granular. The
 	// chainer never asks for less than a minute (see minIsoContourSecs there),
 	// so this truncation cannot produce the {"time": 0} that Valhalla rejects.
 	body := map[string]any{
-		"locations": []map[string]any{
-			{"lat": req.Origin.Lat, "lon": req.Origin.Lng},
-		},
-		"costing":  req.Costing,
-		"contours": []map[string]any{{"time": req.BudgetSecs / 60}},
-		"polygons": true,
+		"locations": []map[string]any{location(req.Origin)},
+		"costing":   req.Costing,
+		"contours":  []map[string]any{{"time": req.BudgetSecs / 60}},
+		"polygons":  true,
 	}
 	var resp IsochroneResponse
 	if err := c.post(ctx, isochronePath, body, &resp); err != nil {
@@ -76,11 +117,11 @@ func (c *HTTPClient) Isochrone(ctx context.Context, req IsochroneRequest) (*Isoc
 func (c *HTTPClient) Matrix(ctx context.Context, req MatrixRequest) (*MatrixResponse, error) {
 	sources := make([]map[string]any, len(req.Origins))
 	for i, o := range req.Origins {
-		sources[i] = map[string]any{"lat": o.Lat, "lon": o.Lng}
+		sources[i] = location(o)
 	}
 	targets := make([]map[string]any, len(req.Destinations))
 	for i, d := range req.Destinations {
-		targets[i] = map[string]any{"lat": d.Lat, "lon": d.Lng}
+		targets[i] = location(d)
 	}
 	body := map[string]any{
 		"sources": sources,
@@ -112,11 +153,8 @@ const minDrawableShapePoints = 2
 
 func (c *HTTPClient) Route(ctx context.Context, req RouteRequest) (*RouteResponse, error) {
 	body := map[string]any{
-		"locations": []map[string]any{
-			{"lat": req.Origin.Lat, "lon": req.Origin.Lng},
-			{"lat": req.Destination.Lat, "lon": req.Destination.Lng},
-		},
-		"costing": req.Costing,
+		"locations": []map[string]any{location(req.Origin), location(req.Destination)},
+		"costing":   req.Costing,
 	}
 	var resp routeBody
 	if err := c.post(ctx, routePath, body, &resp); err != nil {

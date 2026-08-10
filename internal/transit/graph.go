@@ -78,11 +78,21 @@ type ServiceGraph struct {
 // The position is why the worker needs no database of stations. A compiled
 // user scenario's node keys are compile-time cluster keys persisted nowhere
 // else, so the coordinate has to ride on the graph or it is unrecoverable.
+//
+// RoutingLat/RoutingLng are nil for almost every node: the API sets them only
+// for a station whose real Lat/Lng the Valhalla graph cannot reach yet — a
+// site still under construction has no walkable network OSM can see, so a
+// pedestrian isochrone centred on it is rejected outright ("Locations are in
+// unconnected regions"). See sparks-effect-api's Station.RoutingLocation
+// (SPA-234). CompiledGraph.Nodes resolves them away immediately: nothing past
+// that point has a reason to know the difference.
 type GraphNode struct {
-	Slug  string   `json:"slug"`
-	Lat   float64  `json:"lat"`
-	Lng   float64  `json:"lng"`
-	Names []string `json:"names"`
+	Slug       string   `json:"slug"`
+	Lat        float64  `json:"lat"`
+	Lng        float64  `json:"lng"`
+	RoutingLat *float64 `json:"routing_lat,omitempty"`
+	RoutingLng *float64 `json:"routing_lng,omitempty"`
+	Names      []string `json:"names"`
 }
 
 // TransitGraph is a compiled, Dijkstra-ready scenario: the services that run,
@@ -172,13 +182,23 @@ var _ GraphData = CompiledGraph{}
 
 // Nodes reports the graph's own node set, carrying the slug and the position
 // the API attached at compile time.
+//
+// A node with a routing anchor (GraphNode.RoutingLat/RoutingLng) reports that
+// point instead of its real Lat/Lng: every routing call this worker makes —
+// egress isochrone, matrix, route — should ask Valhalla about the point that
+// is actually reachable, and Node carries nothing else that would need the
+// real position instead.
 func (d CompiledGraph) Nodes() []Node {
 	if d.Graph == nil {
 		return nil
 	}
 	nodes := make([]Node, len(d.Graph.Nodes))
 	for i, n := range d.Graph.Nodes {
-		nodes[i] = Node{Slug: n.Slug, Lat: n.Lat, Lng: n.Lng}
+		lat, lng := n.Lat, n.Lng
+		if n.RoutingLat != nil && n.RoutingLng != nil {
+			lat, lng = *n.RoutingLat, *n.RoutingLng
+		}
+		nodes[i] = Node{Slug: n.Slug, Lat: lat, Lng: lng}
 	}
 	return nodes
 }

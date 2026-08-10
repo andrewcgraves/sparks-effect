@@ -227,6 +227,36 @@ func TestNodes_carriesPositions(t *testing.T) {
 	}
 }
 
+// A node with a routing anchor (SPA-234) reports the anchor as its position,
+// not its real Lat/Lng: every routing call — egress isochrone, matrix,
+// route — needs a point Valhalla's graph can actually reach, and Node carries
+// nothing that would need the real one instead.
+func TestNodes_reportsRoutingAnchorWhenSet(t *testing.T) {
+	anchorLat, anchorLng := 36.0545, -115.1706
+	g := transit.CompiledGraph{Graph: &transit.TransitGraph{
+		Nodes: []transit.GraphNode{
+			{Slug: "las-vegas", Lat: 36.0545, Lng: -115.1778, RoutingLat: &anchorLat, RoutingLng: &anchorLng},
+			{Slug: "palmdale", Lat: 34.58, Lng: -118.12},
+		},
+	}}
+
+	nodes := g.Nodes()
+	byslug := make(map[string]transit.Node, len(nodes))
+	for _, n := range nodes {
+		byslug[n.Slug] = n
+	}
+
+	lv := byslug["las-vegas"]
+	if lv.Lat != anchorLat || lv.Lng != anchorLng {
+		t.Errorf("las-vegas node = (%v, %v), want the routing anchor (%v, %v)", lv.Lat, lv.Lng, anchorLat, anchorLng)
+	}
+
+	pl := byslug["palmdale"]
+	if pl.Lat != 34.58 || pl.Lng != -118.12 {
+		t.Errorf("palmdale node = (%v, %v), want its own Lat/Lng unchanged (no routing anchor set)", pl.Lat, pl.Lng)
+	}
+}
+
 // HasWait is what the chainer reports as its wait model, in place of the
 // scenario slug the API used to special-case on.
 func TestHasWait(t *testing.T) {

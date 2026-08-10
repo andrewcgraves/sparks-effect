@@ -93,6 +93,34 @@ func TestIsochrone_requestShape(t *testing.T) {
 	}
 }
 
+// Every location on every call carries the widened radius/minimum_reachability
+// (SPA-234), or a point near a small disconnected OSM fragment finds no
+// candidate edge and Valhalla answers 400 "Locations are in unconnected
+// regions" — see LocationRadiusM's doc comment. Checked once here for
+// isochrone's single location; TestMatrix_requestShape and
+// TestRoute_requestShape check the multi-location calls carry it identically.
+func TestIsochrone_locationCarriesWidenedRadiusAndReachability(t *testing.T) {
+	srv := newCaptureServer(t, http.StatusOK, okIsochrone)
+	client := valhalla.NewHTTPClient(srv.URL)
+
+	if _, err := client.Isochrone(context.Background(), valhalla.IsochroneRequest{
+		Origin:     valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+		Costing:    valhalla.CostingPedestrian,
+		BudgetSecs: 1800,
+	}); err != nil {
+		t.Fatalf("Isochrone: %v", err)
+	}
+
+	locations, _ := srv.body["locations"].([]any)
+	loc, _ := locations[0].(map[string]any)
+	if loc["radius"] != float64(valhalla.LocationRadiusM) {
+		t.Errorf("radius = %v, want %d", loc["radius"], valhalla.LocationRadiusM)
+	}
+	if loc["minimum_reachability"] != float64(valhalla.LocationMinReachability) {
+		t.Errorf("minimum_reachability = %v, want %d", loc["minimum_reachability"], valhalla.LocationMinReachability)
+	}
+}
+
 func TestMatrix_requestShape(t *testing.T) {
 	srv := newCaptureServer(t, http.StatusOK, `{"sources_to_targets":[[{"time":600,"distance":1.0},{"time":-1,"distance":0}]]}`)
 	client := valhalla.NewHTTPClient(srv.URL)
@@ -112,11 +140,21 @@ func TestMatrix_requestShape(t *testing.T) {
 	if got := srv.body["costing"]; got != "auto" {
 		t.Errorf("costing = %v, want auto", got)
 	}
-	if sources, _ := srv.body["sources"].([]any); len(sources) != 1 {
+	sources, _ := srv.body["sources"].([]any)
+	if len(sources) != 1 {
 		t.Errorf("sources: want 1, got %v", srv.body["sources"])
 	}
-	if targets, _ := srv.body["targets"].([]any); len(targets) != 2 {
+	targets, _ := srv.body["targets"].([]any)
+	if len(targets) != 2 {
 		t.Errorf("targets: want 2, got %v", srv.body["targets"])
+	}
+	// See TestIsochrone_locationCarriesWidenedRadiusAndReachability: every
+	// location on every call, sources and targets alike, must carry this.
+	if src, _ := sources[0].(map[string]any); src["radius"] != float64(valhalla.LocationRadiusM) {
+		t.Errorf("sources[0] radius = %v, want %d", src["radius"], valhalla.LocationRadiusM)
+	}
+	if tgt, _ := targets[0].(map[string]any); tgt["minimum_reachability"] != float64(valhalla.LocationMinReachability) {
+		t.Errorf("targets[0] minimum_reachability = %v, want %d", tgt["minimum_reachability"], valhalla.LocationMinReachability)
 	}
 
 	if len(resp.SourcesToTargets) != 1 || len(resp.SourcesToTargets[0]) != 2 {
@@ -315,6 +353,15 @@ func TestRoute_requestShape(t *testing.T) {
 	last, _ := locations[1].(map[string]any)
 	if last["lat"] != 37.701 || last["lon"] != -122.4005 {
 		t.Errorf("locations[1] = %v, want lat 37.701 lon -122.4005", last)
+	}
+	// See TestIsochrone_locationCarriesWidenedRadiusAndReachability: origin and
+	// destination alike must carry this, or the walking-directions call hits
+	// the same "unconnected regions" failure the egress isochrone does.
+	if first["radius"] != float64(valhalla.LocationRadiusM) {
+		t.Errorf("locations[0] radius = %v, want %d", first["radius"], valhalla.LocationRadiusM)
+	}
+	if last["minimum_reachability"] != float64(valhalla.LocationMinReachability) {
+		t.Errorf("locations[1] minimum_reachability = %v, want %d", last["minimum_reachability"], valhalla.LocationMinReachability)
 	}
 
 	want := []valhalla.LatLng{
