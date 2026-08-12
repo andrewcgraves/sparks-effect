@@ -99,10 +99,7 @@ func (c *SyntheticClient) Matrix(_ context.Context, req MatrixRequest) (*MatrixR
 		row := make([]MatrixCell, len(req.Destinations))
 		for j, d := range req.Destinations {
 			roadKm := geo.HaversineKm(o.Lat, o.Lng, d.Lat, d.Lng) * geo.DetourFactor
-			row[j] = MatrixCell{
-				Time:     int(math.Round(roadKm / speed * 3600.0)),
-				Distance: roadKm,
-			}
+			row[j] = Cell(int(math.Round(roadKm/speed*3600.0)), roadKm)
 		}
 		rows[i] = row
 	}

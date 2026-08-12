@@ -127,11 +127,20 @@ func TestSyntheticMatrixTimesGrowWithDistance(t *testing.T) {
 		t.Fatalf("shape = %v, want 1×2", resp.SourcesToTargets)
 	}
 	near, far := resp.SourcesToTargets[0][0], resp.SourcesToTargets[0][1]
-	if near.Time <= 0 {
-		t.Errorf("near time = %d, want positive", near.Time)
+	if !near.Routed() || !far.Routed() {
+		t.Fatalf("cells = %+v, %+v, want both routed", near, far)
 	}
-	if far.Time <= near.Time {
-		t.Errorf("far time %d is not greater than near time %d", far.Time, near.Time)
+	if *near.Time <= 0 {
+		t.Errorf("near time = %d, want positive", *near.Time)
+	}
+	if *far.Time <= *near.Time {
+		t.Errorf("far time %d is not greater than near time %d", *far.Time, *near.Time)
+	}
+	// The chainer measures a cell's distance against the straight line to the
+	// station, so a stand-in client that reported a shorter one would have
+	// every one of its own answers dropped.
+	if bLine := geo.HaversineKm(37.7, -122.4, 38.20, -122.39); *far.DistanceKm < bLine {
+		t.Errorf("far distance = %.2f km, want at least the %.2f km straight line", *far.DistanceKm, bLine)
 	}
 }
 

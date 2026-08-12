@@ -1,11 +1,13 @@
 package isochrone_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -108,6 +110,16 @@ func node(slug string, lng, lat float64) transit.Node {
 	return transit.Node{Slug: slug, Lat: lat, Lng: lng}
 }
 
+// tokenRoadKm is the road distance a stubbed matrix cell reports, for the many
+// cases that are about a travel time and have no opinion about a distance.
+//
+// It cannot be a token zero. The chainer drops a cell whose distance undercuts
+// the straight line to the station it names, because no road does that and a
+// cell claiming one is a pair the server declined rather than routed (SPA-243).
+// Every station in these fixtures sits within a few kilometres of the origin,
+// so one comfortably longer value stands in for a real road to any of them.
+const tokenRoadKm = 10.0
+
 func newTestGraph() *fakeGraph {
 	return &fakeGraph{
 		nodes: []transit.Node{
@@ -185,9 +197,9 @@ func interchangeGraph() transit.CompiledGraph {
 func walkableFrom(accessSecs int, index int) *valhalla.MatrixResponse {
 	row := make([]valhalla.MatrixCell, 4)
 	for i := range row {
-		row[i] = valhalla.MatrixCell{Time: -1}
+		row[i] = valhalla.MatrixCell{}
 	}
-	row[index] = valhalla.MatrixCell{Time: accessSecs, Distance: 1.0}
+	row[index] = valhalla.Cell(accessSecs, tokenRoadKm)
 	return &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{row}}
 }
 
@@ -352,8 +364,8 @@ func TestChainer_happyPath_twoStations(t *testing.T) {
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
 				{
-					{Time: 600, Distance: 1.0},  // station-a: 10 mins
-					{Time: 3000, Distance: 5.0}, // station-b: 50 mins
+					valhalla.Cell(600, tokenRoadKm),  // station-a: 10 mins
+					valhalla.Cell(3000, tokenRoadKm), // station-b: 50 mins
 				},
 			},
 		},
@@ -420,8 +432,8 @@ func TestChainer_allUnreachable(t *testing.T) {
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
 				{
-					{Time: -1, Distance: 0},
-					{Time: -1, Distance: 0},
+					{},
+					{},
 				},
 			},
 		},
@@ -448,8 +460,8 @@ func TestChainer_zeroRemainingExcludesStation(t *testing.T) {
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
 				{
-					{Time: 600, Distance: 1.0}, // station-a: 10 mins
-					{Time: -1, Distance: 0},    // station-b: unreachable
+					valhalla.Cell(600, tokenRoadKm), // station-a: 10 mins
+					{},                              // station-b: unreachable
 				},
 			},
 		},
@@ -482,7 +494,7 @@ func TestChainer_directAccess_AequalsB(t *testing.T) {
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
-				{{Time: 600, Distance: 1.0}}, // 10 mins
+				{valhalla.Cell(600, tokenRoadKm)}, // 10 mins
 			},
 		},
 	}
@@ -535,11 +547,11 @@ func TestChainer_concurrentFanOut_noRace(t *testing.T) {
 	tt := make(map[[2]string]int)
 
 	nodes[0] = node("hub", -122.40, 37.70)
-	cells[0] = valhalla.MatrixCell{Time: 600, Distance: 1.0}
+	cells[0] = valhalla.Cell(600, tokenRoadKm)
 	for i := range stationCount {
 		slug := "st-" + string(rune('a'+i))
 		nodes[i+1] = node(slug, -122.40+0.005*float64(i+1), 37.70+0.005*float64(i+1))
-		cells[i+1] = valhalla.MatrixCell{Time: -1, Distance: 0}
+		cells[i+1] = valhalla.MatrixCell{}
 		tt[[2]string{"hub", slug}] = 600
 	}
 
@@ -569,11 +581,11 @@ func TestChainer_egressFanOutIsBoundedByConfiguration(t *testing.T) {
 	cells := make([]valhalla.MatrixCell, nodeCount+1)
 	tt := make(map[[2]string]int)
 	nodes[0] = node("hub", -122.40, 37.70)
-	cells[0] = valhalla.MatrixCell{Time: 600, Distance: 1.0}
+	cells[0] = valhalla.Cell(600, tokenRoadKm)
 	for i := range nodeCount {
 		slug := fmt.Sprintf("station-%d", i)
 		nodes[i+1] = node(slug, -122.40+0.001*float64(i), 37.70)
-		cells[i+1] = valhalla.MatrixCell{Time: -1, Distance: 0}
+		cells[i+1] = valhalla.MatrixCell{}
 		tt[[2]string{"hub", slug}] = 600
 	}
 
@@ -647,7 +659,7 @@ func TestChainer_haversineFilterExcludesFarStations(t *testing.T) {
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
-			SourcesToTargets: [][]valhalla.MatrixCell{{{Time: 600, Distance: 1.0}}},
+			SourcesToTargets: [][]valhalla.MatrixCell{{valhalla.Cell(600, tokenRoadKm)}},
 		},
 	}
 	chainer := newChainer(fc, graph)
@@ -676,7 +688,7 @@ func TestChainer_driveReachFollowsBudgetNotA20kmFloor(t *testing.T) {
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
-				{{Time: 600, Distance: 1.0}, {Time: 1800, Distance: 30.0}},
+				{valhalla.Cell(600, tokenRoadKm), valhalla.Cell(1800, tokenRoadKm)},
 			},
 		},
 	}
@@ -706,7 +718,7 @@ func TestChainer_driveReachCappedAtAutoMatrixBLineLimit(t *testing.T) {
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
-			SourcesToTargets: [][]valhalla.MatrixCell{{{Time: 600, Distance: 1.0}}},
+			SourcesToTargets: [][]valhalla.MatrixCell{{valhalla.Cell(600, tokenRoadKm)}},
 		},
 	}
 	chainer := newChainer(fc, graph)
@@ -739,7 +751,7 @@ func TestChainer_matrixPairCap_truncates(t *testing.T) {
 			-122.40+0.001*float64(i%30),
 			37.70+0.001*float64(i/30),
 		)
-		cells[i] = valhalla.MatrixCell{Time: -1, Distance: 0}
+		cells[i] = valhalla.MatrixCell{}
 	}
 
 	limits := valhalla.DefaultLimits()
@@ -777,7 +789,7 @@ func TestChainer_defaultMatrixCapIsValhallasNotStadias(t *testing.T) {
 			-122.40+0.001*float64(i%30),
 			37.70+0.001*float64(i/30),
 		)
-		cells[i] = valhalla.MatrixCell{Time: -1, Distance: 0}
+		cells[i] = valhalla.MatrixCell{}
 	}
 
 	fc := &valhalla.StubClient{
@@ -852,7 +864,7 @@ func TestChainer_drive_egressIsoUsesFullRemainingBudget(t *testing.T) {
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
-				{{Time: 600, Distance: 1.0}, {Time: -1, Distance: 0}}, // hub: 10 min access
+				{valhalla.Cell(600, tokenRoadKm), {}}, // hub: 10 min access
 			},
 		},
 	}
@@ -889,7 +901,7 @@ func TestChainer_subMinuteRemainingBudget_stationDropped(t *testing.T) {
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
 			// 600 s budget − 570 s access = 30 s remaining → 0 whole minutes.
-			SourcesToTargets: [][]valhalla.MatrixCell{{{Time: 570, Distance: 1.0}}},
+			SourcesToTargets: [][]valhalla.MatrixCell{{valhalla.Cell(570, tokenRoadKm)}},
 		},
 	}
 	chainer := newChainer(fc, graph)
@@ -978,7 +990,7 @@ func TestChainer_egressFailureFailsTheChain(t *testing.T) {
 	fc := &valhalla.StubClient{
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
-				{{Time: 600, Distance: 1.0}, {Time: -1, Distance: 0}},
+				{valhalla.Cell(600, tokenRoadKm), {}},
 			},
 		},
 		IsochroneFn: func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
@@ -1087,8 +1099,8 @@ func TestChainer_graphWithoutWait_waitModelNone(t *testing.T) {
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
 				{
-					{Time: 600, Distance: 1.0},  // hsr-a: 10 min
-					{Time: 3000, Distance: 5.0}, // hsr-b: 50 min direct
+					valhalla.Cell(600, tokenRoadKm),  // hsr-a: 10 min
+					valhalla.Cell(3000, tokenRoadKm), // hsr-b: 50 min direct
 				},
 			},
 		},
@@ -1128,8 +1140,8 @@ func TestChainer_graphWithWait_waitModelHeadway(t *testing.T) {
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
 				{
-					{Time: 600, Distance: 1.0}, // station-a: 10 min
-					{Time: -1, Distance: 0},    // station-b: not directly reachable
+					valhalla.Cell(600, tokenRoadKm), // station-a: 10 min
+					{},                              // station-b: not directly reachable
 				},
 			},
 		},
@@ -1166,7 +1178,7 @@ func TestChainer_egressFeaturesCarryTheirStation(t *testing.T) {
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
-			SourcesToTargets: [][]valhalla.MatrixCell{{{Time: 540, Distance: 1.0}, {Time: -1, Distance: 0}}},
+			SourcesToTargets: [][]valhalla.MatrixCell{{valhalla.Cell(540, tokenRoadKm), {}}},
 		},
 	}
 	chainer := newChainer(fc, graph)
@@ -1250,8 +1262,8 @@ func TestChainer_starterWalkCarriesTheRoutedShape(t *testing.T) {
 		RouteResp:     cannedRoute(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{{
-				{Time: 600, Distance: 1.0},  // station-a: 10 mins on foot
-				{Time: 3000, Distance: 5.0}, // station-b: 50 mins on foot
+				valhalla.Cell(600, tokenRoadKm),  // station-a: 10 mins on foot
+				valhalla.Cell(3000, tokenRoadKm), // station-b: 50 mins on foot
 			}},
 		},
 	}
@@ -1294,8 +1306,8 @@ func TestChainer_onlyTheStarterStationIsRouted(t *testing.T) {
 		RouteResp:     cannedRoute(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{{
-				{Time: 600, Distance: 1.0},
-				{Time: 3000, Distance: 5.0},
+				valhalla.Cell(600, tokenRoadKm),
+				valhalla.Cell(3000, tokenRoadKm),
 			}},
 		},
 	}
@@ -1335,8 +1347,8 @@ func TestChainer_noReachedStation_noStarterWalk(t *testing.T) {
 		RouteResp:     cannedRoute(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{{
-				{Time: -1, Distance: 0},
-				{Time: -1, Distance: 0},
+				{},
+				{},
 			}},
 		},
 	}
@@ -1371,8 +1383,8 @@ func TestChainer_starterIsTheShortestWalkThenTheSlug(t *testing.T) {
 		RouteResp:     cannedRoute(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{{
-				{Time: 612, Distance: 1.0}, // station-a: 10 mins
-				{Time: 600, Distance: 1.0}, // station-b: 10 mins
+				valhalla.Cell(612, tokenRoadKm), // station-a: 10 mins
+				valhalla.Cell(600, tokenRoadKm), // station-b: 10 mins
 			}},
 		},
 	}
@@ -1391,8 +1403,8 @@ func TestChainer_starterIsTheShortestWalkThenTheSlug(t *testing.T) {
 		RouteResp:     cannedRoute(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{{
-				{Time: 660, Distance: 1.0}, // station-a: 11 mins
-				{Time: 600, Distance: 1.0}, // station-b: 10 mins
+				valhalla.Cell(660, tokenRoadKm), // station-a: 11 mins
+				valhalla.Cell(600, tokenRoadKm), // station-b: 10 mins
 			}},
 		},
 	}
@@ -1402,6 +1414,125 @@ func TestChainer_starterIsTheShortestWalkThenTheSlug(t *testing.T) {
 	}
 	if resp2.Metadata.StarterWalk == nil || resp2.Metadata.StarterWalk.StationSlug != "station-b" {
 		t.Errorf("StarterWalk = %+v, want station-b as the shorter walk", resp2.Metadata.StarterWalk)
+	}
+}
+
+// SPA-243: a pair Valhalla declined to route is not a station next door.
+//
+// It declines by answering nulls, which decode to a zero time beside a zero
+// distance, and taking that at face value makes a station a hundred kilometres
+// away the nearest thing in the plot: nearer than the one across the road, so
+// the access leg is drawn to it and the search is seeded with the rider already
+// standing on its platform. Both spellings of "no route" are covered, and so is
+// the third shape the same nonsense takes — a road shorter than the straight
+// line it is supposed to span, which no road is.
+//
+// Drive is where this bit. It is the only mode whose reach admits a station far
+// enough away for the routing graph not to have it at all.
+func TestChainer_matrixPairThatWasNeverRoutedIsNotAnAccessStation(t *testing.T) {
+	// far-station is some 150 km off: within a four-hour drive, and nowhere
+	// near the origin by any measure.
+	graph := &fakeGraph{
+		nodes: []transit.Node{
+			node("near-station", -122.39, 37.71),
+			node("far-station", -121.0, 38.5),
+		},
+	}
+	chainWithFarCell := func(t *testing.T, far valhalla.MatrixCell) *isochrone.ChainResponse {
+		t.Helper()
+		fc := &valhalla.StubClient{
+			IsochroneResp: cannedIso(),
+			RouteResp:     cannedRoute(),
+			MatrixResp: &valhalla.MatrixResponse{
+				SourcesToTargets: [][]valhalla.MatrixCell{{
+					valhalla.Cell(600, tokenRoadKm), // near-station: a 10-minute drive
+					far,
+				}},
+			},
+		}
+		resp, err := newChainer(fc, graph).Chain(context.Background(), req(240, transit.TravelModeDrive))
+		if err != nil {
+			t.Fatalf("Chain: %v", err)
+		}
+		return resp
+	}
+
+	for _, tc := range []struct {
+		name string
+		far  valhalla.MatrixCell
+	}{
+		{"nulls, which is how Valhalla reports a pair it could not route", valhalla.MatrixCell{}},
+		{"a pair of zeroes, which is how an older build reports the same", valhalla.Cell(0, 0)},
+		{"a road shorter than the straight line it spans", valhalla.Cell(60, 0.5)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := chainWithFarCell(t, tc.far)
+
+			if _, ok := stationsBySlug(t, resp)["far-station"]; ok {
+				t.Error("far-station was reported reached, off a pair that was never routed")
+			}
+			if resp.Metadata.StarterWalk == nil || resp.Metadata.StarterWalk.StationSlug != "near-station" {
+				t.Errorf("StarterWalk = %+v, want near-station — the one the rider can actually drive to",
+					resp.Metadata.StarterWalk)
+			}
+		})
+	}
+
+	// And the rule bites only on the impossible: a genuinely long drive, stated
+	// as a genuinely long road, is still an access leg.
+	t.Run("a real drive to a distant station is kept", func(t *testing.T) {
+		resp := chainWithFarCell(t, valhalla.Cell(7200, 190.0))
+
+		if _, ok := stationsBySlug(t, resp)["far-station"]; !ok {
+			t.Error("far-station was dropped, though its two-hour drive covers a plausible road")
+		}
+		if resp.Metadata.StarterWalk == nil || resp.Metadata.StarterWalk.StationSlug != "near-station" {
+			t.Errorf("StarterWalk = %+v, want near-station as the shorter of the two drives",
+				resp.Metadata.StarterWalk)
+		}
+	})
+}
+
+// A station the routing graph cannot answer for is a gap in the map data, and
+// the plot is the only thing that ever notices. Dropping it silently is how
+// SPA-243 stayed invisible until it produced a visibly wrong plot, so each drop
+// names its station at a level that is on in production.
+func TestChainer_droppedMatrixPairsAreLoggedByName(t *testing.T) {
+	graph := &fakeGraph{
+		nodes: []transit.Node{
+			node("near-station", -122.39, 37.71),
+			node("unrouted-station", -121.0, 38.5),
+			node("implausible-station", -121.2, 38.4),
+		},
+	}
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteResp:     cannedRoute(),
+		MatrixResp: &valhalla.MatrixResponse{
+			SourcesToTargets: [][]valhalla.MatrixCell{{
+				valhalla.Cell(600, tokenRoadKm),
+				valhalla.MatrixCell{},  // no route found
+				valhalla.Cell(60, 0.5), // a road shorter than the line it spans
+			}},
+		},
+	}
+
+	var buf bytes.Buffer
+	chainer := isochrone.New(fc, graph, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.New(&buf, false))
+	if _, err := chainer.Chain(context.Background(), req(240, transit.TravelModeDrive)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	logged := buf.String()
+	for _, want := range []string{"unrouted-station", "implausible-station"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("%s was dropped without being named in the log:\n%s", want, logged)
+		}
+	}
+	// The station that was answered for is not a drop, so it has nothing to
+	// report — a log line per station would bury the two that matter.
+	if strings.Contains(logged, "near-station") {
+		t.Errorf("near-station was reached and should not appear in the log:\n%s", logged)
 	}
 }
 
@@ -1419,7 +1550,7 @@ func TestChainer_starterIsNeverAStationReachedByRiding(t *testing.T) {
 		IsochroneResp: cannedIso(),
 		RouteResp:     cannedRoute(),
 		MatrixResp: &valhalla.MatrixResponse{
-			SourcesToTargets: [][]valhalla.MatrixCell{{{Time: 540, Distance: 1.0}, {Time: -1, Distance: 0}}},
+			SourcesToTargets: [][]valhalla.MatrixCell{{valhalla.Cell(540, tokenRoadKm), {}}},
 		},
 	}
 
@@ -1441,8 +1572,8 @@ func TestChainer_routeFailureLeavesTheChainIntact(t *testing.T) {
 		RouteErr:      fmt.Errorf("%w: no path could be found", valhalla.ErrBadRequest),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{{
-				{Time: 600, Distance: 1.0},
-				{Time: 3000, Distance: 5.0},
+				valhalla.Cell(600, tokenRoadKm),
+				valhalla.Cell(3000, tokenRoadKm),
 			}},
 		},
 	}
@@ -1478,11 +1609,11 @@ func TestChainer_starterRouteRunsAlongsideTheEgressFanOut(t *testing.T) {
 	tt := make(map[[2]string]int)
 
 	nodes[0] = node("hub", -122.40, 37.70)
-	cells[0] = valhalla.MatrixCell{Time: 600, Distance: 1.0}
+	cells[0] = valhalla.Cell(600, tokenRoadKm)
 	for i := range stationCount {
 		slug := fmt.Sprintf("station-%d", i)
 		nodes[i+1] = node(slug, -122.40+0.005*float64(i+1), 37.70+0.005*float64(i+1))
-		cells[i+1] = valhalla.MatrixCell{Time: -1, Distance: 0}
+		cells[i+1] = valhalla.MatrixCell{}
 		tt[[2]string{"hub", slug}] = 600
 	}
 

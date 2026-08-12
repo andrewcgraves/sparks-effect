@@ -122,7 +122,7 @@ func TestIsochrone_locationCarriesWidenedRadiusAndReachability(t *testing.T) {
 }
 
 func TestMatrix_requestShape(t *testing.T) {
-	srv := newCaptureServer(t, http.StatusOK, `{"sources_to_targets":[[{"time":600,"distance":1.0},{"time":-1,"distance":0}]]}`)
+	srv := newCaptureServer(t, http.StatusOK, `{"sources_to_targets":[[{"time":600,"distance":1.0},{"time":null,"distance":null}]]}`)
 	client := valhalla.NewHTTPClient(srv.URL)
 
 	resp, err := client.Matrix(context.Background(), valhalla.MatrixRequest{
@@ -139,6 +139,12 @@ func TestMatrix_requestShape(t *testing.T) {
 	}
 	if got := srv.body["costing"]; got != "auto" {
 		t.Errorf("costing = %v, want auto", got)
+	}
+	// The chainer compares a cell's distance against a great-circle distance in
+	// kilometres, so the units the answer comes back in are not left to the
+	// server's configuration.
+	if got := srv.body["units"]; got != "kilometers" {
+		t.Errorf("units = %v, want kilometers", got)
 	}
 	sources, _ := srv.body["sources"].([]any)
 	if len(sources) != 1 {
@@ -160,13 +166,16 @@ func TestMatrix_requestShape(t *testing.T) {
 	if len(resp.SourcesToTargets) != 1 || len(resp.SourcesToTargets[0]) != 2 {
 		t.Fatalf("SourcesToTargets shape = %v", resp.SourcesToTargets)
 	}
-	if resp.SourcesToTargets[0][0].Time != 600 {
-		t.Errorf("cell 0 time = %d, want 600", resp.SourcesToTargets[0][0].Time)
+	routed := resp.SourcesToTargets[0][0]
+	if !routed.Routed() || *routed.Time != 600 || *routed.DistanceKm != 1.0 {
+		t.Errorf("cell 0 = %+v, want a routed 600 s / 1.0 km", routed)
 	}
-	// -1 is Valhalla's "unreachable", and it must survive decoding as -1
-	// rather than being coerced to zero, which would read as "instant".
-	if resp.SourcesToTargets[0][1].Time != -1 {
-		t.Errorf("cell 1 time = %d, want -1 (unreachable)", resp.SourcesToTargets[0][1].Time)
+	// Valhalla reports a pair it could not route as a pair of nulls, and the
+	// difference between that and a zero has to survive decoding: zero seconds
+	// reads as "the rider is already there", which is how SPA-243 drew the
+	// access leg to a station two hours away.
+	if declined := resp.SourcesToTargets[0][1]; declined.Routed() {
+		t.Errorf("cell 1 = %+v, want an unrouted pair", declined)
 	}
 }
 

@@ -148,15 +148,7 @@ func (c *chainImpl) Chain(ctx context.Context, req ChainRequest) (*ChainResponse
 	}
 	c.log.Debug(ctx, "chain: origin isochrone and matrix calls done")
 
-	accessSecs := make(map[string]int)
-	if matrixResp != nil && len(matrixResp.SourcesToTargets) > 0 {
-		row := matrixResp.SourcesToTargets[0]
-		for i, n := range nearbyNodes {
-			if i < len(row) && row[i].Time >= 0 {
-				accessSecs[n.Slug] = row[i].Time
-			}
-		}
-	}
+	accessSecs := c.accessTimes(ctx, req, nearbyNodes, matrixResp)
 	c.log.Debug(ctx, "chain: matrix reachability", "reachable", len(accessSecs), "total_nodes", len(nodes))
 
 	egressCandidates := c.bestEgressPerNode(req, nodes, accessSecs)
@@ -391,6 +383,110 @@ func (c *chainImpl) originAndMatrix(
 		return nil, nil, err
 	}
 	return originIso, matrixResp, nil
+}
+
+// snapSlackKm is how much shorter than the straight line a routed distance may
+// honestly come out.
+//
+// Valhalla correlates each end of a pair to the nearest edge it will accept,
+// up to valhalla.LocationRadiusM away, so both ends can move inward and the
+// road it then measures spans slightly less than the line between the raw
+// points. Twice the radius is the most that can account for.
+const snapSlackKm = 2 * float64(valhalla.LocationRadiusM) / 1000.0
+
+// accessTimes reads the matrix row into the access seconds the search is
+// seeded with, keeping only the pairs Valhalla actually routed.
+//
+// Two things disqualify a cell, and both say the same thing in different
+// words. One is Valhalla declining the pair outright — see valhalla.MatrixCell.
+// The other is a cell that is arithmetically impossible: a road cannot be
+// shorter than the straight line it spans, so a distance under that line is
+// not a measurement of any journey, and the time beside it is not an access
+// time. That is the shape a declined pair takes on a server that reports one
+// as a pair of zeroes rather than a pair of nulls.
+//
+// Dropping them matters far beyond one wrong number. A zero-second access leg
+// makes a station the closest thing in the plot however far away it is: it
+// becomes the station the access leg is drawn to, it seeds the search with the
+// rider standing on a platform two hours' drive away, and every station beyond
+// it inherits a journey that never happened. Drive is where this shows,
+// because drive is the only mode whose reach admits a station distant enough
+// for the routing graph not to have it.
+//
+// Both drops are reported by name, and that is the point of them being here
+// rather than folded into the guard above. A station within the rider's reach
+// that the routing graph cannot answer for is a gap in the map data, not a
+// fact about this plot: the site is greenfield, or its road is not in OSM yet,
+// and the answer is a routing anchor on the station (see sparks-effect-api's
+// Station.RoutingLocation, SPA-234) rather than anything this worker can
+// compute. Dropped silently, that gap shows up only as a station quietly
+// missing from every drive plot, which is how it went unnoticed until it
+// produced a visibly wrong one.
+func (c *chainImpl) accessTimes(
+	ctx context.Context,
+	req ChainRequest,
+	nearbyNodes []transit.Node,
+	matrixResp *valhalla.MatrixResponse,
+) map[string]int {
+	accessSecs := make(map[string]int)
+	if matrixResp == nil || len(matrixResp.SourcesToTargets) == 0 {
+		return accessSecs
+	}
+
+	var unrouted, implausible []string
+
+	row := matrixResp.SourcesToTargets[0]
+	for i, n := range nearbyNodes {
+		if i >= len(row) {
+			break
+		}
+		cell := row[i]
+		if !cell.Routed() {
+			unrouted = append(unrouted, n.Slug)
+			continue
+		}
+		bLineKm := geo.HaversineKm(req.Lat, req.Lng, n.Lat, n.Lng)
+		if *cell.DistanceKm+snapSlackKm < bLineKm {
+			implausible = append(implausible, n.Slug)
+			c.log.Debug(ctx, "chain: matrix pair shorter than the straight line",
+				"station_slug", n.Slug,
+				"secs", *cell.Time,
+				"distance_km", *cell.DistanceKm,
+				"b_line_km", bLineKm)
+			continue
+		}
+		accessSecs[n.Slug] = *cell.Time
+	}
+
+	c.logDropped(ctx, req, "chain: routing graph found no route to these stations, dropping them", unrouted)
+	c.logDropped(ctx, req, "chain: routing graph answered these stations with a road shorter than the straight line, dropping them", implausible)
+
+	return accessSecs
+}
+
+// maxLoggedSlugs bounds the station list on the summary below. The count
+// beside it is never truncated, so a run that dropped more than this still
+// says how many: the list is there to name the handful an operator is expected
+// to go and fix, not to be exhaustive on a graph where something has gone
+// wrong systematically.
+const maxLoggedSlugs = 20
+
+// logDropped reports one reason's worth of dropped stations, and says nothing
+// at all when there were none — the ordinary case, where every station within
+// reach was answered for.
+func (c *chainImpl) logDropped(ctx context.Context, req ChainRequest, msg string, slugs []string) {
+	if len(slugs) == 0 {
+		return
+	}
+	listed := slugs
+	if len(listed) > maxLoggedSlugs {
+		listed = listed[:maxLoggedSlugs]
+	}
+	c.log.Info(ctx, msg,
+		"compile_job_id", req.CompileJobID,
+		"mode", req.Mode,
+		"count", len(slugs),
+		"station_slugs", listed)
 }
 
 type egressCandidate struct {

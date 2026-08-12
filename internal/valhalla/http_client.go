@@ -123,10 +123,15 @@ func (c *HTTPClient) Matrix(ctx context.Context, req MatrixRequest) (*MatrixResp
 	for i, d := range req.Destinations {
 		targets[i] = location(d)
 	}
+	// Units are asked for rather than assumed. Kilometres are Valhalla's own
+	// default, but the chainer checks a cell's distance against the straight
+	// line to the station it names, and a server configured for miles would
+	// make every one of those comparisons wrong by a factor of 1.6.
 	body := map[string]any{
 		"sources": sources,
 		"targets": targets,
 		"costing": req.Costing,
+		"units":   "kilometers",
 	}
 	var resp MatrixResponse
 	if err := c.post(ctx, matrixPath, body, &resp); err != nil {

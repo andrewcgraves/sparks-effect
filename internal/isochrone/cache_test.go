@@ -114,9 +114,9 @@ func twoReachableStations() *valhalla.StubClient {
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
 				{
-					{Time: 600, Distance: 1.0}, // hub: 10 mins, directly walkable
-					{Time: -1, Distance: 0},    // station-a: only reachable via the hub
-					{Time: -1, Distance: 0},    // station-b: only reachable via the hub
+					valhalla.Cell(600, tokenRoadKm), // hub: 10 mins, directly walkable
+					{},                              // station-a: only reachable via the hub
+					{},                              // station-b: only reachable via the hub
 				},
 			},
 		},

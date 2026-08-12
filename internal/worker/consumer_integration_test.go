@@ -325,7 +325,7 @@ func TestEndToEnd_transientFailureThatRecoversSucceeds(t *testing.T) {
 	synthetic := valhalla.NewSyntheticClient()
 	var attempts atomic.Int32
 	client := &valhalla.StubClient{
-		MatrixResp: &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{{{Time: -1}, {Time: -1}}}},
+		MatrixResp: &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{{{}, {}}}},
 		IsochroneFn: func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
 			if attempts.Add(1) == 1 {
 				return nil, valhalla.ErrUpstream

@@ -77,11 +77,36 @@ type MatrixRequest struct {
 	Costing      Costing
 }
 
-// MatrixCell holds travel time (seconds) for one origin→destination pair.
-// Time == -1 means unreachable.
+// MatrixCell is Valhalla's answer for one origin→destination pair: the travel
+// time in seconds and the road distance in kilometres, or nothing at all where
+// it found no route between them.
+//
+// Both fields are pointers because "no route" is spelled null on the wire —
+// {"time": null, "distance": null} — and decoding that into a plain int gives
+// zero, which is what a pair the rider is already standing on looks like. A
+// station two hours away admitted at zero seconds is then the nearest thing in
+// the plot and the access leg is drawn to it, which is exactly what SPA-243
+// was. The -1 this used to test for was Stadia's sentinel, not Valhalla's;
+// Routed still rejects it, so a server that does spell it that way is handled
+// too.
 type MatrixCell struct {
-	Time     int     `json:"time"`
-	Distance float64 `json:"distance"`
+	Time       *int     `json:"time"`
+	DistanceKm *float64 `json:"distance"`
+}
+
+// Routed reports whether the cell describes a journey Valhalla actually found.
+// The zero MatrixCell is not one, which is what makes a missing pair and a
+// declined pair the same thing to a caller.
+func (c MatrixCell) Routed() bool {
+	return c.Time != nil && *c.Time >= 0 && c.DistanceKm != nil && *c.DistanceKm >= 0
+}
+
+// Cell builds a routed cell. Stand-in clients and tests are the only callers:
+// a decoded response has its pointers set by encoding/json, and taking the
+// address of a loop variable at every one of those call sites is noise that
+// hides what the cell is meant to say.
+func Cell(secs int, distanceKm float64) MatrixCell {
+	return MatrixCell{Time: &secs, DistanceKm: &distanceKm}
 }
 
 type MatrixResponse struct {
