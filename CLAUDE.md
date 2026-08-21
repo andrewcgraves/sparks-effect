@@ -14,3 +14,8 @@ Use the Makefile for all build/test tasks (Go project).
 The Postgres schema is owned by sparks-effect-api's migration sequence. This
 repository runs no migrations; `internal/testsupport/schema.sql` is a test-only
 copy.
+
+## Branching
+
+One trunk: `main`. Branch from it, PR into it. No `prd` branch here. See
+`docs/releases.md`.

@@ -84,9 +84,16 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # `sha-<commit>` is the promotable artifact: immutable, and what
+          # kustomize-config's production overlay pins. `staging` is a moving
+          # tag for whatever the trunk last built.
+          #
+          # No `latest`. The cluster used to pull it, and Kubernetes defaults
+          # imagePullPolicy: Always for `:latest` — so every pod restart was an
+          # unrecorded production upgrade to whatever had merged most recently.
           tags: |
-            type=raw,value=latest
             type=sha
+            type=raw,value=staging
 
       - name: Build and push
         uses: docker/build-push-action@v6

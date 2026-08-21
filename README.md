@@ -114,6 +114,12 @@ after a restart — and an in-memory counter would begin again at zero. That is
 also why the retry path republishes rather than nacking with requeue: a nack
 puts the original bytes back unchanged, so the counter would never advance.
 
+## Branching and releases
+
+One trunk: `main`. Branch from it, PR into it. Production runs whichever
+`sha-<commit>` image `kustomize-config` pins — see
+[`docs/releases.md`](docs/releases.md).
+
 ## Running it
 
 `VALHALLA_URL` decides what backs the routing calls. Unset, the worker serves
