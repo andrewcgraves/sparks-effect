@@ -116,6 +116,92 @@ func TestSearch_reportsUnreachableNodesByOmission(t *testing.T) {
 	}
 }
 
+// A bidirectional hop is two independent edges, and the API is free to give
+// them different durations: since SPA-245 it compiles a segment's optional
+// reverse_run_seconds into the reverse edge rather than mirroring the forward
+// run time. CA HSR has two such hops — Gilroy<->Merced over Pacheco Pass and
+// Bakersfield<->Palmdale over Tehachapi — where the northbound run is the
+// faster one.
+//
+// Nothing here has to change to honour that; the search already keys its
+// adjacency on Edge.FromSlug and never consults a pair's opposite. This pins
+// that, so a future pass that "simplifies" the pooling by treating a pair as
+// one undirected hop fails here rather than silently shifting every isochrone
+// that crosses one of those two hops.
+func TestSearch_honoursDifferentDurationsEachWayAcrossOnePair(t *testing.T) {
+	g := graph(svc("ca-hsr-local", 0,
+		edge("gilroy", "merced", 3140),
+		edge("merced", "gilroy", 3030),
+	))
+
+	southbound, ok := g.Search(from("gilroy", 0))["merced"]
+	if !ok {
+		t.Fatal("Search did not reach merced from gilroy")
+	}
+	northbound, ok := g.Search(from("merced", 0))["gilroy"]
+	if !ok {
+		t.Fatal("Search did not reach gilroy from merced")
+	}
+
+	if southbound.TotalSecs != 3140 {
+		t.Errorf("gilroy -> merced = %d s, want 3140", southbound.TotalSecs)
+	}
+	if northbound.TotalSecs != 3030 {
+		t.Errorf("merced -> gilroy = %d s, want 3030 — the reverse edge carries its own duration", northbound.TotalSecs)
+	}
+	if southbound.TotalSecs == northbound.TotalSecs {
+		t.Errorf("both directions settled at %d s; the pair's two edges were collapsed into one", southbound.TotalSecs)
+	}
+}
+
+// The asymmetry survives a corridor rather than only a single hop: a journey
+// end to end is the sum of the edges actually ridden, so the two directions of
+// a line carrying one asymmetric hop arrive at different totals. This is the
+// shape the isochrones are plotted from, and the reason the departure surface
+// drawn from one terminus can no longer be read as the arrival surface of the
+// other.
+func TestSearch_corridorTotalsDifferByDirection(t *testing.T) {
+	g := graph(svc("ca-hsr-local", 0,
+		// Symmetric either side of the mountain hop, so the whole of the
+		// difference below comes from that one span.
+		edge("sf", "gilroy", 1200), edge("gilroy", "sf", 1200),
+		edge("gilroy", "merced", 3140), edge("merced", "gilroy", 3030),
+		edge("merced", "fresno", 900), edge("fresno", "merced", 900),
+	))
+
+	down := g.Search(from("sf", 0))["fresno"]
+	up := g.Search(from("fresno", 0))["sf"]
+
+	if down.TotalSecs != 5240 {
+		t.Errorf("sf -> fresno = %d s, want 5240 (1200 + 3140 + 900)", down.TotalSecs)
+	}
+	if up.TotalSecs != 5130 {
+		t.Errorf("fresno -> sf = %d s, want 5130 (900 + 3030 + 1200)", up.TotalSecs)
+	}
+}
+
+// Dwell rides on the edge, so the two directions of one pair report their own.
+// The chainer subtracts HopDwellS off HopSecs to say how long the vehicle stood
+// at a station, and reading the forward edge's dwell against a reverse hop
+// would misreport that on exactly the hops SPA-245 made asymmetric.
+func TestSearch_carriesDwellPerDirectionOfAPair(t *testing.T) {
+	g := graph(svc("ca-hsr-local", 0,
+		transit.Edge{FromSlug: "gilroy", ToSlug: "merced", Seconds: 3140, DwellS: 90},
+		transit.Edge{FromSlug: "merced", ToSlug: "gilroy", Seconds: 3075, DwellS: 45},
+	))
+
+	southbound := g.Search(from("gilroy", 0))["merced"]
+	if southbound.HopSecs != 3140 || southbound.HopDwellS != 90 {
+		t.Errorf("hop into merced = %d s with %d s dwell, want 3140 and 90",
+			southbound.HopSecs, southbound.HopDwellS)
+	}
+	northbound := g.Search(from("merced", 0))["gilroy"]
+	if northbound.HopSecs != 3075 || northbound.HopDwellS != 45 {
+		t.Errorf("hop into gilroy = %d s with %d s dwell, want 3075 and 45",
+			northbound.HopSecs, northbound.HopDwellS)
+	}
+}
+
 // An access station is reached at the cost of walking to it and nothing more.
 // The chainer relies on this for the station a rider walks straight to and does
 // not ride from.

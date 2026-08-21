@@ -56,6 +56,16 @@ func (m TravelMode) Valid() bool {
 // vanish into the total. It is additive and absent on graphs compiled before
 // the API emitted it, which decode with a zero indistinguishable from a hop
 // that really has no dwell — see the chainer's legs.
+//
+// A pair of stations served both ways is two of these, and their Seconds need
+// not agree. Most hops are symmetric and the API compiles them that way, but a
+// segment carrying reverse_run_seconds — CA HSR's Pacheco Pass and Tehachapi
+// crossings, where northbound is the faster run (SPA-245) — compiles into two
+// edges of different duration. The search reads only Edge.FromSlug, so this
+// costs nothing here; it is recorded because folding a pair into one undirected
+// hop would look like a harmless simplification and would move every isochrone
+// crossing those spans. See
+// TestSearch_honoursDifferentDurationsEachWayAcrossOnePair.
 type Edge struct {
 	FromSlug string `json:"from_slug"`
 	ToSlug   string `json:"to_slug"`
