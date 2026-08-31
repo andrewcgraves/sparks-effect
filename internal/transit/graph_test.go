@@ -641,3 +641,19 @@ func TestSearch_matchesThePerPairSearchOnRandomGraphs(t *testing.T) {
 		assertSearchMatchesReference(t, fmt.Sprintf("random run %d", run), g, nodes, access)
 	}
 }
+
+func TestTravelModeValid(t *testing.T) {
+	for _, m := range transit.TravelModes() {
+		if !m.Valid() {
+			t.Errorf("%q is in TravelModes but Valid is false", m)
+		}
+	}
+	if !transit.TravelModeTransit.Valid() {
+		t.Error("transit must be a valid mode — the API already enqueues it (SPA-248)")
+	}
+	for _, m := range []transit.TravelMode{"", "teleport", "multimodal", "pedestrian", "Transit", "transit "} {
+		if m.Valid() {
+			t.Errorf("%q Valid = true, want false", m)
+		}
+	}
+}

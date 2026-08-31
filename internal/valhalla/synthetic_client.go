@@ -40,6 +40,7 @@ func NewSyntheticClient() *SyntheticClient {
 			CostingPedestrian: geo.WalkSpeedKmH,
 			CostingBicycle:    geo.BikeSpeedKmH,
 			CostingAuto:       geo.DriveSpeedKmH,
+			CostingMultimodal: geo.TransitSpeedKmH,
 		},
 	}
 }
@@ -113,10 +114,16 @@ func (c *SyntheticClient) Matrix(_ context.Context, req MatrixRequest) (*MatrixR
 // shape on the map that reads as a real walk. The costing is still checked, so
 // an unknown one is refused here exactly as the real server refuses it.
 func (c *SyntheticClient) Route(_ context.Context, req RouteRequest) (*RouteResponse, error) {
-	if _, err := c.speed(req.Costing); err != nil {
+	speed, err := c.speed(req.Costing)
+	if err != nil {
 		return nil, err
 	}
-	return &RouteResponse{Shape: []LatLng{req.Origin, req.Destination}}, nil
+	roadKm := geo.HaversineKm(req.Origin.Lat, req.Origin.Lng, req.Destination.Lat, req.Destination.Lng) * geo.DetourFactor
+	return &RouteResponse{
+		Shape:      []LatLng{req.Origin, req.Destination},
+		Time:       int(math.Round(roadKm / speed * 3600.0)),
+		DistanceKm: roadKm,
+	}, nil
 }
 
 // Status reports ErrNoStatus: there is no tileset behind this client, and

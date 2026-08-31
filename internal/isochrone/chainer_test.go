@@ -1014,7 +1014,7 @@ func TestChainer_isochroneBudgetNeverExceedsContourCeiling(t *testing.T) {
 	limits := valhalla.DefaultLimits()
 	maxContourSecs := limits.MaxIsoContourMins * 60
 
-	for _, mode := range []transit.TravelMode{transit.TravelModeWalk, transit.TravelModeBike, transit.TravelModeDrive} {
+	for _, mode := range transit.TravelModes() {
 		t.Run(string(mode), func(t *testing.T) {
 			fc := &valhalla.StubClient{IsochroneResp: cannedIso()}
 			chainer := newChainer(fc, &fakeGraph{})
@@ -1648,5 +1648,249 @@ func TestChainer_starterRouteRunsAlongsideTheEgressFanOut(t *testing.T) {
 	}
 	if serialised.Load() {
 		t.Error("the starter route did not go out until the egress fan-out had finished")
+	}
+}
+
+func routedAccess(secs int) *valhalla.RouteResponse {
+	return &valhalla.RouteResponse{
+		Shape:      cannedRoute().Shape,
+		Time:       secs,
+		DistanceKm: tokenRoadKm,
+	}
+}
+
+func transitAccessClient(accessSecs int) *valhalla.StubClient {
+	return &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteFn: func(valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+			return routedAccess(accessSecs), nil
+		},
+	}
+}
+
+// Every Valid mode has to have a costing, or a message the API now accepts
+// (SPA-248) fails here as ErrInvalidMode. The mapping is asserted rather than
+// inferred so a fifth mode cannot land in TravelModes with no row in `modes`.
+func TestChainer_everyValidModeHasACosting(t *testing.T) {
+	want := map[transit.TravelMode]valhalla.Costing{
+		transit.TravelModeWalk:    valhalla.CostingPedestrian,
+		transit.TravelModeBike:    valhalla.CostingBicycle,
+		transit.TravelModeDrive:   valhalla.CostingAuto,
+		transit.TravelModeTransit: valhalla.CostingMultimodal,
+	}
+	for _, mode := range transit.TravelModes() {
+		t.Run(string(mode), func(t *testing.T) {
+			costing, ok := want[mode]
+			if !ok {
+				t.Fatalf("valid mode %q has no expected costing — add it to the modes table", mode)
+			}
+			fc := &valhalla.StubClient{IsochroneResp: cannedIso()}
+			if _, err := newChainer(fc, &fakeGraph{}).Chain(context.Background(), req(30, mode)); err != nil {
+				t.Fatalf("Chain: %v", err)
+			}
+			iso, matrix := fc.Calls()
+			if len(iso) != 1 {
+				t.Fatalf("IsochroneCalls: want 1, got %d", len(iso))
+			}
+			if iso[0].Costing != costing {
+				t.Errorf("costing = %q, want %q", iso[0].Costing, costing)
+			}
+			if mode == transit.TravelModeTransit {
+				if len(matrix) != 0 {
+					t.Errorf("transit called Matrix %d times; multimodal is error 140", len(matrix))
+				}
+			}
+		})
+	}
+}
+
+// Transit access times come from pairwise /route, never Matrix. Domain
+// "transit" maps to costing=multimodal, not costing=transit (SPA-246).
+func TestChainer_transitAccessUsesPairwiseRouteNotMatrix(t *testing.T) {
+	fc := transitAccessClient(600)
+	resp, err := newChainer(fc, newTestGraph()).Chain(context.Background(), req(90, transit.TravelModeTransit))
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	iso, matrix := fc.Calls()
+	if len(matrix) != 0 {
+		t.Fatalf("Matrix calls = %d, want 0", len(matrix))
+	}
+	if len(iso) < 1 {
+		t.Fatal("expected an origin isochrone")
+	}
+	if iso[0].Costing != valhalla.CostingMultimodal {
+		t.Errorf("origin costing = %q, want multimodal", iso[0].Costing)
+	}
+
+	routes := fc.RouteCalls()
+	if len(routes) < 2 {
+		t.Fatalf("Route calls = %d, want at least one per nearby station", len(routes))
+	}
+	for _, r := range routes {
+		if r.Costing != valhalla.CostingMultimodal {
+			t.Errorf("route costing = %q, want multimodal (not transit)", r.Costing)
+		}
+	}
+
+	stations := stationsBySlug(t, resp)
+	if _, ok := stations["station-a"]; !ok {
+		t.Error("station-a missing — pairwise /route should have seeded it")
+	}
+}
+
+// A 400 from a pairwise access /route drops that station the way a null Matrix
+// cell does. Failing the chain would turn "no transit near this station" into
+// a failed job, which is the wrong split: the origin polygon is still a
+// correct answer.
+func TestChainer_transitRoute400DropsThatStation(t *testing.T) {
+	stationB := node("station-b", -122.41, 37.69)
+	graph := &fakeGraph{nodes: []transit.Node{
+		node("station-a", -122.39, 37.71),
+		stationB,
+	}}
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteFn: func(r valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+			if r.Destination.Lat == stationB.Lat && r.Destination.Lng == stationB.Lng {
+				return nil, fmt.Errorf("%w: no matching transit service near this location (error_code 171)", valhalla.ErrBadRequest)
+			}
+			return routedAccess(600), nil
+		},
+	}
+	resp, err := newChainer(fc, graph).Chain(context.Background(), req(90, transit.TravelModeTransit))
+	if err != nil {
+		t.Fatalf("Chain: %v — a per-station 400 must not fail the job", err)
+	}
+	stations := stationsBySlug(t, resp)
+	if _, ok := stations["station-a"]; !ok {
+		t.Error("station-a missing")
+	}
+	if _, ok := stations["station-b"]; ok {
+		t.Error("station-b should have been dropped after its access /route 400")
+	}
+}
+
+func TestChainer_transitRouteUpstreamFailsTheChain(t *testing.T) {
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteFn: func(valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+			return nil, valhalla.ErrUpstream
+		},
+	}
+	_, err := newChainer(fc, newTestGraph()).Chain(context.Background(), req(90, transit.TravelModeTransit))
+	if !errors.Is(err, isochrone.ErrRoutingUnavailable) {
+		t.Errorf("err = %v, want ErrRoutingUnavailable", err)
+	}
+}
+
+func TestChainer_transitRouteRateLimitFailsTheChain(t *testing.T) {
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteFn: func(valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+			return nil, valhalla.ErrRateLimit
+		},
+	}
+	_, err := newChainer(fc, newTestGraph()).Chain(context.Background(), req(90, transit.TravelModeTransit))
+	if !errors.Is(err, isochrone.ErrRoutingRateLimit) {
+		t.Errorf("err = %v, want ErrRoutingRateLimit", err)
+	}
+}
+
+// 40 km/h × 90 min / 1.4 detour ≈ 43 km of b-line. A station 50 km out is
+// outside that, even though walk/bike's 200 km matrix b-line would have
+// admitted it under a large enough budget.
+func TestChainer_transitReachFollowsBlendedSpeedNotThePedestrianBLine(t *testing.T) {
+	graph := &fakeGraph{nodes: []transit.Node{
+		node("station-near", -122.39, 37.71),
+		// ~50 km north: 0.45° of latitude.
+		node("station-50km", -122.40, 38.15),
+	}}
+	fc := transitAccessClient(600)
+	if _, err := newChainer(fc, graph).Chain(context.Background(), req(90, transit.TravelModeTransit)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	var accessDests int
+	origin := valhalla.LatLng{Lat: 37.7, Lng: -122.4}
+	for _, r := range fc.RouteCalls() {
+		if r.Origin == origin {
+			accessDests++
+		}
+	}
+	// Pairwise access plus the starter walk, all to the nearby station.
+	if accessDests < 1 {
+		t.Fatal("expected a route to the nearby station")
+	}
+	for _, r := range fc.RouteCalls() {
+		if r.Destination.Lat == 38.15 {
+			t.Error("50 km station was asked as a transit access pair; 90 min at 40 km/h should have filtered it")
+		}
+	}
+}
+
+// Pairwise /route is unbounded in the number of stations, so the 80 km cap is
+// what keeps a huge budget from asking Valhalla about every station on the
+// graph. The 200 km pedestrian matrix b-line is explicitly not the target list
+// (SPA-246).
+func TestChainer_transitReachCappedAt80kmNotThePedestrianBLine(t *testing.T) {
+	graph := &fakeGraph{nodes: []transit.Node{
+		node("station-near", -122.39, 37.71),
+		// ~90 km north: past the 80 km transit cap, inside the 200 km other b-line.
+		node("station-90km", -122.40, 38.51),
+	}}
+	fc := transitAccessClient(600)
+	if _, err := newChainer(fc, graph).Chain(context.Background(), req(9999, transit.TravelModeTransit)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	for _, r := range fc.RouteCalls() {
+		if r.Destination.Lat == 38.51 {
+			t.Error("90 km station was asked as a transit access pair; the 80 km cap should have dropped it")
+		}
+	}
+}
+
+func TestChainer_transitPairwiseAccessIsBoundedByConfiguration(t *testing.T) {
+	const nodeCount = 20
+	const concurrency = 3
+
+	nodes := make([]transit.Node, nodeCount)
+	for i := range nodeCount {
+		nodes[i] = node(fmt.Sprintf("station-%d", i), -122.40+0.001*float64(i), 37.70)
+	}
+
+	var (
+		mu       sync.Mutex
+		inFlight int
+		peak     int
+	)
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteFn: func(valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+			mu.Lock()
+			inFlight++
+			if inFlight > peak {
+				peak = inFlight
+			}
+			mu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+			return routedAccess(600), nil
+		},
+	}
+
+	limits := valhalla.DefaultLimits()
+	limits.MaxConcurrency = concurrency
+	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes}, limits, isochrone.EgressCache{}, logger.Discard())
+	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeTransit)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	if peak > concurrency {
+		t.Errorf("peak concurrent /route calls = %d, want ≤ %d", peak, concurrency)
+	}
+	if peak < 2 {
+		t.Errorf("peak concurrent /route calls = %d; pairwise access is not running concurrently", peak)
 	}
 }

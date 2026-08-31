@@ -255,6 +255,39 @@ func TestChainer_cacheKeyIsCompileStationModeAndContour(t *testing.T) {
 	}
 }
 
+func TestChainer_cacheKeyTransitIsTheDomainWordNotMultimodal(t *testing.T) {
+	cache := newFakeCache()
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteFn: func(r valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+			// Only the hub is an access station; a and b are reached by riding.
+			if r.Destination.Lat == 37.70 && r.Destination.Lng == -122.40 {
+				return routedAccess(600), nil
+			}
+			return nil, valhalla.ErrBadRequest
+		},
+	}
+	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache})
+
+	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeTransit)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	written := cache.written()
+	if len(written) != 2 {
+		t.Fatalf("cached %d polygons, want 2 (one per station reached by riding)", len(written))
+	}
+	for _, e := range written {
+		if e.Key.Mode != "transit" {
+			t.Errorf("%s: mode = %q, want the domain's transit rather than Valhalla's multimodal", e.Key.StationSlug, e.Key.Mode)
+		}
+	}
+	_, matrix := fc.Calls()
+	if len(matrix) != 0 {
+		t.Errorf("transit cache fill called Matrix %d times", len(matrix))
+	}
+}
+
 // The stamp is recorded on every row and is not part of what is looked up. The
 // second half of that is the store's to enforce — the key type has no such
 // field — so what is checked here is that the chainer actually supplies it.

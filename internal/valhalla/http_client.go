@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -57,6 +58,38 @@ const (
 	LocationMinReachability = 15
 )
 
+// MultimodalStartEndMaxDistanceM is the walking distance allowed at the start
+// or end of a multimodal route. Valhalla's request default is 2415 m, which
+// clips suburban walks to a station; 10 km matches the service-limit ceiling
+// pedestrian.max_multimodal_walking_distance (SPA-246).
+const MultimodalStartEndMaxDistanceM = 10000
+
+// dateTimeDepartAt is Valhalla's date_time.type for a specified departure.
+// Type 0 is "now", which waits for the next trip rather than a representative
+// commute; type 1 is "depart at" the value below.
+const dateTimeDepartAt = 1
+
+const dateTimeLayout = "2006-01-02T15:04"
+
+// WeekdayDepartAt is the representative departure a multimodal request uses
+// when the caller has not picked one: 08:00 on the next weekday (today, if
+// today is one).
+//
+// date_time is load-bearing for transit costing. The same pair was 781 s at
+// a weekday morning versus 3480 s without a time (waiting for the next trip).
+// Valhalla interprets the value in the origin's local timezone from its
+// timezone tiles, so the string carries no offset. The weekday is chosen on
+// the UTC calendar — close enough that a commute-hour request does not land
+// on a Saturday GTFS calendar (SPA-246).
+func WeekdayDepartAt(now time.Time) time.Time {
+	d := now.UTC()
+	t := time.Date(d.Year(), d.Month(), d.Day(), 8, 0, 0, 0, time.UTC)
+	for t.Weekday() == time.Saturday || t.Weekday() == time.Sunday {
+		t = t.AddDate(0, 0, 1)
+	}
+	return t
+}
+
 // HTTPClient talks to a Valhalla server over HTTP.
 //
 // There is no API key and no Authorization header. The server is a ClusterIP
@@ -97,6 +130,27 @@ func location(p LatLng) map[string]any {
 	}
 }
 
+// attachMultimodalOptions adds the request fields multimodal costing needs
+// and pedestrian/bicycle/auto must not send.
+//
+// date_time is the representative weekday 08:00 (see WeekdayDepartAt).
+// multimodal_start_end_max_distance raises the 2415 m walk clip so a suburban
+// origin can still reach a station on foot before boarding (SPA-246).
+func attachMultimodalOptions(body map[string]any, costing Costing) {
+	if costing != CostingMultimodal {
+		return
+	}
+	body["date_time"] = map[string]any{
+		"type":  dateTimeDepartAt,
+		"value": WeekdayDepartAt(time.Now()).Format(dateTimeLayout),
+	}
+	body["costing_options"] = map[string]any{
+		"pedestrian": map[string]any{
+			"multimodal_start_end_max_distance": MultimodalStartEndMaxDistanceM,
+		},
+	}
+}
+
 func (c *HTTPClient) Isochrone(ctx context.Context, req IsochroneRequest) (*IsochroneResponse, error) {
 	// Valhalla's contour time is in minutes and is minute-granular. The
 	// chainer never asks for less than a minute (see minIsoContourSecs there),
@@ -107,6 +161,7 @@ func (c *HTTPClient) Isochrone(ctx context.Context, req IsochroneRequest) (*Isoc
 		"contours":  []map[string]any{{"time": req.BudgetSecs / 60}},
 		"polygons":  true,
 	}
+	attachMultimodalOptions(body, req.Costing)
 	var resp IsochroneResponse
 	if err := c.post(ctx, isochronePath, body, &resp); err != nil {
 		return nil, err
@@ -115,6 +170,12 @@ func (c *HTTPClient) Isochrone(ctx context.Context, req IsochroneRequest) (*Isoc
 }
 
 func (c *HTTPClient) Matrix(ctx context.Context, req MatrixRequest) (*MatrixResponse, error) {
+	if !req.Costing.SupportsMatrix() {
+		// Hard-coded in loki's matrix handler (error 140), not a missing-tiles
+		// artefact. Refusing here keeps a mistaken caller off the wire and
+		// maps onto the same permanent bucket Valhalla would have returned.
+		return nil, fmt.Errorf("%w: sources_to_targets does not support %s costing", ErrBadRequest, req.Costing)
+	}
 	sources := make([]map[string]any, len(req.Origins))
 	for i, o := range req.Origins {
 		sources[i] = location(o)
@@ -148,6 +209,10 @@ type routeBody struct {
 		Legs []struct {
 			Shape string `json:"shape"`
 		} `json:"legs"`
+		Summary struct {
+			Time   float64 `json:"time"`
+			Length float64 `json:"length"`
+		} `json:"summary"`
 	} `json:"trip"`
 }
 
@@ -160,7 +225,9 @@ func (c *HTTPClient) Route(ctx context.Context, req RouteRequest) (*RouteRespons
 	body := map[string]any{
 		"locations": []map[string]any{location(req.Origin), location(req.Destination)},
 		"costing":   req.Costing,
+		"units":     "kilometers",
 	}
+	attachMultimodalOptions(body, req.Costing)
 	var resp routeBody
 	if err := c.post(ctx, routePath, body, &resp); err != nil {
 		return nil, err
@@ -186,7 +253,11 @@ func (c *HTTPClient) Route(ctx context.Context, req RouteRequest) (*RouteRespons
 		// may well be answered properly a moment later.
 		return nil, fmt.Errorf("%w: route carried no drawable shape", ErrUpstream)
 	}
-	return &RouteResponse{Shape: shape}, nil
+	return &RouteResponse{
+		Shape:      shape,
+		Time:       int(math.Round(resp.Trip.Summary.Time)),
+		DistanceKm: resp.Trip.Summary.Length,
+	}, nil
 }
 
 // statusBody is the default (non-verbose) /status response. Valhalla reports

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,6 +61,9 @@ func TestIsochrone_requestShape(t *testing.T) {
 	}
 	if got := srv.body["costing"]; got != "pedestrian" {
 		t.Errorf("costing = %v, want pedestrian", got)
+	}
+	if _, ok := srv.body["date_time"]; ok {
+		t.Error("date_time is a multimodal option; pedestrian must not send it")
 	}
 
 	// Valhalla names the longitude field "lon"; this codebase spells it "lng"
@@ -349,6 +353,12 @@ func TestRoute_requestShape(t *testing.T) {
 	if got := srv.body["costing"]; got != "pedestrian" {
 		t.Errorf("costing = %v, want pedestrian", got)
 	}
+	if got := srv.body["units"]; got != "kilometers" {
+		t.Errorf("units = %v, want kilometers", got)
+	}
+	if _, ok := srv.body["date_time"]; ok {
+		t.Error("date_time is a multimodal option; pedestrian must not send it")
+	}
 	locations, _ := srv.body["locations"].([]any)
 	if len(locations) != 2 {
 		t.Fatalf("locations: want 2, got %v", srv.body["locations"])
@@ -385,6 +395,12 @@ func TestRoute_requestShape(t *testing.T) {
 		if !nearly(resp.Shape[i].Lat, w.Lat) || !nearly(resp.Shape[i].Lng, w.Lng) {
 			t.Errorf("Shape[%d] = %v, want %v", i, resp.Shape[i], w)
 		}
+	}
+	if resp.Time != 420 {
+		t.Errorf("Time = %d, want 420 (trip.summary.time)", resp.Time)
+	}
+	if resp.DistanceKm != 0.5 {
+		t.Errorf("DistanceKm = %v, want 0.5 (trip.summary.length)", resp.DistanceKm)
 	}
 }
 
@@ -502,5 +518,143 @@ func TestTrailingSlashInBaseURLIsTolerated(t *testing.T) {
 	}
 	if srv.path != "/isochrone" {
 		t.Errorf("path = %q, want /isochrone (no double slash)", srv.path)
+	}
+}
+
+func TestWeekdayDepartAtPicksTheNextWeekdayMorning(t *testing.T) {
+	tests := []struct {
+		now  string
+		want string
+	}{
+		{"2026-08-31T15:00:00Z", "2026-08-31T08:00:00Z"}, // Monday stays Monday
+		{"2026-08-28T03:00:00Z", "2026-08-28T08:00:00Z"}, // Friday stays Friday
+		{"2026-08-29T15:00:00Z", "2026-08-31T08:00:00Z"}, // Saturday → Monday
+		{"2026-08-30T15:00:00Z", "2026-08-31T08:00:00Z"}, // Sunday → Monday
+	}
+	for _, tc := range tests {
+		now, err := time.Parse(time.RFC3339, tc.now)
+		if err != nil {
+			t.Fatalf("parse now: %v", err)
+		}
+		got := valhalla.WeekdayDepartAt(now)
+		want, err := time.Parse(time.RFC3339, tc.want)
+		if err != nil {
+			t.Fatalf("parse want: %v", err)
+		}
+		if !got.Equal(want) {
+			t.Errorf("WeekdayDepartAt(%s) = %s, want %s", tc.now, got.UTC().Format(time.RFC3339), tc.want)
+		}
+		if got.Weekday() == time.Saturday || got.Weekday() == time.Sunday {
+			t.Errorf("WeekdayDepartAt(%s) landed on a weekend", tc.now)
+		}
+		if got.Hour() != 8 || got.Minute() != 0 {
+			t.Errorf("WeekdayDepartAt(%s) = %s, want 08:00", tc.now, got)
+		}
+	}
+}
+
+func assertMultimodalOptions(t *testing.T, body map[string]any) {
+	t.Helper()
+	if got := body["costing"]; got != "multimodal" {
+		t.Errorf("costing = %v, want multimodal", got)
+	}
+	dt, _ := body["date_time"].(map[string]any)
+	if dt == nil {
+		t.Fatal("date_time missing — multimodal costing is load-bearing on a specified departure")
+	}
+	if dt["type"] != float64(1) {
+		t.Errorf("date_time.type = %v, want 1 (depart at)", dt["type"])
+	}
+	value, _ := dt["value"].(string)
+	if _, err := time.Parse("2006-01-02T15:04", value); err != nil {
+		t.Errorf("date_time.value = %q, want YYYY-MM-DDTHH:MM: %v", value, err)
+	}
+	if !strings.HasSuffix(value, "T08:00") {
+		t.Errorf("date_time.value = %q, want a 08:00 departure", value)
+	}
+	opts, _ := body["costing_options"].(map[string]any)
+	ped, _ := opts["pedestrian"].(map[string]any)
+	if ped["multimodal_start_end_max_distance"] != float64(valhalla.MultimodalStartEndMaxDistanceM) {
+		t.Errorf("multimodal_start_end_max_distance = %v, want %d", ped["multimodal_start_end_max_distance"], valhalla.MultimodalStartEndMaxDistanceM)
+	}
+}
+
+func TestIsochrone_multimodalRequestShape(t *testing.T) {
+	srv := newCaptureServer(t, http.StatusOK, okIsochrone)
+	_, err := valhalla.NewHTTPClient(srv.URL).Isochrone(context.Background(), valhalla.IsochroneRequest{
+		Origin:     valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+		Costing:    valhalla.CostingMultimodal,
+		BudgetSecs: 1800,
+	})
+	if err != nil {
+		t.Fatalf("Isochrone: %v", err)
+	}
+	assertMultimodalOptions(t, srv.body)
+}
+
+func TestRoute_multimodalRequestShape(t *testing.T) {
+	srv := newCaptureServer(t, http.StatusOK, okRoute(shapeThreePoints))
+	_, err := valhalla.NewHTTPClient(srv.URL).Route(context.Background(), valhalla.RouteRequest{
+		Origin:      valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+		Destination: valhalla.LatLng{Lat: 37.701, Lng: -122.4005},
+		Costing:     valhalla.CostingMultimodal,
+	})
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	if srv.path != "/route" {
+		t.Errorf("path = %q, want /route", srv.path)
+	}
+	assertMultimodalOptions(t, srv.body)
+}
+
+// Matrix hard-rejects multimodal (error 140) whether or not transit tiles
+// exist. Refusing locally keeps a mistaken caller off the wire and still
+// lands in ErrBadRequest, the permanent bucket.
+func TestMatrix_multimodalIsRejectedWithoutACall(t *testing.T) {
+	var called int32
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		atomic.AddInt32(&called, 1)
+	}))
+	defer srv.Close()
+
+	_, err := valhalla.NewHTTPClient(srv.URL).Matrix(context.Background(), valhalla.MatrixRequest{
+		Origins:      []valhalla.LatLng{{Lat: 1, Lng: 2}},
+		Destinations: []valhalla.LatLng{{Lat: 3, Lng: 4}},
+		Costing:      valhalla.CostingMultimodal,
+	})
+	if !errors.Is(err, valhalla.ErrBadRequest) {
+		t.Errorf("err = %v, want ErrBadRequest", err)
+	}
+	if !strings.Contains(err.Error(), "multimodal") {
+		t.Errorf("error %q does not mention multimodal", err)
+	}
+	if atomic.LoadInt32(&called) != 0 {
+		t.Error("Matrix hit the server for multimodal costing; it must refuse locally")
+	}
+}
+
+// Transit-costing 400s are permanent: the same bytes will be refused again.
+// Error 140 is Matrix's multimodal rejection (should not appear if Matrix is
+// skipped); "no transit near here" and "no path" are the pair-level 400s the
+// chainer drops as unrouted stations rather than failing the chain.
+func TestTransitCostingRejectionsAreBadRequests(t *testing.T) {
+	bodies := []string{
+		`{"error_code":140,"error":"Action does not support multimodal costing: sources_to_targets"}`,
+		`{"error_code":171,"error":"No matching transit service near this location"}`,
+		`{"error_code":442,"error":"No path could be found for input"}`,
+	}
+	for _, body := range bodies {
+		t.Run(body, func(t *testing.T) {
+			srv := newCaptureServer(t, http.StatusBadRequest, body)
+			_, err := valhalla.NewHTTPClient(srv.URL).Route(context.Background(), valhalla.RouteRequest{
+				Origin:      valhalla.LatLng{Lat: 1, Lng: 2},
+				Destination: valhalla.LatLng{Lat: 3, Lng: 4},
+				Costing:     valhalla.CostingMultimodal,
+			})
+			if !errors.Is(err, valhalla.ErrBadRequest) {
+				t.Errorf("err = %v, want ErrBadRequest", err)
+			}
+		})
 	}
 }

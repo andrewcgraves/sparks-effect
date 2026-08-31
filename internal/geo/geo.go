@@ -27,10 +27,17 @@ const DetourFactor = 1.4
 // pre-filter admits should be one the synthetic client reports as reachable, or
 // a fake-backed run stops exercising the paths a real one does — so the numbers
 // live here rather than once in each.
+//
+// TransitSpeedKmH is the odd one out: it is a blended local-transit speed for
+// the access-leg pre-filter, not a physical constant. The API's origin-range
+// check uses the same number, and this side must never be the smaller of the
+// two copies — a tighter radius here would drop a station the API already
+// admitted. 40 km/h is SPA-246's figure.
 const (
-	WalkSpeedKmH  = 5.0
-	BikeSpeedKmH  = 15.0
-	DriveSpeedKmH = 80.0
+	WalkSpeedKmH    = 5.0
+	BikeSpeedKmH    = 15.0
+	DriveSpeedKmH   = 80.0
+	TransitSpeedKmH = 40.0
 )
 
 // HaversineKm is the great-circle distance between two WGS84 points.

@@ -39,14 +39,33 @@ var (
 
 // Costing is Valhalla's word for a travel mode, and this package is the only
 // place the translation from the domain's own vocabulary happens. See
-// transit.TravelMode.
+// transit.TravelMode: walk → pedestrian, bike → bicycle, drive → auto,
+// transit → multimodal.
 type Costing string
 
 const (
 	CostingPedestrian Costing = "pedestrian"
 	CostingBicycle    Costing = "bicycle"
 	CostingAuto       Costing = "auto"
+	// CostingMultimodal is walk plus scheduled transit. Domain
+	// TravelModeTransit maps here, never to costing=transit, which is
+	// transit-only and of no use for origins that are not already at a GTFS
+	// stop (SPA-246). The Matrix endpoint rejects this costing (error 140);
+	// see Costing.SupportsMatrix.
+	CostingMultimodal Costing = "multimodal"
 )
+
+// SupportsMatrix reports whether Valhalla's /sources_to_targets will accept
+// this costing. Multimodal is hard-rejected (error 140) regardless of tiles;
+// the chainer's access-leg workaround is pairwise /route instead.
+func (c Costing) SupportsMatrix() bool {
+	switch c {
+	case CostingPedestrian, CostingBicycle, CostingAuto:
+		return true
+	default:
+		return false
+	}
+}
 
 // LatLng is a WGS84 position. Lng, not Lon: the field is spelled the way the
 // rest of this codebase spells it, and the wire spelling is applied at the
@@ -140,6 +159,14 @@ type RouteRequest struct {
 // a lake.
 type RouteResponse struct {
 	Shape []LatLng
+	// Time is the journey duration in seconds — Valhalla's trip.summary.time.
+	// The chainer uses it as the access-leg seed when Matrix cannot answer
+	// (multimodal costing, SPA-246).
+	Time int
+	// DistanceKm is the journey length in kilometres — trip.summary.length
+	// with units=kilometers. Used the same way MatrixCell.DistanceKm is: a
+	// route shorter than the straight line is not a real journey.
+	DistanceKm float64
 }
 
 // Status is what /status reports about the server and the tiles it is serving.

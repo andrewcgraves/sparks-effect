@@ -31,21 +31,27 @@ const (
 )
 
 // modes is the one table mapping a travel mode onto everything the chainer
-// needs to know about it: the costing to ask Valhalla for, and the speed to
-// size the destination pre-filter with. One table rather than a switch apiece
-// so a fourth mode cannot be added to some of them and forgotten in the rest.
+// needs to know about it: the costing to ask Valhalla for, the speed to size
+// the destination pre-filter with, and — for transit — a reach cap tighter
+// than any matrix b-line, because transit never calls Matrix. One table rather
+// than a switch apiece so a fourth mode cannot be added to some of them and
+// forgotten in the rest.
 var modes = map[transit.TravelMode]struct {
-	costing  valhalla.Costing
-	speedKmH float64
+	costing    valhalla.Costing
+	speedKmH   float64
+	maxReachKm float64
 }{
-	transit.TravelModeWalk:  {valhalla.CostingPedestrian, geo.WalkSpeedKmH},
-	transit.TravelModeBike:  {valhalla.CostingBicycle, geo.BikeSpeedKmH},
-	transit.TravelModeDrive: {valhalla.CostingAuto, geo.DriveSpeedKmH},
+	transit.TravelModeWalk:    {valhalla.CostingPedestrian, geo.WalkSpeedKmH, 0},
+	transit.TravelModeBike:    {valhalla.CostingBicycle, geo.BikeSpeedKmH, 0},
+	transit.TravelModeDrive:   {valhalla.CostingAuto, geo.DriveSpeedKmH, 0},
+	transit.TravelModeTransit: {valhalla.CostingMultimodal, geo.TransitSpeedKmH, transitAccessReachKm},
 }
 
-func modeSpeedKmH(mode transit.TravelMode) float64 {
-	return modes[mode].speedKmH
-}
+// transitAccessReachKm caps how far a transit-mode access pair is worth asking
+// /route about. Matrix's 200 km pedestrian b-line is not a target list:
+// pairwise /route is the access-leg workaround (SPA-246), and 80 km is plenty
+// for a local-transit ride to an HSR station.
+const transitAccessReachKm = 80
 
 func modeToCosting(m transit.TravelMode) (valhalla.Costing, error) {
 	spec, ok := modes[m]
@@ -100,8 +106,13 @@ func New(routingClient valhalla.Client, graph transit.GraphData, limits valhalla
 // dropping that pair — so this filter is what keeps a distant station from
 // failing the whole chain.
 func (c *chainImpl) approxAccessReachKm(mode transit.TravelMode, costing valhalla.Costing, budgetMins int) float64 {
-	budgetReachKm := modeSpeedKmH(mode) * float64(budgetMins) / 60.0 / geo.DetourFactor
-	return math.Min(budgetReachKm, c.limits.BLineLimitKm(costing))
+	spec := modes[mode]
+	budgetReachKm := spec.speedKmH * float64(budgetMins) / 60.0 / geo.DetourFactor
+	capKm := c.limits.BLineLimitKm(costing)
+	if spec.maxReachKm > 0 {
+		capKm = spec.maxReachKm
+	}
+	return math.Min(budgetReachKm, capKm)
 }
 
 // clampToContourCeilingSecs caps a contour at the configured isochrone ceiling.
@@ -142,14 +153,14 @@ func (c *chainImpl) Chain(ctx context.Context, req ChainRequest) (*ChainResponse
 			"clamped_secs", originContourSecs)
 	}
 
-	originIso, matrixResp, err := c.originAndMatrix(ctx, req, costing, originContourSecs, nearbyNodes)
+	originIso, matrixResp, err := c.originAndAccess(ctx, req, costing, originContourSecs, nearbyNodes)
 	if err != nil {
 		return nil, err
 	}
-	c.log.Debug(ctx, "chain: origin isochrone and matrix calls done")
+	c.log.Debug(ctx, "chain: origin isochrone and access times done")
 
 	accessSecs := c.accessTimes(ctx, req, nearbyNodes, matrixResp)
-	c.log.Debug(ctx, "chain: matrix reachability", "reachable", len(accessSecs), "total_nodes", len(nodes))
+	c.log.Debug(ctx, "chain: access reachability", "reachable", len(accessSecs), "total_nodes", len(nodes))
 
 	egressCandidates := c.bestEgressPerNode(req, nodes, accessSecs)
 	c.log.Debug(ctx, "chain: egress candidates", "count", len(egressCandidates))
@@ -315,25 +326,34 @@ func (c *chainImpl) nearbyNodes(ctx context.Context, req ChainRequest, costing v
 	// One source, so the pair limit is a destination limit. Truncating to the
 	// nearest is the least-bad way to lose stations: the ones dropped are the
 	// ones with the least access budget left, hence the smallest egress
-	// polygons.
-	if max := c.limits.MaxMatrixPairs; max > 0 && len(nearby) > max {
-		sort.Slice(nearby, func(i, j int) bool {
-			di := geo.HaversineKm(req.Lat, req.Lng, nearby[i].Lat, nearby[i].Lng)
-			dj := geo.HaversineKm(req.Lat, req.Lng, nearby[j].Lat, nearby[j].Lng)
-			return di < dj
-		})
-		nearby = nearby[:max]
-		c.log.Info(ctx, "chain: nodes truncated to matrix pair cap",
-			"compile_job_id", req.CompileJobID, "cap", max)
+	// polygons. Transit never calls Matrix, so this cap does not apply — the
+	// haversine reach (and MaxConcurrency on the pairwise /route fan-out) is
+	// what bounds that path (SPA-246).
+	if costing.SupportsMatrix() {
+		if max := c.limits.MaxMatrixPairs; max > 0 && len(nearby) > max {
+			sort.Slice(nearby, func(i, j int) bool {
+				di := geo.HaversineKm(req.Lat, req.Lng, nearby[i].Lat, nearby[i].Lng)
+				dj := geo.HaversineKm(req.Lat, req.Lng, nearby[j].Lat, nearby[j].Lng)
+				return di < dj
+			})
+			nearby = nearby[:max]
+			c.log.Info(ctx, "chain: nodes truncated to matrix pair cap",
+				"compile_job_id", req.CompileJobID, "cap", max)
+		}
 	}
 	return nearby
 }
 
-// originAndMatrix fetches the origin polygon and the access-time matrix
-// together. They do not depend on each other, and the matrix is the slower of
-// the two, so serialising them would add the origin call's latency to every
+// originAndAccess fetches the origin polygon and the access times together.
+// They do not depend on each other, and the access call is the slower of the
+// two, so serialising them would add the origin call's latency to every
 // request for nothing.
-func (c *chainImpl) originAndMatrix(
+//
+// Access times come from Matrix for costings that support it, and from
+// pairwise /route for multimodal, which Matrix hard-rejects (SPA-246). The
+// answer is shaped as a MatrixResponse either way so accessTimes has one
+// reader.
+func (c *chainImpl) originAndAccess(
 	ctx context.Context,
 	req ChainRequest,
 	costing valhalla.Costing,
@@ -362,17 +382,9 @@ func (c *chainImpl) originAndMatrix(
 
 	if len(nearbyNodes) > 0 {
 		g.Go(func() error {
-			dests := make([]valhalla.LatLng, len(nearbyNodes))
-			for i, n := range nearbyNodes {
-				dests[i] = valhalla.LatLng{Lat: n.Lat, Lng: n.Lng}
-			}
-			m, mErr := c.routing.Matrix(gctx, valhalla.MatrixRequest{
-				Origins:      []valhalla.LatLng{{Lat: req.Lat, Lng: req.Lng}},
-				Destinations: dests,
-				Costing:      costing,
-			})
+			m, mErr := c.accessMatrix(gctx, req, costing, nearbyNodes)
 			if mErr != nil {
-				return wrapRoutingErr(mErr)
+				return mErr
 			}
 			matrixResp = m
 			return nil
@@ -383,6 +395,84 @@ func (c *chainImpl) originAndMatrix(
 		return nil, nil, err
 	}
 	return originIso, matrixResp, nil
+}
+
+func (c *chainImpl) accessMatrix(
+	ctx context.Context,
+	req ChainRequest,
+	costing valhalla.Costing,
+	nearbyNodes []transit.Node,
+) (*valhalla.MatrixResponse, error) {
+	if !costing.SupportsMatrix() {
+		return c.pairwiseAccess(ctx, req, costing, nearbyNodes)
+	}
+	dests := make([]valhalla.LatLng, len(nearbyNodes))
+	for i, n := range nearbyNodes {
+		dests[i] = valhalla.LatLng{Lat: n.Lat, Lng: n.Lng}
+	}
+	m, mErr := c.routing.Matrix(ctx, valhalla.MatrixRequest{
+		Origins:      []valhalla.LatLng{{Lat: req.Lat, Lng: req.Lng}},
+		Destinations: dests,
+		Costing:      costing,
+	})
+	if mErr != nil {
+		return nil, wrapRoutingErr(mErr)
+	}
+	return m, nil
+}
+
+// pairwiseAccess is the Matrix workaround for multimodal costing: one /route
+// per nearby station, bounded by MaxConcurrency, assembled into the same
+// matrix shape accessTimes already reads.
+//
+// A 400 from /route drops that station the way a null Matrix cell does —
+// "no transit near here" is a fact about that pair, not a reason to fail the
+// chain. Rate-limits and upstream failures still fail the job; those are
+// transient, and retrying is the right answer.
+func (c *chainImpl) pairwiseAccess(
+	ctx context.Context,
+	req ChainRequest,
+	costing valhalla.Costing,
+	nearbyNodes []transit.Node,
+) (*valhalla.MatrixResponse, error) {
+	cells := make([]valhalla.MatrixCell, len(nearbyNodes))
+
+	concurrency := c.limits.MaxConcurrency
+	if concurrency <= 0 {
+		concurrency = valhalla.DefaultMaxConcurrency
+	}
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(concurrency)
+
+	origin := valhalla.LatLng{Lat: req.Lat, Lng: req.Lng}
+	for i, n := range nearbyNodes {
+		g.Go(func() error {
+			route, err := c.routing.Route(gctx, valhalla.RouteRequest{
+				Origin:      origin,
+				Destination: valhalla.LatLng{Lat: n.Lat, Lng: n.Lng},
+				Costing:     costing,
+			})
+			if err != nil {
+				if errors.Is(err, valhalla.ErrBadRequest) {
+					c.log.Debug(gctx, "chain: pairwise access route declined, dropping station",
+						"station_slug", n.Slug, "err", err.Error())
+					return nil
+				}
+				return wrapRoutingErr(err)
+			}
+			if route == nil {
+				return nil
+			}
+			cells[i] = valhalla.Cell(route.Time, route.DistanceKm)
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{cells}}, nil
 }
 
 // snapSlackKm is how much shorter than the straight line a routed distance may

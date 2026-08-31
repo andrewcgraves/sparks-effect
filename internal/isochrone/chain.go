@@ -1,14 +1,15 @@
 // Package isochrone chains an access leg, a transit ride, and an egress leg
 // into one reachability surface.
 //
-// The shape of the answer: from where the caller is standing, walk/cycle/drive
-// to any station within the budget, ride to anywhere the graph reaches, and
-// spend whatever budget is left travelling out from there. The union of the
-// origin polygon and one polygon per station reached by riding transit is
-// where a person could actually get to. A station reached without boarding
-// anything contributes no polygon of its own — the origin polygon already
-// covers how far a walk from it would go, since that is a walk from the same
-// starting point — but it still appears among the reachable stations.
+// The shape of the answer: from where the caller is standing, walk, cycle,
+// drive, or take local transit to any station within the budget, ride to
+// anywhere the graph reaches, and spend whatever budget is left travelling
+// out from there. The union of the origin polygon and one polygon per station
+// reached by riding the authored service is where a person could actually get
+// to. A station reached without boarding anything contributes no polygon of
+// its own — the origin polygon already covers how far a walk from it would
+// go, since that is a walk from the same starting point — but it still
+// appears among the reachable stations.
 //
 // This package moved here from sparks-effect-api unchanged in behaviour. What
 // changed is where its inputs come from: the graph arrives inline on a queue
@@ -103,10 +104,13 @@ type ReachableStation struct {
 // StarterWalk is the routed access leg: the walk from the request's origin to
 // the station the rider boards at.
 //
-// It exists because the matrix that timed that leg reports time and distance
-// and nothing else. Valhalla did follow the street network to produce the
-// number, and this is the same leg asked again as a route so that the shape is
-// kept. Drawing it rather than a straight segment closes three gaps at once:
+// It exists because the access times that timed that leg report time and
+// distance and nothing else. For walk/bike/drive those times come from the
+// matrix; for transit they come from pairwise /route (Matrix rejects
+// multimodal). Valhalla did follow the street network to produce the
+// number, and this is the same leg asked again as a route so that the
+// shape is kept. Drawing it rather than a straight segment closes three
+// gaps at once:
 // the line follows streets instead of cutting across them, it starts where
 // Valhalla snapped the origin rather than at the raw point the user gave, and
 // it ends at the graph node the timing was measured to rather than at whatever

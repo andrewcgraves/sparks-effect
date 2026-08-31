@@ -18,6 +18,7 @@ package transit
 import (
 	"container/heap"
 	"encoding/json"
+	"slices"
 	"sort"
 )
 
@@ -26,26 +27,50 @@ import (
 // routing_jobs row both carry.
 //
 // Valhalla calls the same concept "costing" and spells it pedestrian /
-// bicycle / auto. That translation lives at the routing client's boundary, in
-// internal/valhalla, and nowhere else.
+// bicycle / auto / multimodal. That translation lives at the routing client's
+// boundary, in internal/valhalla, and nowhere else.
 type TravelMode string
 
 const (
 	TravelModeWalk  TravelMode = "walk"
 	TravelModeBike  TravelMode = "bike"
 	TravelModeDrive TravelMode = "drive"
+	// TravelModeTransit is walking plus scheduled local transit: how a rider
+	// gets to and from a station, not how they ride the authored line (that
+	// leg is physics-compiled on the API, never routed).
+	//
+	// Valhalla spells it "multimodal". Its own "transit" costing is a
+	// different thing — transit-only, stop to stop — and is useless for an
+	// access leg that starts at a house rather than a stop, so the worker
+	// must not map this mode to the identically-spelled costing (SPA-246).
+	TravelModeTransit TravelMode = "transit"
 )
 
-// Valid reports whether m is one of the three modes. A message naming anything
-// else is a permanent failure: no amount of retrying turns an unknown mode into
-// a known one.
+// travelModes is every mode there is, and the single definition of the set:
+// Valid and TravelModes both read it, so a fourth mode cannot be added to one
+// and forgotten in the other. The chainer's modes table is the other copy that
+// has to stay in step — TestChainer_everyValidModeHasACosting holds them
+// together.
+var travelModes = []TravelMode{
+	TravelModeWalk,
+	TravelModeBike,
+	TravelModeDrive,
+	TravelModeTransit,
+}
+
+// Valid reports whether m is a mode at all. A message naming anything else is
+// a permanent failure: no amount of retrying turns an unknown mode into a
+// known one.
 func (m TravelMode) Valid() bool {
-	switch m {
-	case TravelModeWalk, TravelModeBike, TravelModeDrive:
-		return true
-	default:
-		return false
-	}
+	return slices.Contains(travelModes, m)
+}
+
+// TravelModes returns every mode, for a caller outside this package that has
+// to hold something to the whole set rather than to one member. A copy,
+// because a caller must not be able to edit the set by editing what it was
+// handed.
+func TravelModes() []TravelMode {
+	return slices.Clone(travelModes)
 }
 
 // Edge is one directed hop along a service, in seconds of vehicle time.

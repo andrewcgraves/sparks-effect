@@ -64,6 +64,37 @@ func TestIsochroneCache_roundTrip(t *testing.T) {
 	}
 }
 
+func TestIsochroneCache_transitModeRoundTrips(t *testing.T) {
+	pool := testsupport.Postgres(t)
+	testsupport.SeedCompileJob(t, pool, firstCompileID)
+	repo := store.NewRepo(pool)
+	ctx := context.Background()
+
+	stored := store.IsochroneKey{
+		CompileJobID: firstCompileID,
+		StationSlug:  "station-a",
+		Mode:         "transit",
+		ContourMins:  45,
+	}
+	if err := repo.Put(ctx, []store.CachedIsochrone{
+		{Key: stored, Geometry: polygon("transit-a")},
+	}); err != nil {
+		t.Fatalf("Put(mode=transit): %v", err)
+	}
+
+	got, err := repo.Get(ctx, []store.IsochroneKey{stored, key(firstCompileID, "station-a", 45)})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if _, ok := got[stored]; !ok {
+		t.Fatal("transit-keyed row missing — the cache key must accept mode=transit with no schema change")
+	}
+	walk := key(firstCompileID, "station-a", 45)
+	if _, ok := got[walk]; ok {
+		t.Error("a walk-keyed lookup was served the transit polygon")
+	}
+}
+
 // Every field of the key has to matter, or a chain would be served a polygon
 // centred on the wrong station, cut for the wrong mode, or sized for the wrong
 // budget. Each case below stores one row and asks for it with exactly one field

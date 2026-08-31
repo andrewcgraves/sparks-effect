@@ -40,7 +40,7 @@ a struct to update.
 - **The queue consumer** (`internal/worker`) — one durable classic queue with a
   dead-letter queue behind it, prefetch 1, acked only after the job row is
   written.
-- **The Valhalla client** (`internal/valhalla`) — isochrone, matrix and status,
+- **The Valhalla client** (`internal/valhalla`) — isochrone, matrix, route and status,
   plus the request limits the server enforces.
 - **The chainer** (`internal/isochrone`) — access leg, transit ride, egress leg,
   unioned into one reachability surface. Moved here wholesale from the API.
@@ -52,9 +52,12 @@ a struct to update.
 ## Caching egress polygons
 
 A chain makes three kinds of routing call, and they are not equally cacheable.
-The origin isochrone and the access matrix both start from wherever the user
-clicked, so they are as particular as the click is. The egress isochrones start
-from station positions, which the publication fixed — and they are the bulk of
+The origin isochrone and the access times both start from wherever the user
+clicked, so they are as particular as the click is. Access times are one Matrix
+call for walk / bike / drive, and pairwise `/route` for transit — Valhalla's
+Matrix endpoint hard-rejects multimodal costing (error 140), so the chainer
+never asks it for that mode (SPA-246). The egress isochrones start from
+station positions, which the publication fixed — and they are the bulk of
 the work, one call per station reached by riding transit against two for
 everything else. A station reached by walking alone gets no egress call, and
 nothing to cache: its own reach is already covered by the origin polygon.
@@ -71,8 +74,12 @@ foreign key.
 
 `contour_mins` is the contour actually asked of Valhalla, after clamping to the
 server's ceiling, so every budget that clamps to the same contour shares one row.
-`mode` is the domain's vocabulary — walk / bike / drive — matching the column;
-Valhalla's "costing" stays at the client boundary.
+`mode` is the domain's vocabulary — walk / bike / drive / transit — matching
+the column; Valhalla's "costing" stays at the client boundary (`transit` →
+`multimodal`, never Valhalla's own `transit` costing, which is stop-to-stop
+and useless for an origin that is a house). Adding `transit` needed no schema
+change: the column is unconstrained text, and SPA-248 left it that way
+because this worker is the only writer.
 
 **Accepted risk.** A Valhalla tile rebuild changes every polygon without
 changing any compile job, and nothing here detects that. Rebuilds are rare and
@@ -213,4 +220,38 @@ too strict). Both are now the real numbers.
 
 `VALHALLA_MAX_CONCURRENCY` is a courtesy to the server rather than a limit it
 imposes. Note that `valhalla.env` currently sets `server_threads=2`; a
-deployment keeping that should lower this to match.
+deployment keeping that should lower this to match. The same bound covers the
+egress fan-out and, for transit mode, the pairwise `/route` access-leg
+workaround.
+
+## Transit costing
+
+`transit` is an access/egress mode: walk plus scheduled local transit to and
+from an authored station. The ride along the authored line stays
+physics-compiled on the API; Valhalla never sees it.
+
+Valhalla's `/sources_to_targets` (Matrix) does not support `costing=multimodal`
+— it returns 400 / error 140 whether or not transit tiles are loaded. The
+chainer therefore:
+
+1. Pre-filters stations by haversine at 40 km/h (blended local-transit),
+   capped at 80 km — not the 200 km pedestrian matrix b-line, which would
+   be a target list pairwise `/route` cannot afford.
+2. Issues one `/route` `costing=multimodal` per survivor, bounded by
+   `VALHALLA_MAX_CONCURRENCY`, and reads `trip.summary.time` as access
+   seconds. A 400 on one pair drops that station (the way a null Matrix
+   cell does); a rate-limit or 5xx still fails the job.
+3. Draws origin and egress isochrones with the same multimodal costing.
+   Those polygons are visualisation only — a 30-minute multimodal
+   isochrone can miss a stop `/route` reached in 13 minutes
+   (valhalla/valhalla#5636) — and are never used as a station filter.
+4. Always sends `date_time` as a representative weekday 08:00. Without it
+   the same pair waits for the next trip and inflates by a factor of four.
+   `costing_options.pedestrian.multimodal_start_end_max_distance` is raised
+   to 10 km (Valhalla's request default is 2415 m) so suburban walks to a
+   station are not clipped.
+
+Error 140 is a 400 and already maps to `ErrBadRequest` / permanent. It
+should not appear if Matrix is skipped. Other transit-costing 400s (no
+service near a location, no path) are the same bucket; the pairwise
+access path treats them as an unrouted station rather than a failed job.

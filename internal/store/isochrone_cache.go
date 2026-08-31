@@ -23,10 +23,10 @@ import (
 type IsochroneKey struct {
 	CompileJobID string
 	StationSlug  string
-	// Mode is the domain's vocabulary — walk / bike / drive — matching the
-	// column and the routing job the request came from. Valhalla's "costing" is
-	// the same concept under a vendor name, and that translation stays at the
-	// routing client's boundary.
+	// Mode is the domain's vocabulary — walk / bike / drive / transit —
+	// matching the column and the routing job the request came from.
+	// Valhalla's "costing" is the same concept under a vendor name, and that
+	// translation stays at the routing client's boundary.
 	Mode string
 	// ContourMins is the contour actually asked of Valhalla, after clamping to
 	// the server's ceiling — not the rider's remaining budget. The two differ

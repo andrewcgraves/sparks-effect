@@ -77,6 +77,26 @@ func TestDecodeAcceptsMessageWithoutTraceID(t *testing.T) {
 	}
 }
 
+func TestDecodeAcceptsTransitMode(t *testing.T) {
+	var m map[string]any
+	if err := json.Unmarshal(goldenBytes(t), &m); err != nil {
+		t.Fatalf("unmarshalling golden fixture: %v", err)
+	}
+	m["mode"] = "transit"
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("re-marshalling: %v", err)
+	}
+
+	msg, err := Decode(body)
+	if err != nil {
+		t.Fatalf("Decode(mode=transit) = %v, want nil", err)
+	}
+	if msg.Mode != transit.TravelModeTransit {
+		t.Errorf("Mode = %q, want transit", msg.Mode)
+	}
+}
+
 // The graph is the largest part of the message and the part with the most room
 // to decode into something plausible but wrong — a node list that arrives empty,
 // or edges whose endpoints no longer line up with node slugs. Decoding it is

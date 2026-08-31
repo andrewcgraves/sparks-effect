@@ -1,7 +1,7 @@
 -- Test-only schema. NOT a migration, and deliberately not one.
 --
 -- The real schema lives in sparks-effect-api's migration sequence
--- (00014_routing_jobs.sql), because routing_jobs and isochrone_cache both want
+-- (00014_routing_jobs.sql, plus 00021's mode CHECK), because routing_jobs and isochrone_cache both want
 -- real foreign keys into users and jobs, and a foreign key cannot cross a
 -- schema owned by a different migration sequence. This worker only ever updates
 -- rows; it runs no migrations, and a second goose sequence against the same
@@ -46,7 +46,13 @@ CREATE TABLE routing_jobs (
     lat            double precision NOT NULL,
     lng            double precision NOT NULL,
     budget_mins    integer NOT NULL,
-    mode           text NOT NULL,
+    -- Same CHECK as sparks-effect-api's 00021. isochrone_cache.mode is
+    -- deliberately unconstrained: SPA-248 left it that way because this
+    -- worker is the only writer, and a constraint owned by the other
+    -- repository would fail this side's inserts if the two copies of the
+    -- enum ever drifted. A wrong mode there is a cache miss, not a wrong
+    -- isochrone.
+    mode           text NOT NULL CHECK (mode IN ('walk', 'bike', 'drive', 'transit')),
     result         jsonb,
     error          text NOT NULL DEFAULT '',
     created_at     timestamptz NOT NULL DEFAULT now(),

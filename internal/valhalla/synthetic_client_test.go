@@ -198,6 +198,34 @@ func TestSyntheticRouteIsTheStraightSegment(t *testing.T) {
 			t.Errorf("Shape[%d] = %v, want %v", i, resp.Shape[i], w)
 		}
 	}
+	if resp.Time <= 0 {
+		t.Errorf("Time = %d, want a positive duration so the chainer can seed access seconds", resp.Time)
+	}
+	bLine := geo.HaversineKm(37.7, -122.4, 37.71, -122.39)
+	if resp.DistanceKm < bLine {
+		t.Errorf("DistanceKm = %.2f, want at least the %.2f km straight line", resp.DistanceKm, bLine)
+	}
+}
+
+func TestSyntheticAcceptsMultimodalCosting(t *testing.T) {
+	client := valhalla.NewSyntheticClient()
+	origin := valhalla.LatLng{Lat: 37.7, Lng: -122.4}
+
+	if _, err := client.Isochrone(context.Background(), valhalla.IsochroneRequest{
+		Origin: origin, Costing: valhalla.CostingMultimodal, BudgetSecs: 1800,
+	}); err != nil {
+		t.Fatalf("Isochrone: %v", err)
+	}
+	route, err := client.Route(context.Background(), valhalla.RouteRequest{
+		Origin: origin, Destination: valhalla.LatLng{Lat: 37.71, Lng: -122.39},
+		Costing: valhalla.CostingMultimodal,
+	})
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	if route.Time <= 0 {
+		t.Errorf("Time = %d, want a positive multimodal access time", route.Time)
+	}
 }
 
 // There is no tileset behind the synthetic client, and inventing a timestamp
