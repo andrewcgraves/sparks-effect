@@ -357,6 +357,103 @@ func TestHandle_unreadableMessageIsDiscarded(t *testing.T) {
 	}
 }
 
+// goldenTraceID is the trace the golden message carries.
+const goldenTraceID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+
+// traceIDsIn reports the trace_id on every line the handler logged, using "" for
+// a line that carried none, so a test can assert the whole trail rather than
+// whichever line happened to be first.
+func traceIDsIn(t *testing.T, out string) []string {
+	t.Helper()
+	out = strings.TrimSpace(out)
+	if out == "" {
+		t.Fatal("the handler logged nothing; there is no trail to check")
+	}
+	var ids []string
+	for _, line := range strings.Split(out, "\n") {
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(line), &parsed); err != nil {
+			t.Fatalf("log line is not valid JSON: %v\nline: %s", err, line)
+		}
+		id, _ := parsed["trace_id"].(string)
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// The trace lives in the message body, and sparks-effect-api sets no
+// x-trace-id header at all, so a handler that only read the header logged every
+// job untraced and cross-service correlation did not work (SPA-227).
+func TestHandle_logsUnderTheTraceTheMessageCarries(t *testing.T) {
+	var buf strings.Builder
+	s := &fakeStore{}
+	h := worker.NewHandler(s, valhalla.NewSyntheticClient(), valhalla.DefaultLimits(),
+		isochrone.EgressCache{}, logger.New(&buf, false))
+
+	res := h.Handle(context.Background(), goldenMessage(t))
+	if res.Outcome != worker.OutcomeSucceeded {
+		t.Fatalf("Outcome = %v (err %v), want succeeded", res.Outcome, res.Err)
+	}
+	// The consumer reads it back off the Result to log the delivery's
+	// settlement under the same trace.
+	if res.TraceID != goldenTraceID {
+		t.Errorf("res.TraceID = %q, want the fixture's %q", res.TraceID, goldenTraceID)
+	}
+
+	for i, id := range traceIDsIn(t, buf.String()) {
+		if id != goldenTraceID {
+			t.Errorf("log line %d has trace_id %q, want %q", i, id, goldenTraceID)
+		}
+	}
+}
+
+// A message rejected out of hand is exactly when the trace is most worth
+// having: the API recorded a request, and this is the only place that says what
+// became of it.
+func TestHandle_logsARejectedMessageUnderItsTrace(t *testing.T) {
+	var buf strings.Builder
+	s := &fakeStore{}
+	h := worker.NewHandler(s, valhalla.NewSyntheticClient(), valhalla.DefaultLimits(),
+		isochrone.EgressCache{}, logger.New(&buf, false))
+
+	body := mutateGolden(t, func(m map[string]any) { m["mode"] = "teleport" })
+	if res := h.Handle(context.Background(), body); res.TraceID != goldenTraceID {
+		t.Errorf("res.TraceID = %q, want the fixture's %q", res.TraceID, goldenTraceID)
+	}
+
+	for i, id := range traceIDsIn(t, buf.String()) {
+		if id != goldenTraceID {
+			t.Errorf("log line %d has trace_id %q, want %q", i, id, goldenTraceID)
+		}
+	}
+}
+
+// A message with no trace of its own does not erase the one the delivery header
+// gave the context, and does not log an empty trace_id in its place.
+func TestHandle_messageWithoutATraceKeepsTheHeadersTrace(t *testing.T) {
+	var buf strings.Builder
+	s := &fakeStore{}
+	h := worker.NewHandler(s, valhalla.NewSyntheticClient(), valhalla.DefaultLimits(),
+		isochrone.EgressCache{}, logger.New(&buf, false))
+
+	body := mutateGolden(t, func(m map[string]any) { delete(m, "trace_id") })
+	ctx := logger.WithTraceID(context.Background(), "from-the-header")
+
+	res := h.Handle(ctx, body)
+	if res.Outcome != worker.OutcomeSucceeded {
+		t.Fatalf("Outcome = %v (err %v), want succeeded", res.Outcome, res.Err)
+	}
+	if res.TraceID != "" {
+		t.Errorf("res.TraceID = %q, want empty — the message carried no trace", res.TraceID)
+	}
+
+	for i, id := range traceIDsIn(t, buf.String()) {
+		if id != "from-the-header" {
+			t.Errorf("log line %d has trace_id %q, want the header's", i, id)
+		}
+	}
+}
+
 // Fail is what the consumer calls once retries are exhausted, and it has to
 // leave the row saying failed with the reason attached — that is what stops the
 // client polling.

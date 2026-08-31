@@ -75,6 +75,14 @@ type Edge struct {
 
 // ServiceGraph is one service's hops plus the boarding wait a rider pays to
 // join it. WaitSecs is charged once, at the point of boarding, not per hop.
+//
+// The wire carries one more key here, wait_policy, and its absence below is
+// deliberate. It names which of the API's boarding-wait policies produced
+// WaitSecs — service override, scenario override, global default — which is a
+// fact about how the graph was compiled, and this package models none of that
+// (see the package comment). The number is what the search charges; where it
+// came from is the API's business. Modelling it would only add a field to keep
+// in sync for a value nothing here would read.
 type ServiceGraph struct {
 	ServiceID string `json:"service_id"`
 	Edges     []Edge `json:"edges"`

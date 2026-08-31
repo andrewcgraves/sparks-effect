@@ -49,6 +49,32 @@ func TestDecodeGoldenFixture(t *testing.T) {
 	if msg.Mode != transit.TravelModeWalk {
 		t.Errorf("Mode = %q, want %q", msg.Mode, transit.TravelModeWalk)
 	}
+	if want := "3fa85f64-5717-4562-b3fc-2c963f66afa6"; msg.TraceID != want {
+		t.Errorf("TraceID = %q, want %q", msg.TraceID, want)
+	}
+}
+
+// trace_id is optional: the API added it after this worker shipped, and a
+// message published without it has to stay processable rather than being
+// rejected for a field nothing routes on.
+func TestDecodeAcceptsMessageWithoutTraceID(t *testing.T) {
+	var m map[string]any
+	if err := json.Unmarshal(goldenBytes(t), &m); err != nil {
+		t.Fatalf("unmarshalling golden fixture: %v", err)
+	}
+	delete(m, "trace_id")
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("re-marshalling: %v", err)
+	}
+
+	msg, err := Decode(body)
+	if err != nil {
+		t.Fatalf("Decode(no trace_id) = %v, want nil", err)
+	}
+	if msg.TraceID != "" {
+		t.Errorf("TraceID = %q, want empty", msg.TraceID)
+	}
 }
 
 // The graph is the largest part of the message and the part with the most room
@@ -113,7 +139,7 @@ func TestGoldenFixtureKeyOrderMatchesStruct(t *testing.T) {
 
 	want := []string{
 		"schema_version", "routing_job_id", "compile_job_id",
-		"graph", "lat", "lng", "budget_mins", "mode",
+		"graph", "lat", "lng", "budget_mins", "mode", "trace_id",
 	}
 	if len(raw) != len(want) {
 		t.Errorf("fixture has %d keys, Message declares %d: %v", len(raw), len(want), keysOf(raw))

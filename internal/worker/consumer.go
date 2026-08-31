@@ -13,17 +13,19 @@ import (
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
 )
 
-// traceIDHeader carries the caller's trace id, so a job's whole log trail —
-// worker and API alike, once sparks-effect-api starts setting it — can be
-// filtered on one value. It rides as a custom header rather than AMQP's
-// standard CorrelationId property: MessageId/CorrelationId are the queue's
-// own bookkeeping fields, easy for an intermediary to rewrite or drop, while
-// a plain header round-trips untouched through requeue and dead-lettering
-// alongside x-routing-attempts.
+// traceIDHeader carries a trace id set by whoever published the delivery, so a
+// job's whole log trail can be filtered on one value. It rides as a custom
+// header rather than AMQP's standard CorrelationId property: MessageId /
+// CorrelationId are the queue's own bookkeeping fields, easy for an
+// intermediary to rewrite or drop, while a plain header round-trips untouched
+// through requeue and dead-lettering alongside x-routing-attempts.
 //
-// Its absence is normal, not an error: a message published before the API
-// carries trace ids, or sent by hand, simply logs with no trace_id field. See
-// traceIDFromDelivery.
+// It is not what carries the trace in production. sparks-effect-api puts the
+// trace in the message body (routing.Message.TraceID) and sets no header at
+// all, so this is only the trace available *before* the body is decoded, plus
+// a way to trace a message injected by hand. Its absence is normal rather than
+// an error; see traceIDFromDelivery, and handle for how the body's trace
+// supersedes it.
 const traceIDHeader = "x-trace-id"
 
 // retryHeader counts how many times a delivery has been requeued by this
@@ -116,6 +118,14 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 	ctx = logger.WithTraceID(ctx, traceIDFromDelivery(d))
 
 	res := c.handler.Handle(ctx, d.Body)
+
+	// The handler is the first thing to see the message body, and the trace the
+	// API actually sets is in there rather than in a header (see traceIDHeader).
+	// Adopting it here puts everything said about settling this delivery —
+	// requeued, dead-lettered, failed for exhaustion — on the same trail as the
+	// job itself. Empty for a message that carried no trace, which leaves the
+	// header's tag alone.
+	ctx = logger.WithTraceID(ctx, res.TraceID)
 
 	switch res.Outcome {
 	case OutcomeSucceeded, OutcomePermanent:

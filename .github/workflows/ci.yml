@@ -38,6 +38,28 @@ jobs:
         with:
           version: v2.12.2
 
+  contract:
+    name: Message contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The golden fixture is supposed to be byte-identical in both
+      # repositories, and before this job nothing checked it: the two copies
+      # drifted for two releases and trace ids were silently dropped on this
+      # side (SPA-227).
+      #
+      # It is a job of its own rather than a step of `check`, so a drift
+      # failure reads as "the contract moved" and not as a broken test, and so
+      # it still reports when the test job is red for its own reasons.
+      #
+      # This can go red without anything in this repository changing —
+      # sparks-effect-api merging a new field is enough. That is the intended
+      # behaviour: the drift is real from that moment, and the job says so
+      # instead of leaving it to whoever next reads both files.
+      - name: Diff the golden fixture against sparks-effect-api
+        run: make check-contract
+
   build:
     name: Build
     needs: check

@@ -31,7 +31,15 @@ TEST_AMQP_URL    := amqp://guest:guest@localhost:$(TEST_MQ_PORT)/
 # 5432/5672), so both repositories' throwaway containers can be up at once on
 # one machine without either quietly connecting to the other's.
 
-.PHONY: all deps build run test test-integration itest \
+# --- The cross-repo message contract ---
+# The golden fixture is meant to be the same file, byte for byte, in both
+# repositories. `make check-contract` is what makes that true rather than
+# aspirational; see the target below.
+CONTRACT_FIXTURE := internal/routing/testdata/message.golden.json
+CONTRACT_REF     := main
+CONTRACT_URL     := https://raw.githubusercontent.com/andrewcgraves/sparks-effect-api/$(CONTRACT_REF)/$(CONTRACT_FIXTURE)
+
+.PHONY: all deps build run test test-integration itest check-contract \
 	db-up db-wait db-down mq-up mq-wait mq-down vet lint tidy clean dev-workflow
 
 all: build
@@ -78,6 +86,40 @@ test-integration: deps
 itest:
 	$(MAKE) db-up && $(MAKE) mq-up && $(MAKE) test-integration; \
 	status=$$?; $(MAKE) db-down; $(MAKE) mq-down; exit $$status
+
+# check-contract diffs this repository's golden message fixture against
+# sparks-effect-api's copy of the same file.
+#
+# The Message struct is hand-copied into both repositories and the fixture is
+# documented as the only thing keeping the copies honest — but until this
+# existed, nothing checked that the two files were still the same file. They
+# drifted for two releases without anyone noticing, and trace ids were dropped
+# on this side the whole time (SPA-227). A human remembering to copy a file
+# across repositories is not an invariant.
+#
+# It fetches from the API's main rather than a pinned commit, because what has
+# to hold is agreement with what the API publishes *now*. A failure here is
+# therefore not always this repository's fault: usually it means the API added
+# a field and this side has not caught up, and the fix is to copy the fetched
+# file in and follow the failing tests until the struct agrees with it.
+#
+# Not part of dev-workflow: it needs the network, and the rest of that target
+# deliberately does not.
+check-contract:
+	@echo "fetching $(CONTRACT_URL)"
+	@theirs=$$(mktemp); trap 'rm -f "$$theirs"' EXIT; \
+	curl -fsSL "$(CONTRACT_URL)" -o "$$theirs" || { \
+		echo "could not fetch the API's fixture from $(CONTRACT_URL)" >&2; exit 1; }; \
+	if diff -u "$$theirs" $(CONTRACT_FIXTURE); then \
+		echo "$(CONTRACT_FIXTURE) matches sparks-effect-api@$(CONTRACT_REF)"; \
+	else \
+		echo >&2; \
+		echo "the message contract has drifted from sparks-effect-api@$(CONTRACT_REF)." >&2; \
+		echo "'-' is the API's copy, '+' is this repository's." >&2; \
+		echo "copy the API's file over $(CONTRACT_FIXTURE) and make the struct in" >&2; \
+		echo "internal/routing/message.go agree with it." >&2; \
+		exit 1; \
+	fi
 
 # db-up starts (or reuses) a throwaway Postgres and waits until it accepts
 # connections. Idempotent: a running container is left in place.

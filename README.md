@@ -29,7 +29,11 @@ own to read graphs from and no piece of resolution logic crosses the boundary.
 
 The message contract is pinned by `internal/routing/testdata/message.golden.json`
 — the same file, byte for byte, that the API asserts it produces. Nothing else
-stops the two hand-maintained copies of the struct drifting apart.
+stops the two hand-maintained copies of the struct drifting apart, so
+`make check-contract` fetches the API's copy and diffs it, and CI runs it on
+every push. That check can go red without anything here changing: the API
+merging a new field is enough, and means this side has a fixture to copy in and
+a struct to update.
 
 ## What it owns
 
@@ -148,16 +152,24 @@ make queryable, ahead of the Grafana Alloy hookup that will ship them
 somewhere queryable.
 
 A `trace_id` field is attached to every log line written while a job is being
-processed, if the queued delivery carried one in its `x-trace-id` header. A
-message published with no such header — an older publisher, or one sent by
-hand — simply logs without the field; nothing about processing it changes.
+processed, so one isochrone can be followed across both services on one value.
+It comes from the message body's `trace_id`, which the API mints for the request
+that created the job. A delivery may also carry an `x-trace-id` header, which is
+what a line logged *before* the body is decoded uses and what traces a message
+injected by hand; the body's value supersedes it once there is one. A message
+carrying neither simply logs without the field, and nothing about processing it
+changes.
 
 ## Development
 
 ```sh
-make dev-workflow   # test, vet, lint, build — run this before pushing
-make itest          # throwaway Postgres + RabbitMQ, full integration suite, teardown
+make dev-workflow    # test, vet, lint, build — run this before pushing
+make itest           # throwaway Postgres + RabbitMQ, full integration suite, teardown
+make check-contract  # diff the golden message fixture against sparks-effect-api
 ```
+
+`check-contract` is not part of `dev-workflow` because it needs the network and
+nothing else in that target does. CI runs it as a job of its own.
 
 Integration tests skip themselves unless `TEST_DATABASE_URL` and `TEST_AMQP_URL`
 are set, so `make test` stays green with nothing running. Under CI a missing URL

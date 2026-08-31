@@ -62,9 +62,15 @@ func (o Outcome) String() string {
 // has already been decoded and discarded. It is empty only when the message was
 // too malformed to name a job — the one case where nothing can be recorded
 // anywhere, since there is no row to record it against.
+//
+// TraceID rides back out for the same reason: the trace lives in the message
+// body, so only the handler has seen it, and the consumer's own logging about
+// the delivery — requeued, dead-lettered, acked — would otherwise fall outside
+// the trail it belongs to. Empty when the message carried no trace.
 type Result struct {
 	Outcome Outcome
 	JobID   string
+	TraceID string
 	Err     error
 }
 
@@ -101,17 +107,42 @@ func NewHandler(
 // to do, and Err is there for the log. Every path that abandons a job has
 // already marked it failed by the time it returns, so a caller that only acts
 // on Outcome cannot leave a row stuck in running.
+//
+// The message's trace is applied to ctx and stamped onto the Result here, in
+// one place, rather than at each of the returns below — a return path added
+// later cannot forget to carry it.
 func (h *Handler) Handle(ctx context.Context, body []byte) Result {
 	msg, err := routing.Decode(body)
-	if err != nil {
+
+	// The body's trace wins over the delivery header the consumer tagged with,
+	// and is in practice the only one there is: sparks-effect-api publishes
+	// trace_id in the message and sets no x-trace-id header. Tagging before the
+	// error is judged means a message rejected for its schema or its mode is
+	// still logged under the trace of the request that queued it — the case
+	// where following one job across both services matters most. A message
+	// carrying no trace, or one too malformed to parse at all, leaves the
+	// header's tag in place: WithTraceID ignores an empty id.
+	ctx = logger.WithTraceID(ctx, msg.TraceID)
+
+	res := h.handle(ctx, msg, err)
+	res.TraceID = msg.TraceID
+	return res
+}
+
+// handle is the body of Handle, taking the already-decoded message and whatever
+// Decode made of it. msg is populated even when decodeErr is non-nil — Decode
+// rejects a message it has read, not one it failed to read — so the failure
+// paths below can still name the job.
+func (h *Handler) handle(ctx context.Context, msg routing.Message, decodeErr error) Result {
+	if decodeErr != nil {
 		// A message with no job id cannot be recorded against anything, so the
 		// log is the only place its death is visible. Everything else gets a
 		// failed row, which is what stops the caller polling.
 		if msg.RoutingJobID == "" {
-			h.log.Error(ctx, "routing: discarding unreadable message", "err", err.Error())
-			return Result{Outcome: OutcomePermanent, Err: err}
+			h.log.Error(ctx, "routing: discarding unreadable message", "err", decodeErr.Error())
+			return Result{Outcome: OutcomePermanent, Err: decodeErr}
 		}
-		return h.fail(ctx, msg.RoutingJobID, err)
+		return h.fail(ctx, msg.RoutingJobID, decodeErr)
 	}
 
 	h.log.Info(ctx, "routing: job received",

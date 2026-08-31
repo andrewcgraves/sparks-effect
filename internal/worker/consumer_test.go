@@ -1,11 +1,20 @@
 package worker
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
 
 func TestUserinfo(t *testing.T) {
@@ -49,6 +58,56 @@ func TestRedactDialErrNoCredentials(t *testing.T) {
 
 	if err.Error() != underlying.Error() {
 		t.Fatalf("expected error unchanged when URL has no credentials, got %q", err.Error())
+	}
+}
+
+// nullStore accepts every transition and remembers nothing. What the consumer
+// does with a delivery does not depend on the row behind it, and the row itself
+// is settled in handler_test.go and against a real database.
+type nullStore struct{}
+
+func (nullStore) MarkRunning(context.Context, string) error                    { return nil }
+func (nullStore) MarkSucceeded(context.Context, string, json.RawMessage) error { return nil }
+func (nullStore) MarkFailed(context.Context, string, string) error             { return nil }
+
+// The trace rides in the message body, which only the handler decodes, so
+// without the Result carrying it back out everything the consumer says about
+// settling a delivery — requeued, dead-lettered, acked — would fall outside the
+// trace the job itself logged under (SPA-227).
+//
+// A transient failure with no broker connection is the shortest path through
+// that logging: the handler reports the failure, the consumer says it is
+// requeueing, and the requeue itself then fails for want of a channel. Three
+// lines from two components, all of which have to name the same trace.
+func TestConsumerHandle_settlementLoggingAdoptsTheMessagesTrace(t *testing.T) {
+	const wantTrace = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+
+	body, err := os.ReadFile(filepath.Join("..", "routing", "testdata", "message.golden.json"))
+	if err != nil {
+		t.Fatalf("reading golden fixture: %v", err)
+	}
+
+	var buf bytes.Buffer
+	log := logger.New(&buf, false)
+	handler := NewHandler(nullStore{}, &valhalla.StubClient{IsochroneErr: valhalla.ErrUpstream},
+		valhalla.DefaultLimits(), isochrone.EgressCache{}, log)
+
+	// No broker: the delivery is never dialled, so nothing here talks to one.
+	NewConsumer("amqp://unused", "q", "q.dead", 3, handler, log).
+		handle(context.Background(), amqp.Delivery{Body: body})
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("expected the handler and the consumer both to log, got: %q", buf.String())
+	}
+	for i, line := range lines {
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(line), &parsed); err != nil {
+			t.Fatalf("log line is not valid JSON: %v\nline: %s", err, line)
+		}
+		if parsed["trace_id"] != wantTrace {
+			t.Errorf("log line %d has trace_id %v, want %q\nline: %s", i, parsed["trace_id"], wantTrace, line)
+		}
 	}
 }
 

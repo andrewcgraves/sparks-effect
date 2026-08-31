@@ -45,7 +45,9 @@ var ErrMalformedMessage = errors.New("routing: malformed message")
 // two repositories share no Go code, so nothing but testdata/message.golden.json
 // — the same file, byte for byte, that the API asserts it produces — stops the
 // copies drifting. Change a field here and that test fails until the fixture is
-// updated on both sides deliberately.
+// updated on both sides deliberately. `make check-contract` fetches the API's
+// copy of that fixture and diffs it, so a change made on only one side is
+// caught by CI rather than by whoever next reads both files (SPA-227).
 //
 // Graph travels inline rather than by reference. A compiled graph is immutable
 // once its compile job succeeds, so there is no staleness to worry about, and
@@ -63,6 +65,17 @@ type Message struct {
 	Lng          float64               `json:"lng"`
 	BudgetMins   int                   `json:"budget_mins"`
 	Mode         transit.TravelMode    `json:"mode"`
+	// TraceID is the trace of the request that created this job, minted by the
+	// API. Logging under it is what makes one isochrone followable across both
+	// services instead of stopping at the queue, so the handler tags its
+	// context with it (see internal/worker).
+	//
+	// It is the only trace source that actually fires in production: the
+	// x-trace-id delivery header this worker also reads is set by nothing the
+	// API publishes. Optional — a message published before the field existed,
+	// or sent by hand, decodes with it empty and is processed unchanged, which
+	// is why adding it needed no SchemaVersion bump.
+	TraceID string `json:"trace_id"`
 }
 
 // Decode parses a message body and checks it describes work this worker can
