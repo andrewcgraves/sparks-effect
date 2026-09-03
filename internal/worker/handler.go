@@ -86,7 +86,7 @@ type Handler struct {
 // NewHandler builds the job handler.
 //
 // The cache is passed in rather than derived from s, even though in production
-// both are the same *store.Repo. The two are separate concerns — one is where
+// both are the same *store.Client. The two are separate concerns — one is where
 // the answer goes, the other is a saving on how it is arrived at — and a
 // handler wired for one is legitimately run without the other, which a shared
 // argument would make impossible to express. A zero EgressCache computes every
@@ -153,8 +153,8 @@ func (h *Handler) handle(ctx context.Context, msg routing.Message, decodeErr err
 
 	if err := h.store.MarkRunning(ctx, msg.RoutingJobID); err != nil {
 		// A row that is gone is gone: its compile job cascaded away, and there
-		// is nothing left to answer. Anything else — the database being down,
-		// a connection dropped — is worth another attempt.
+		// is nothing left to answer. Anything else — the API being down, a
+		// connection dropped — is worth another attempt.
 		if errors.Is(err, store.ErrJobNotFound) {
 			h.log.Warn(ctx, "routing: job has no row; discarding", "job_id", msg.RoutingJobID)
 			return Result{Outcome: OutcomePermanent, JobID: msg.RoutingJobID, Err: err}

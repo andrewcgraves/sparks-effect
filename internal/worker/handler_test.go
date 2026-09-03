@@ -306,7 +306,7 @@ func TestHandle_transientFailureRequeuesWithoutFailingTheJob(t *testing.T) {
 	}
 }
 
-// A database that cannot be written to is transient, not permanent: the chain
+// An API that cannot be written to is transient, not permanent: the chain
 // itself was fine and the answer is worth another attempt.
 func TestHandle_storeFailuresAreTransient(t *testing.T) {
 	dbDown := errors.New("connection refused")

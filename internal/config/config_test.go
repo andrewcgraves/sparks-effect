@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/config"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
@@ -103,5 +104,24 @@ func TestZeroRetriesIsRespected(t *testing.T) {
 func TestValhallaURLHasNoDefault(t *testing.T) {
 	if got := config.Load().ValhallaURL; got != "" {
 		t.Errorf("ValhallaURL = %q, want empty when unset", got)
+	}
+}
+
+// The API URL and worker token have no useful defaults: a worker with nowhere
+// to record results, or one that would be rejected at the auth gate, should
+// fail at startup rather than boot into a degraded mode.
+func TestAPICredentialsHaveNoDefault(t *testing.T) {
+	if got := config.Load().APIURL; got != "" {
+		t.Errorf("APIURL = %q, want empty when unset", got)
+	}
+	if got := config.Load().WorkerToken; got != "" {
+		t.Errorf("WorkerToken = %q, want empty when unset", got)
+	}
+}
+
+func TestAPITimeoutIsOverridable(t *testing.T) {
+	t.Setenv("API_TIMEOUT_SECONDS", "5")
+	if got := config.Load().APITimeout; got != 5*time.Second {
+		t.Errorf("APITimeout = %s, want 5s", got)
 	}
 }

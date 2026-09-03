@@ -12,7 +12,7 @@ import (
 // SyntheticClient answers routing calls with geometry instead of tiles.
 //
 // It is selected in production when no Valhalla URL is configured, which is
-// what makes the whole publish → consume → Postgres loop runnable in seconds
+// what makes the whole publish → consume → API loop runnable in seconds
 // on a laptop. Building a real tileset takes hours and tens of gigabytes, and
 // requiring that to check that a message is consumed and a row is written would
 // mean the loop was never exercised outside the cluster.

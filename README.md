@@ -10,16 +10,16 @@ Valhalla runs ClusterIP-only on the home cluster with no ingress, so
 only transport between them, which means the routing fan-out has to execute
 inside the cluster. This worker is that execution.
 
-The two repositories share **no Go code**. What they share is the Postgres
-schema and one message body:
+The two repositories share **no Go code**. What they share is one message body
+and the authenticated HTTP contract this worker uses to write results back:
 
 ```
 API                                    worker
  ├── resolves auth, ownership,          ├── decodes the message
  │   target slug, staleness             ├── computes the chained isochrone
  ├── inserts routing_jobs row           │   against Valhalla
- ├── publishes the message  ──queue──▶  └── updates the routing_jobs row
- └── answers 202; client polls
+ ├── publishes the message  ──queue──▶  └── records the result through
+ └── answers 202; client polls              authenticated API endpoints
 ```
 
 Everything to do with *who may ask for what* is resolved on the API side before
@@ -38,16 +38,17 @@ a struct to update.
 ## What it owns
 
 - **The queue consumer** (`internal/worker`) — one durable classic queue with a
-  dead-letter queue behind it, prefetch 1, acked only after the job row is
-  written.
+  dead-letter queue behind it, prefetch 1, acked only after the job is
+  recorded through the API.
 - **The Valhalla client** (`internal/valhalla`) — isochrone, matrix, route and status,
   plus the request limits the server enforces.
 - **The chainer** (`internal/isochrone`) — access leg, transit ride, egress leg,
   unioned into one reachability surface. Moved here wholesale from the API.
 - **The graph model** (`internal/transit`) — enough of the compiled-graph types
   to decode one and run Dijkstra over it, and no more.
-- **The egress cache** (`internal/store`) — the polygons a chain would otherwise
-  recompute, keyed on the publication.
+- **The result and cache client** (`internal/store`) — job transitions and
+  egress-polygon reuse, over authenticated HTTP rather than a database
+  connection. The SQL lives in sparks-effect-api.
 
 ## Caching egress polygons
 
@@ -90,17 +91,18 @@ The stamp is read once at startup, so a rebuild under a running worker keeps
 stamping the old timestamp until the pod restarts.
 
 The cache is an optimisation over work the worker can always do itself, so
-nothing about it can fail a job: a miss, an entry that will not parse, or a
-database that cannot be reached all mean the same thing — compute the polygon,
+nothing about it can fail a job: a miss, an entry that will not parse, or an
+API that cannot be reached all mean the same thing — compute the polygon,
 and log that the cache is not working.
 
 **Synthetic and real polygons share one keyspace.** Nothing in the key says
 which backend drew the shape, so a worker started with `VALHALLA_URL` unset
-against a database another worker warmed will serve real polygons, and one
-started *with* it against a database warmed synthetically will serve circles.
-Locally that is what the throwaway database is for; anywhere shared, treat
-switching `VALHALLA_URL` as needing the cache cleared. A NULL `tileset_at` is
-the tell — synthetic rows have never seen a tile.
+against a cache another worker warmed will serve real polygons, and one
+started *with* it against a cache warmed synthetically will serve circles.
+Locally that is what a throwaway API (or the in-process fake the tests use)
+is for; anywhere shared, treat switching `VALHALLA_URL` as needing the cache
+cleared. A NULL `tileset_at` is the tell — synthetic rows have never seen a
+tile.
 
 ## Failure handling
 
@@ -113,7 +115,7 @@ spinner forever, so it is explicit:
 | A request Valhalla rejects (400) | **Permanent** — mark failed, ack |
 | Routing job row missing (compile job cascaded away) | **Permanent** — discard, ack |
 | Valhalla unreachable, 5xx, timeout, rate limit | **Transient** — requeue, bounded |
-| Database unreachable | **Transient** — requeue, bounded |
+| API unreachable | **Transient** — requeue, bounded |
 | Retries exhausted | Mark failed, then dead-letter |
 
 Unrecognised errors are treated as transient. Retrying one a bounded number of
@@ -135,13 +137,13 @@ One trunk: `main`. Branch from it, PR into it. Production runs whichever
 
 `VALHALLA_URL` decides what backs the routing calls. Unset, the worker serves
 **synthetic** isochrones — circles sized from the budget — which makes the whole
-publish → consume → Postgres loop runnable in seconds with no tileset. Every
+publish → consume → API loop runnable in seconds with no tileset. Every
 synthetic feature carries `"synthetic": true`, and the fallback is logged
 loudly at startup, because it is the right default locally and a serious problem
 in production.
 
 ```sh
-cp .env.example .env   # set AMQP_URL and DATABASE_URL at minimum
+cp .env.example .env   # set AMQP_URL, API_URL and WORKER_TOKEN at minimum
 make run
 ```
 
@@ -171,21 +173,22 @@ changes.
 
 ```sh
 make dev-workflow    # test, vet, lint, build — run this before pushing
-make itest           # throwaway Postgres + RabbitMQ, full integration suite, teardown
+make itest           # throwaway RabbitMQ, full integration suite, teardown
 make check-contract  # diff the golden message fixture against sparks-effect-api
 ```
 
 `check-contract` is not part of `dev-workflow` because it needs the network and
 nothing else in that target does. CI runs it as a job of its own.
 
-Integration tests skip themselves unless `TEST_DATABASE_URL` and `TEST_AMQP_URL`
-are set, so `make test` stays green with nothing running. Under CI a missing URL
-is a hard failure instead, so a broken service fails the job rather than
-silently skipping.
+Integration tests skip themselves unless `TEST_AMQP_URL` is set, so `make test`
+stays green with nothing running. Under CI a missing URL is a hard failure
+instead, so a broken broker fails the job rather than silently skipping.
 
-The throwaway containers listen on 5433 and 5673 — one above the API repo's —
-so both repositories' test stacks can be up at once without either connecting to
-the other's.
+The throwaway broker listens on 5673 — one above the API repo's 5672 — so both
+repositories' test stacks can be up at once without either connecting to the
+other's. Job writes and the egress cache are exercised against an in-process
+stand-in for the API's worker endpoints; there is no throwaway Postgres in
+this repository.
 
 ## Schema ownership
 
@@ -193,12 +196,28 @@ the other's.
 sequence. Both want real foreign keys into `users` and `jobs`, and a foreign key
 cannot cross a schema owned by a different migration sequence.
 
-This repository therefore runs no migrations, and should not gain any: a second
-goose sequence against the same database would be two tools racing to own one
-`schema_migrations` table. `internal/testsupport/schema.sql` is a test-only copy
-of the columns this worker touches. It is a copy, and copies drift — if a test
-passes locally but the worker fails deployed, that file disagreeing with
-`00014_routing_jobs.sql` is the first place to look.
+This repository therefore runs no migrations, connects to no database, and
+should not gain either: a second goose sequence against the same database
+would be two tools racing to own one `schema_migrations` table, and a
+`DATABASE_URL` on this worker is how the database used to be reachable from
+the private internet (SPA-273). Job transitions and cache writes go through
+authenticated endpoints on the API (`/api/internal/...`), gated by a shared
+`WORKER_TOKEN`. Deploy the API side of that contract before this worker, or
+startup ping fails and the pod will not consume.
+
+The paths this client speaks:
+
+| Method | Path | Success | 404 |
+|---|---|---|---|
+| GET | `/api/internal/worker` | 204 (startup ping) | — |
+| POST | `/api/internal/routing-jobs/{id}/running` | 204 | missing or already terminal |
+| POST | `/api/internal/routing-jobs/{id}/succeeded` | 204 | missing |
+| POST | `/api/internal/routing-jobs/{id}/failed` | 204 | missing |
+| POST | `/api/internal/isochrone-cache/lookup` | 200 `{entries}` | — |
+| POST | `/api/internal/isochrone-cache` | 204 | — |
+
+Authorization is `Bearer $WORKER_TOKEN`. A 404 on a job write is
+`ErrJobNotFound` (permanent); anything else is retried.
 
 ## Routing limits
 

@@ -28,14 +28,18 @@ type Config struct {
 	// before the job is dead-lettered and marked failed. Zero means a
 	// transient failure fails the job on first sight.
 	MaxRetries int
-	// DatabaseURL is the Postgres connection string. The schema is owned by
-	// sparks-effect-api's migration sequence; this worker only ever updates
-	// rows in it, and runs no migrations of its own.
-	DatabaseURL string
-	// DBMaxConns caps the pgx pool size when > 0. Prefetch is 1, so one
-	// connection is genuinely enough; the setting exists for the operator who
-	// disagrees.
-	DBMaxConns int
+	// APIURL is the sparks-effect-api base URL this worker records results
+	// through. The schema is owned by that repository's migration sequence;
+	// this worker never connects to Postgres, and talks to the API over the
+	// authenticated worker endpoints instead (SPA-273).
+	APIURL string
+	// WorkerToken is the shared bearer token the API's worker endpoints
+	// accept. It is a service credential, not a user session: the API
+	// compares it with constant-time equality rather than looking it up in
+	// the sessions table.
+	WorkerToken string
+	// APITimeout bounds one call to the API.
+	APITimeout time.Duration
 	// ValhallaURL points at the in-cluster routing service, e.g.
 	// http://valhalla:8002. When empty the synthetic client is used instead,
 	// which is what makes the whole loop runnable without a tileset.
@@ -88,8 +92,9 @@ func Load() Config {
 		// Zero is a meaningful setting here — fail on first transient error —
 		// so it is read with envIntAllowingZero rather than envInt.
 		MaxRetries:      envIntAllowingZero("ROUTING_MAX_RETRIES", defaultMaxRetries),
-		DatabaseURL:     os.Getenv("DATABASE_URL"),
-		DBMaxConns:      envInt("DATABASE_MAX_CONNS", 0),
+		APIURL:          os.Getenv("API_URL"),
+		WorkerToken:     os.Getenv("WORKER_TOKEN"),
+		APITimeout:      time.Duration(envInt("API_TIMEOUT_SECONDS", 30)) * time.Second,
 		ValhallaURL:     os.Getenv("VALHALLA_URL"),
 		ValhallaTimeout: time.Duration(envInt("VALHALLA_TIMEOUT_SECONDS", int(valhalla.DefaultTimeout.Seconds()))) * time.Second,
 		Limits:          limits,

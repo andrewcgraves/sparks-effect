@@ -6,15 +6,15 @@ Use the Makefile for all build/test tasks (Go project).
 - `make build` — compile to `./bin/sparks-effect-routing-worker`
 - `make run` — build and run
 - `make test` — `go test ./... -race -cover` (integration tests skip themselves)
-- `make itest` — throwaway Postgres + RabbitMQ, full integration suite, teardown
+- `make itest` — throwaway RabbitMQ, full integration suite, teardown
 - `make check-contract` — diff the golden message fixture against sparks-effect-api's copy (needs network; CI runs it, `dev-workflow` does not)
 - `make vet` / `make lint` — static checks
 - `make tidy` — `go mod tidy`
 - `make clean` — remove build artifacts
 
 The Postgres schema is owned by sparks-effect-api's migration sequence. This
-repository runs no migrations; `internal/testsupport/schema.sql` is a test-only
-copy.
+repository runs no migrations and holds no database connection; job writes
+go through authenticated API endpoints.
 
 ## Branching
 

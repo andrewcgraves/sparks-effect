@@ -129,7 +129,7 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 
 	switch res.Outcome {
 	case OutcomeSucceeded, OutcomePermanent:
-		// Ack only now — after the row is written. A crash before this point
+		// Ack only now — after the result is written. A crash before this point
 		// redelivers the message rather than silently losing the work, which is
 		// safe because every write is keyed by job id and recomputing over an
 		// immutable graph gives the same answer.
@@ -141,7 +141,7 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 			c.log.Warn(ctx, "routing: job exhausted retries; dead-lettering",
 				"job_id", res.JobID, "max_retries", c.maxRetries)
 			// Mark failed *before* dead-lettering, so the moment the message
-			// leaves the queue the row already says why. A client polling this
+			// leaves the queue the job already says why. A client polling this
 			// job stops waiting here; without it, it would wait forever on a
 			// message nothing will consume again.
 			if res.JobID != "" {

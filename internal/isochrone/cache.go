@@ -40,7 +40,7 @@ type EgressCache struct {
 
 // lookup reads what the cache already holds, and never reports a failure.
 //
-// Every way this can go wrong — no cache configured, the database unreachable,
+// Every way this can go wrong — no cache configured, the API unreachable,
 // a row that will not parse — means the same thing to the caller: compute the
 // polygon. Returning an error would invite a caller to fail a routing job over
 // a missing optimisation, so the seam does not offer one; the failure goes to
@@ -82,8 +82,8 @@ func (e EgressCache) lookup(
 // fails.
 //
 // It runs after the fan-out has already succeeded, so by this point the answer
-// the caller wanted exists. A compile job that cascaded away mid-chain, or a
-// database that has gone down since, costs the next request a recomputation and
+// the caller wanted exists. A compile job that cascaded away mid-chain, or an
+// API that has gone down since, costs the next request a recomputation and
 // nothing else.
 //
 // misses indexes keys and isos, which the chainer holds parallel to its

@@ -313,9 +313,9 @@ func TestChainer_cachedEntriesCarryTheTilesetStamp(t *testing.T) {
 }
 
 // A recompile mints a new compile job, and the previous generation's rows are
-// simply not addressable from it. The store proves this against Postgres; this
-// proves the chainer puts the request's own compile job in the key rather than
-// anything it inferred.
+// simply not addressable from it. The store client proves this against the API
+// contract; this proves the chainer puts the request's own compile job in the
+// key rather than anything it inferred.
 func TestChainer_recompiledGraphMissesThePreviousGeneration(t *testing.T) {
 	cache := newFakeCache()
 	egress := isochrone.EgressCache{Store: cache}
@@ -516,7 +516,7 @@ func TestChainer_zeroCacheIsSupported(t *testing.T) {
 }
 
 // A chain that reaches nothing has nothing to look up, and should not go to the
-// database to say so.
+// API to say so.
 func TestChainer_noReachableStationsTouchesNoCache(t *testing.T) {
 	cache := newFakeCache()
 	fc := &valhalla.StubClient{IsochroneResp: cannedIso()}

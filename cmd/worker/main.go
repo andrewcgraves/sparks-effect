@@ -40,15 +40,19 @@ func main() {
 }
 
 func run(cfg config.Config, log *logger.Logger) error {
-	// Both of these are refused at startup rather than degraded around. A
-	// worker with no queue has nothing to consume, and one with no database
-	// has nowhere to record what it computed — in either case it would run
-	// indefinitely doing nothing, which is worse than not starting.
+	// These are refused at startup rather than degraded around. A worker with
+	// no queue has nothing to consume, and one with no API (or no token the
+	// API will accept) has nowhere to record what it computed — in either
+	// case it would run indefinitely doing nothing, which is worse than not
+	// starting.
 	if cfg.AMQPURL == "" {
 		return errors.New("AMQP_URL is required")
 	}
-	if cfg.DatabaseURL == "" {
-		return errors.New("DATABASE_URL is required")
+	if cfg.APIURL == "" {
+		return errors.New("API_URL is required")
+	}
+	if cfg.WorkerToken == "" {
+		return errors.New("WORKER_TOKEN is required")
 	}
 
 	// Cancelled on SIGINT/SIGTERM. The consumer finishes settling the delivery
@@ -60,15 +64,14 @@ func run(cfg config.Config, log *logger.Logger) error {
 	connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	repo, err := store.Connect(connectCtx, cfg.DatabaseURL, cfg.DBMaxConns)
+	repo, err := store.Connect(connectCtx, cfg.APIURL, cfg.WorkerToken, cfg.APITimeout)
 	if err != nil {
 		return err
 	}
-	defer repo.Close()
 
 	routingClient, tilesetAt := newRoutingClient(ctx, cfg, log)
 
-	// One repo, two roles: it is where results are written and where egress
+	// One client, two roles: it is where results are written and where egress
 	// polygons are reused from. The tileset stamp is read once, here, because
 	// it describes the server rather than any one request.
 	cache := isochrone.EgressCache{Store: repo, TilesetAt: tilesetAt}

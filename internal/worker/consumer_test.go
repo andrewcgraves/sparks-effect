@@ -63,7 +63,7 @@ func TestRedactDialErrNoCredentials(t *testing.T) {
 
 // nullStore accepts every transition and remembers nothing. What the consumer
 // does with a delivery does not depend on the row behind it, and the row itself
-// is settled in handler_test.go and against a real database.
+// is settled in handler_test.go and against a real API.
 type nullStore struct{}
 
 func (nullStore) MarkRunning(context.Context, string) error                    { return nil }

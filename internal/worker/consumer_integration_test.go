@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
@@ -30,10 +29,11 @@ const (
 	goldenCompileID = "0f3b7c2a-4d1e-4a5b-9c8d-2e6f1a0b3c4d"
 )
 
-// harness is one worker wired to a real broker and a real database, with a
-// routing client the test controls.
+// harness is one worker wired to a real broker and the worker HTTP contract,
+// with a routing client the test controls.
 type harness struct {
-	pool   *pgxpool.Pool
+	api    *testsupport.FakeAPI
+	store  *store.Client
 	ch     *amqp.Channel
 	client valhalla.Client
 	url    string
@@ -44,11 +44,15 @@ type harness struct {
 
 func newHarness(t *testing.T, client valhalla.Client) *harness {
 	t.Helper()
-	pool := testsupport.Postgres(t)
+	api := testsupport.StartFakeAPI(t)
+	repo, err := store.Connect(context.Background(), api.URL(), api.Token, 0)
+	if err != nil {
+		t.Fatalf("connecting to fake API: %v", err)
+	}
 	url, ch := testsupport.Broker(t)
 	testsupport.ResetQueues(t, ch, testQueue, testDeadLetter)
 	return &harness{
-		pool: pool, ch: ch, client: client, url: url,
+		api: api, store: repo, ch: ch, client: client, url: url,
 		tilesetAt: time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC),
 	}
 }
@@ -61,11 +65,10 @@ func newHarness(t *testing.T, client valhalla.Client) *harness {
 // makes the broker redeliver it.
 func (h *harness) run(t *testing.T, maxRetries int) (stop, kill func()) {
 	t.Helper()
-	// One repo in both roles, exactly as main wires it: results are written
+	// One client in both roles, exactly as main wires it: results are written
 	// through it and egress polygons are reused through it.
-	repo := store.NewRepo(h.pool)
-	cache := isochrone.EgressCache{Store: repo, TilesetAt: h.tilesetAt}
-	handler := worker.NewHandler(repo, h.client, valhalla.DefaultLimits(), cache, logger.Discard())
+	cache := isochrone.EgressCache{Store: h.store, TilesetAt: h.tilesetAt}
+	handler := worker.NewHandler(h.store, h.client, valhalla.DefaultLimits(), cache, logger.Discard())
 	consumer := worker.NewConsumer(h.url, testQueue, testDeadLetter, maxRetries, handler, logger.Discard())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -101,7 +104,7 @@ func (h *harness) run(t *testing.T, maxRetries int) (stop, kill func()) {
 func (h *harness) waitForStatus(t *testing.T, jobID, want string) {
 	t.Helper()
 	testsupport.WaitFor(t, 15*time.Second, "job "+jobID+" to reach "+want, func() bool {
-		status, _, _ := testsupport.RoutingJobStatus(t, h.pool, jobID)
+		status, _, _ := h.api.JobStatus(t, jobID)
 		return status == want
 	})
 }
@@ -111,7 +114,7 @@ func (h *harness) waitForStatus(t *testing.T, jobID, want string) {
 // result attached.
 func TestEndToEnd_publishedJobIsComputedAndRecorded(t *testing.T) {
 	h := newHarness(t, valhalla.NewSyntheticClient())
-	testsupport.SeedRoutingJob(t, h.pool, goldenJobID, goldenCompileID)
+	h.api.SeedRoutingJob(goldenJobID)
 
 	stop, _ := h.run(t, 3)
 	defer stop()
@@ -119,7 +122,7 @@ func TestEndToEnd_publishedJobIsComputedAndRecorded(t *testing.T) {
 	testsupport.Publish(t, h.ch, testQueue, goldenMessage(t))
 	h.waitForStatus(t, goldenJobID, store.StatusSucceeded)
 
-	_, errMsg, result := testsupport.RoutingJobStatus(t, h.pool, goldenJobID)
+	_, errMsg, result := h.api.JobStatus(t, goldenJobID)
 	if errMsg != "" {
 		t.Errorf("error = %q, want empty", errMsg)
 	}
@@ -167,7 +170,7 @@ func (c *countingClient) Isochrone(ctx context.Context, req valhalla.IsochroneRe
 }
 
 // Reuse, end to end: two routing jobs over one publication, through a real
-// broker and a real database. The second makes the single call the first one's
+// broker and the worker HTTP contract. The second makes the single call the first one's
 // cache could not save it — the origin polygon, which starts where the user
 // clicked and is nobody else's to share.
 func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
@@ -175,7 +178,7 @@ func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
 
 	client := &countingClient{Client: valhalla.NewSyntheticClient()}
 	h := newHarness(t, client)
-	testsupport.SeedRoutingJob(t, h.pool, goldenJobID, goldenCompileID)
+	h.api.SeedRoutingJob(goldenJobID)
 
 	stop, _ := h.run(t, 3)
 	defer stop()
@@ -189,7 +192,7 @@ func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
 	h.waitForStatus(t, goldenJobID, store.StatusSucceeded)
 	coldCalls := client.isochroneCalls.Load()
 
-	cached := testsupport.IsochroneCacheCount(t, h.pool, goldenCompileID)
+	cached := h.api.IsochroneCacheCount(goldenCompileID)
 	if cached == 0 {
 		t.Fatal("the completed job cached no egress polygons")
 	}
@@ -197,15 +200,15 @@ func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
 	if want := int(coldCalls) - 1; cached != want {
 		t.Errorf("cached %d polygons against %d isochrone calls, want %d (all but the origin)", cached, coldCalls, want)
 	}
-	for _, at := range testsupport.IsochroneCacheStamps(t, h.pool, goldenCompileID) {
-		if at == nil || !at.Equal(h.tilesetAt) {
+	for _, at := range h.api.IsochroneCacheStamps(goldenCompileID) {
+		if at.IsZero() || !at.Equal(h.tilesetAt) {
 			t.Errorf("cache row stamped %v, want the server's tileset %s", at, h.tilesetAt)
 		}
 	}
 
 	// A second job: same publication, same click, same budget — a different
 	// user asking the same question.
-	testsupport.SeedRoutingJob(t, h.pool, secondJobID, goldenCompileID)
+	h.api.SeedRoutingJob(secondJobID)
 	client.isochroneCalls.Store(0)
 	testsupport.Publish(t, h.ch, testQueue,
 		mutateGolden(t, func(m map[string]any) {
@@ -223,15 +226,15 @@ func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
 	}
 
 	// Cheaper, and the same answer.
-	_, _, coldResult := testsupport.RoutingJobStatus(t, h.pool, goldenJobID)
-	_, _, warmResult := testsupport.RoutingJobStatus(t, h.pool, secondJobID)
+	_, _, coldResult := h.api.JobStatus(t, goldenJobID)
+	_, _, warmResult := h.api.JobStatus(t, secondJobID)
 	if len(features(t, coldResult)) != len(features(t, warmResult)) {
 		t.Errorf("warm result has %d features, cold has %d",
 			len(features(t, warmResult)), len(features(t, coldResult)))
 	}
 
 	// Nothing new to write the second time round.
-	if got := testsupport.IsochroneCacheCount(t, h.pool, goldenCompileID); got != cached {
+	if got := h.api.IsochroneCacheCount(goldenCompileID); got != cached {
 		t.Errorf("cache holds %d rows after the warm job, want the %d the cold one left", got, cached)
 	}
 }
@@ -251,7 +254,7 @@ func features(t *testing.T, result []byte) []any {
 // it would loop forever against a server with room for one chain at a time.
 func TestEndToEnd_permanentFailureFailsTheJobAndDoesNotRequeue(t *testing.T) {
 	h := newHarness(t, valhalla.NewSyntheticClient())
-	testsupport.SeedRoutingJob(t, h.pool, goldenJobID, goldenCompileID)
+	h.api.SeedRoutingJob(goldenJobID)
 
 	stop, _ := h.run(t, 3)
 	defer stop()
@@ -260,7 +263,7 @@ func TestEndToEnd_permanentFailureFailsTheJobAndDoesNotRequeue(t *testing.T) {
 		mutateGolden(t, func(m map[string]any) { m["mode"] = "teleport" }))
 	h.waitForStatus(t, goldenJobID, store.StatusFailed)
 
-	_, errMsg, _ := testsupport.RoutingJobStatus(t, h.pool, goldenJobID)
+	_, errMsg, _ := h.api.JobStatus(t, goldenJobID)
 	if errMsg == "" {
 		t.Error("job failed with no message; a caller has nothing to read")
 	}
@@ -292,7 +295,7 @@ func TestEndToEnd_transientFailureRetriesThenDeadLetters(t *testing.T) {
 	}
 
 	h := newHarness(t, client)
-	testsupport.SeedRoutingJob(t, h.pool, goldenJobID, goldenCompileID)
+	h.api.SeedRoutingJob(goldenJobID)
 
 	stop, _ := h.run(t, maxRetries)
 	defer stop()
@@ -312,7 +315,7 @@ func TestEndToEnd_transientFailureRetriesThenDeadLetters(t *testing.T) {
 		t.Errorf("live queue depth = %d, want 0 — the message should have moved on", got)
 	}
 
-	_, errMsg, _ := testsupport.RoutingJobStatus(t, h.pool, goldenJobID)
+	_, errMsg, _ := h.api.JobStatus(t, goldenJobID)
 	if errMsg == "" {
 		t.Error("job failed with no message after exhausting retries")
 	}
@@ -335,7 +338,7 @@ func TestEndToEnd_transientFailureThatRecoversSucceeds(t *testing.T) {
 	}
 
 	h := newHarness(t, client)
-	testsupport.SeedRoutingJob(t, h.pool, goldenJobID, goldenCompileID)
+	h.api.SeedRoutingJob(goldenJobID)
 
 	stop, _ := h.run(t, 3)
 	defer stop()
@@ -356,7 +359,7 @@ func TestEndToEnd_transientFailureThatRecoversSucceeds(t *testing.T) {
 // returned. The second, with a working client, has to finish the job.
 func TestEndToEnd_workerKilledMidChainRedelivers(t *testing.T) {
 	h := newHarness(t, nil)
-	testsupport.SeedRoutingJob(t, h.pool, goldenJobID, goldenCompileID)
+	h.api.SeedRoutingJob(goldenJobID)
 
 	// blocked is released only at the very end, so the first worker is still
 	// genuinely inside the call when its connection is dropped.
@@ -388,7 +391,7 @@ func TestEndToEnd_workerKilledMidChainRedelivers(t *testing.T) {
 	// it — the first worker never acks, nacks, or republishes anything.
 	killFirst()
 
-	if status, _, _ := testsupport.RoutingJobStatus(t, h.pool, goldenJobID); status == store.StatusSucceeded {
+	if status, _, _ := h.api.JobStatus(t, goldenJobID); status == store.StatusSucceeded {
 		t.Fatal("the job completed before the worker was killed; the test proves nothing")
 	}
 
@@ -404,7 +407,7 @@ func TestEndToEnd_workerKilledMidChainRedelivers(t *testing.T) {
 
 	h.waitForStatus(t, goldenJobID, store.StatusSucceeded)
 
-	_, _, result := testsupport.RoutingJobStatus(t, h.pool, goldenJobID)
+	_, _, result := h.api.JobStatus(t, goldenJobID)
 	if len(result) == 0 {
 		t.Error("job succeeded with no result attached")
 	}
