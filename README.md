@@ -63,7 +63,7 @@ the work, one call per station reached by riding transit against two for
 everything else. A station reached by walking alone gets no egress call, and
 nothing to cache: its own reach is already covered by the origin polygon.
 
-The key is `(compile_job_id, station_slug, mode, contour_mins)`.
+The key is `(compile_job_id, station_slug, mode, contour_mins, departs_on)`.
 
 Keying on the publication is what makes this correct with no invalidation
 machinery at all. A published scenario is frozen and its stations cannot move,
@@ -82,6 +82,18 @@ and useless for an origin that is a house). Adding `transit` needed no schema
 change: the column is unconstrained text, and SPA-248 left it that way
 because this worker is the only writer.
 
+`departs_on` is the GTFS service day a transit polygon was computed against,
+and is empty — NULL — for the modes that have no timetable. A transit polygon
+is a function of that day's services, so without it the first request against a
+compile job froze that day's answer for as long as the job lived, which for the
+seeded corridor is indefinitely. Two service dates being two rows is what makes
+a GTFS calendar boundary self-correcting instead of mixing pre-expiry and
+post-expiry polygons into one response (SPA-269). The API's constraint treats
+NULLs as *not* distinct, so walk / bike / drive still keep exactly one row per
+station and contour. The date on the key is the date the egress request itself
+was stamped with — see "the departure clock" below — never one recomputed
+beside it.
+
 **Accepted risk.** A Valhalla tile rebuild changes every polygon without
 changing any compile job, and nothing here detects that. Rebuilds are rare and
 are already a deliberate operator ritual. To keep it diagnosable, each row
@@ -89,6 +101,29 @@ records the server's tileset timestamp as *data only* — never part of the key,
 because keying on it would silently invalidate the entire cache on every rebuild.
 The stamp is read once at startup, so a rebuild under a running worker keeps
 stamping the old timestamp until the pod restarts.
+
+**Accepted risk, second one.** `departs_on` is a *date*, but since SPA-274 the
+egress request's departure also carries a time of day — the chain's departure
+plus the journey to that station. So the key is coarser than the request it
+describes, and two chains can share a row whose polygons were computed at
+different hours of the same day.
+
+Reaching it takes a coincidence: the same graph, the same station, the same
+clamped contour and the same date, but different journey durations — which
+needs different origins and budgets that differ by exactly the difference in
+journey time. Two cases are worth knowing about. Below the contour ceiling the
+gap is bounded by the minute-truncation of `remaining_mins`, so at worst 59
+seconds, which no timetable notices. Above the ceiling every budget clamps to
+the same contour, so the gap is unbounded: budget 400 min arriving 10 minutes
+in and budget 500 min arriving 100 minutes in both key on contour 320 and share
+one row, 90 minutes of timetable apart.
+
+It is accepted rather than fixed because closing it means putting the departure
+itself in the key, and the column the API owns is a `date` — so the fix is a
+migration in sparks-effect-api (a `departs_at`, or a minute-of-day beside the
+date), not something this repository can do alone. Until then the reuse is
+wrong only in the clamped regime, where the polygon is a ceiling-sized answer
+to an over-ceiling ask in the first place.
 
 The cache is an optimisation over work the worker can always do itself, so
 nothing about it can fail a job: a miss, an entry that will not parse, or an
@@ -264,11 +299,49 @@ chainer therefore:
    Those polygons are visualisation only — a 30-minute multimodal
    isochrone can miss a stop `/route` reached in 13 minutes
    (valhalla/valhalla#5636) — and are never used as a station filter.
-4. Always sends `date_time` as a representative weekday 08:00. Without it
-   the same pair waits for the next trip and inflates by a factor of four.
+4. Always sends `date_time`. Without it the same pair waits for the next
+   trip and inflates by a factor of four.
    `costing_options.pedestrian.multimodal_start_end_max_distance` is raised
    to 10 km (Valhalla's request default is 2415 m) so suburban walks to a
    station are not clipped.
+
+### The departure clock
+
+One chain resolves one departure, at the top of `Chain`, and every call it
+makes carries it. It defaults to 08:00 on the next weekday — today, if today
+is one — resolved on `America/Los_Angeles`, since every scenario served is in
+California or Nevada. Resolving it on the UTC calendar, as it used to, rolled
+the date over at about 17:00 Pacific: the same pin at the same budget drew a
+different surface in the evening than at lunchtime, a Friday evening asked for
+Monday, and an evening request the day before a feed's `end_date` asked for a
+day that feed does not cover (SPA-274).
+
+Egress is the one leg that does *not* depart when the rider does. It is
+stamped at the chain's departure plus the whole journey to that station —
+access leg, boarding wait, and every hop ridden — because that is when the
+rider is actually standing on the platform. Compiled Local is 5 h 06 m
+SF→Anaheim, so a rider leaving at 08:00 steps off in the early afternoon and
+was previously handed a morning-peak reach.
+
+### Did it actually ride anything?
+
+Valhalla does not error on a multimodal request it can find no service for. It
+walks the whole way and answers 200, with a plausible shape and a plausible
+duration, so a tileset whose GTFS calendars have all expired is
+indistinguishable from a corridor with genuinely poor service unless the
+maneuvers are read. `RouteResponse.RodeTransit` reads them, the transit access
+fan-out logs how many of its legs boarded anything, and `make acceptance`
+asserts it against a real server on a pair where the answer is known:
+
+```
+make acceptance TEST_VALHALLA_URL=http://localhost:8002
+```
+
+A 200 with a polygon is exactly what the broken state returns, so a check
+weaker than "a maneuver whose `travel_mode` is `transit`" proves nothing.
+`TEST_TRANSIT_DEPART_AT=YYYY-MM-DDTHH:MM` asks about a specific service date,
+which is how "do the feeds on the volume still cover next week?" gets answered
+before it turns into an undersized isochrone.
 
 Error 140 is a 400 and already maps to `ErrBadRequest` / permanent. It
 should not appear if Matrix is skipped. Other transit-costing 400s (no

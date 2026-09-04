@@ -32,7 +32,14 @@ CONTRACT_FIXTURE := internal/routing/testdata/message.golden.json
 CONTRACT_REF     := main
 CONTRACT_URL     := https://raw.githubusercontent.com/andrewcgraves/sparks-effect-api/$(CONTRACT_REF)/$(CONTRACT_FIXTURE)
 
-.PHONY: all deps build run test test-integration itest check-contract \
+# --- Acceptance checks against a real Valhalla ---
+# The transit checks need tiles, which a fake cannot stand in for: the failure
+# they exist to catch is a tileset whose GTFS calendars have expired, and
+# Valhalla answers that with a 200 and a walking itinerary. Point this at a
+# port-forward of the cluster's valhalla service.
+TEST_VALHALLA_URL ?=
+
+.PHONY: all deps build run test test-integration itest acceptance check-contract \
 	mq-up mq-wait mq-down vet lint tidy clean dev-workflow
 
 all: build
@@ -71,6 +78,29 @@ test-integration: deps
 itest:
 	$(MAKE) mq-up && $(MAKE) test-integration; \
 	status=$$?; $(MAKE) mq-down; exit $$status
+
+# acceptance asks a real Valhalla whether it will actually put a rider on a
+# train, over a known pair on a rail line that is in the tiles.
+#
+# Not part of dev-workflow, and not part of `test`: it needs a server with
+# transit tiles, which is a multi-hour build and tens of gigabytes. Without
+# TEST_VALHALLA_URL the checks skip themselves, so this target refuses rather
+# than reporting a green run that asserted nothing.
+#
+#	make acceptance TEST_VALHALLA_URL=http://localhost:8002
+#
+# TEST_TRANSIT_DEPART_AT=YYYY-MM-DDTHH:MM asks about a specific service date,
+# which is how "do the feeds on the volume still cover next week?" gets checked
+# before the answer turns into an undersized isochrone.
+acceptance: deps
+	@if [ -z "$(TEST_VALHALLA_URL)" ]; then \
+		echo "set TEST_VALHALLA_URL to a Valhalla server with transit tiles, e.g." >&2; \
+		echo "  make acceptance TEST_VALHALLA_URL=http://localhost:8002" >&2; \
+		exit 1; \
+	fi
+	TEST_VALHALLA_URL="$(TEST_VALHALLA_URL)" \
+	TEST_TRANSIT_DEPART_AT="$(TEST_TRANSIT_DEPART_AT)" \
+		go test ./internal/valhalla/ -run Acceptance -count=1 -v
 
 # check-contract diffs this repository's golden message fixture against
 # sparks-effect-api's copy of the same file.

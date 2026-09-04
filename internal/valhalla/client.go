@@ -79,6 +79,18 @@ type IsochroneRequest struct {
 	Origin     LatLng
 	Costing    Costing
 	BudgetSecs int
+	// DepartAt is when the rider is standing at Origin. It is read only under
+	// multimodal costing, where it decides which GTFS service day the answer is
+	// computed against and which departures are running when the rider arrives;
+	// the other costings have no timetable and ignore it.
+	//
+	// The zero value means "the caller has no opinion", and falls back to the
+	// representative weekday morning (see WeekdayDepartAt). A caller that does
+	// have one is expected to say so: an egress polygon is drawn from a station
+	// the rider reaches hours after setting out, and stamping it with the same
+	// morning peak as the origin gives it a service level that will not be
+	// running by the time they arrive (SPA-274).
+	DepartAt time.Time
 }
 
 // IsochroneResponse is the raw GeoJSON FeatureCollection Valhalla returns.
@@ -143,6 +155,9 @@ type RouteRequest struct {
 	Origin      LatLng
 	Destination LatLng
 	Costing     Costing
+	// DepartAt is when the rider leaves Origin, read under multimodal costing
+	// only. See IsochroneRequest.DepartAt, which it means the same thing as.
+	DepartAt time.Time
 }
 
 // RouteResponse is the routed path, as positions.
@@ -167,6 +182,18 @@ type RouteResponse struct {
 	// with units=kilometers. Used the same way MatrixCell.DistanceKm is: a
 	// route shorter than the straight line is not a real journey.
 	DistanceKm float64
+	// RodeTransit reports whether the rider boarded a scheduled service at any
+	// point, read off the maneuvers' travel_mode.
+	//
+	// It is the one thing that distinguishes a multimodal answer from a walking
+	// one. Valhalla does not refuse a multimodal request it can find no service
+	// for — it walks the whole way and answers 200 — so a corridor whose GTFS
+	// calendars have all expired is indistinguishable from one with a genuinely
+	// poor service unless this is read (SPA-274). Always false under the other
+	// costings, which have nothing to board. SyntheticClient reports it true
+	// for multimodal, since its answer is timed as though a service had been
+	// ridden — see its Route.
+	RodeTransit bool
 }
 
 // Status is what /status reports about the server and the tiles it is serving.

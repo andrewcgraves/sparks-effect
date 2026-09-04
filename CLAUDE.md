@@ -7,6 +7,7 @@ Use the Makefile for all build/test tasks (Go project).
 - `make run` — build and run
 - `make test` — `go test ./... -race -cover` (integration tests skip themselves)
 - `make itest` — throwaway RabbitMQ, full integration suite, teardown
+- `make acceptance TEST_VALHALLA_URL=…` — asks a real Valhalla whether it actually puts a rider on a train. Needs transit tiles, so it sits outside `test` and `dev-workflow`, and refuses rather than skipping silently
 - `make check-contract` — diff the golden message fixture against sparks-effect-api's copy (needs network; CI runs it, `dev-workflow` does not)
 - `make vet` / `make lint` — static checks
 - `make tidy` — `go mod tidy`

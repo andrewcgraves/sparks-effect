@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 
@@ -132,12 +134,21 @@ func (c *chainImpl) Chain(ctx context.Context, req ChainRequest) (*ChainResponse
 		return nil, ErrInvalidMode
 	}
 
+	// One chain, one departure. req is this function's own copy, so writing the
+	// resolved value back onto it hands the same moment to every call below
+	// without threading it through six signatures — and makes it impossible for
+	// two of them to resolve their own (SPA-274).
+	if req.DepartAt.IsZero() {
+		req.DepartAt = valhalla.WeekdayDepartAt(time.Now(), valhalla.ServiceAreaZone())
+	}
+
 	c.log.Info(ctx, "chain: starting",
 		"compile_job_id", req.CompileJobID,
 		"mode", req.Mode,
 		"budget_mins", req.BudgetMins,
 		"lat", req.Lat,
-		"lng", req.Lng)
+		"lng", req.Lng,
+		"departs_at", req.DepartAt.Format(time.RFC3339))
 
 	nodes := c.graph.Nodes()
 	c.log.Debug(ctx, "chain: graph loaded", "node_count", len(nodes))
@@ -274,6 +285,7 @@ func (c *chainImpl) starterWalk(
 		Origin:      valhalla.LatLng{Lat: req.Lat, Lng: req.Lng},
 		Destination: valhalla.LatLng{Lat: starter.node.Lat, Lng: starter.node.Lng},
 		Costing:     costing,
+		DepartAt:    req.DepartAt,
 	})
 	if err != nil {
 		c.log.Debug(ctx, "chain: starter walk not routed, drawing none", "station_slug", starter.node.Slug, "err", err.Error())
@@ -372,6 +384,7 @@ func (c *chainImpl) originAndAccess(
 			Origin:     valhalla.LatLng{Lat: req.Lat, Lng: req.Lng},
 			Costing:    costing,
 			BudgetSecs: originContourSecs,
+			DepartAt:   req.DepartAt,
 		})
 		if isoErr != nil {
 			return wrapRoutingErr(isoErr)
@@ -429,6 +442,16 @@ func (c *chainImpl) accessMatrix(
 // "no transit near here" is a fact about that pair, not a reason to fail the
 // chain. Rate-limits and upstream failures still fail the job; those are
 // transient, and retrying is the right answer.
+//
+// How many of the answers actually boarded a service is counted and reported.
+// A multimodal request Valhalla can find no service for is answered 200 with a
+// walking itinerary, so a corridor whose GTFS calendars have expired produces a
+// chain that succeeds, draws polygons, and is quietly no better than walking.
+// Nothing in this worker used to look, which is why it took a manual
+// reproduction to find (SPA-274). The count is not an error — an origin genuinely
+// far from any service is a legitimate zero — so it is logged rather than
+// enforced, and the acceptance checks in internal/valhalla are what assert it
+// on a pair where the answer is known.
 func (c *chainImpl) pairwiseAccess(
 	ctx context.Context,
 	req ChainRequest,
@@ -436,6 +459,7 @@ func (c *chainImpl) pairwiseAccess(
 	nearbyNodes []transit.Node,
 ) (*valhalla.MatrixResponse, error) {
 	cells := make([]valhalla.MatrixCell, len(nearbyNodes))
+	var routed, rode atomic.Int64
 
 	concurrency := c.limits.MaxConcurrency
 	if concurrency <= 0 {
@@ -452,6 +476,7 @@ func (c *chainImpl) pairwiseAccess(
 				Origin:      origin,
 				Destination: valhalla.LatLng{Lat: n.Lat, Lng: n.Lng},
 				Costing:     costing,
+				DepartAt:    req.DepartAt,
 			})
 			if err != nil {
 				if errors.Is(err, valhalla.ErrBadRequest) {
@@ -464,6 +489,10 @@ func (c *chainImpl) pairwiseAccess(
 			if route == nil {
 				return nil
 			}
+			routed.Add(1)
+			if route.RodeTransit {
+				rode.Add(1)
+			}
 			cells[i] = valhalla.Cell(route.Time, route.DistanceKm)
 			return nil
 		})
@@ -472,6 +501,14 @@ func (c *chainImpl) pairwiseAccess(
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
+
+	c.log.Info(ctx, "chain: transit access legs routed",
+		"compile_job_id", req.CompileJobID,
+		"asked", len(nearbyNodes),
+		"routed", routed.Load(),
+		"rode_transit", rode.Load(),
+		"departs_at", req.DepartAt.Format(time.RFC3339))
+
 	return &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{cells}}, nil
 }
 
@@ -682,6 +719,40 @@ func legsTo(slug string, reached map[string]transit.Reached) []Leg {
 	return legs
 }
 
+// egressDepartAt is when this rider is standing at this station, ready to
+// travel out from it: the chain's own departure plus everything the journey
+// there cost — the access leg, the boarding wait, and every hop ridden.
+//
+// The origin's departure is the wrong clock for it. Every egress request used
+// to be stamped 08:00, which is defensible for the origin polygon and the
+// access legs and wrong for egress, which happens after both: compiled Local is
+// 5 h 06 m SF→Anaheim, so a rider leaving at 08:00 steps off in the early
+// afternoon and was nonetheless handed a peak-service reach (SPA-274, recorded
+// as SPA-272 defect B).
+//
+// journey.TotalSecs is that whole cost, already worked out by the search that
+// decided this station was reachable at all.
+func (ec egressCandidate) egressDepartAt(chainDepartAt time.Time) time.Time {
+	return chainDepartAt.Add(time.Duration(ec.journey.TotalSecs) * time.Second)
+}
+
+// serviceDate names the GTFS service day a cached polygon belongs to, and is
+// empty for the costings with no timetable to belong to one.
+//
+// The gate is on the costing rather than the mode because the costing is what
+// decides whether a departure was sent at all: a row keyed by a date its
+// request never carried would be a row nothing can hit.
+//
+// A date, and not the departure itself, because that is what the cache column
+// is — see the accepted risk in README's "Caching egress polygons", which this
+// is the other half of.
+func serviceDate(costing valhalla.Costing, departAt time.Time) string {
+	if costing != valhalla.CostingMultimodal {
+		return ""
+	}
+	return valhalla.ServiceDate(departAt)
+}
+
 // egressIsochrones produces one polygon per station reached by riding transit,
 // reusing whatever the cache already holds and computing the rest.
 //
@@ -737,13 +808,21 @@ func (c *chainImpl) egressIsochrones(
 	// keys and subIsos are indexed by position in served, not in candidates —
 	// walk-only candidates have no key at all, so candidates' own indices
 	// would leave gaps for the cache and the fan-out to trip over.
+	//
+	// departs is parallel to them, and is the clock the polygon is drawn on:
+	// see egressDepartAt. Working it out here rather than at the call below is
+	// what lets the key carry the same date the request is stamped with, the
+	// way the contour is kept in one place for the same reason.
 	keys := make([]store.IsochroneKey, len(served))
+	departs := make([]time.Time, len(served))
 	for j, i := range served {
+		departs[j] = candidates[i].egressDepartAt(req.DepartAt)
 		keys[j] = store.IsochroneKey{
 			CompileJobID: req.CompileJobID,
 			StationSlug:  candidates[i].node.Slug,
 			Mode:         string(req.Mode),
 			ContourMins:  c.clampToContourCeilingSecs(candidates[i].remainingMins*60) / 60,
+			DepartsOn:    serviceDate(costing, departs[j]),
 		}
 	}
 
@@ -787,6 +866,7 @@ func (c *chainImpl) egressIsochrones(
 				Origin:     valhalla.LatLng{Lat: candidates[i].node.Lat, Lng: candidates[i].node.Lng},
 				Costing:    costing,
 				BudgetSecs: keys[j].ContourMins * 60,
+				DepartAt:   departs[j],
 			})
 			if isoErr != nil {
 				return wrapRoutingErr(isoErr)

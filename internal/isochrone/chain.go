@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/transit"
 )
@@ -49,6 +50,18 @@ type ChainRequest struct {
 	// CompileJobID identifies the graph, and is reported back in the metadata
 	// so a result can be traced to the graph it was plotted over.
 	CompileJobID string
+	// DepartAt is when the rider sets out from (Lat, Lng). It decides which
+	// GTFS service day a transit chain is computed against, and the modes with
+	// no timetable ignore it.
+	//
+	// Zero — which is what the queue message produces, since no caller chooses
+	// a departure yet — is resolved once at the top of Chain to the
+	// representative weekday morning on the service area's calendar. Resolving
+	// it there rather than at each routing call is what makes one chain use one
+	// departure: recomputed per call, a chain straddling midnight drew its
+	// origin and its egress polygons against two different service dates
+	// (SPA-274).
+	DepartAt time.Time
 }
 
 // Leg is one hop of a journey: the ride from one station to the next on one

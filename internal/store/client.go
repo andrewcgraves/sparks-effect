@@ -236,7 +236,7 @@ func (c *Client) Get(ctx context.Context, keys []IsochroneKey) (map[IsochroneKey
 //
 // An entry whose key is already present is left alone: a conflict means
 // another worker chained over the same graph concurrently and computed the
-// same four inputs into the same polygon. Overwriting it would churn the row
+// same inputs into the same polygon. Overwriting it would churn the row
 // to no effect.
 func (c *Client) Put(ctx context.Context, entries []CachedIsochrone) error {
 	if len(entries) == 0 {

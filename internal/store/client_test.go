@@ -254,6 +254,50 @@ func TestIsochroneCache_transitModeRoundTrips(t *testing.T) {
 	}
 }
 
+// A transit polygon is a function of the timetable it was computed against, so
+// two service dates are two rows and neither answers for the other. Walk, bike
+// and drive send no date at all, and keep the single row per station they had
+// (SPA-269).
+func TestIsochroneCache_serviceDateDiscriminatesTransitRows(t *testing.T) {
+	api := testsupport.StartFakeAPI(t)
+	client := connect(t, api)
+	ctx := context.Background()
+
+	onDate := func(date string) store.IsochroneKey {
+		return store.IsochroneKey{
+			CompileJobID: firstCompileID, StationSlug: "station-a",
+			Mode: "transit", ContourMins: 45, DepartsOn: date,
+		}
+	}
+	wednesday, thursday := onDate("2026-09-02"), onDate("2026-09-03")
+
+	if err := client.Put(ctx, []store.CachedIsochrone{
+		{Key: wednesday, Geometry: polygon("wednesday")},
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	got, err := client.Get(ctx, []store.IsochroneKey{wednesday, thursday})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if _, ok := got[wednesday]; !ok {
+		t.Error("the row written for Wednesday was not served back for Wednesday")
+	}
+	if _, ok := got[thursday]; ok {
+		t.Error("Wednesday's polygon was served for Thursday's question")
+	}
+
+	if err := client.Put(ctx, []store.CachedIsochrone{
+		{Key: thursday, Geometry: polygon("thursday")},
+	}); err != nil {
+		t.Fatalf("Put(thursday): %v", err)
+	}
+	if got := api.IsochroneCacheCount(firstCompileID); got != 2 {
+		t.Errorf("cache holds %d rows for the compile job, want one per service date", got)
+	}
+}
+
 func TestIsochroneCache_everyKeyFieldDiscriminates(t *testing.T) {
 	api := testsupport.StartFakeAPI(t)
 	client := connect(t, api)
@@ -271,6 +315,10 @@ func TestIsochroneCache_everyKeyFieldDiscriminates(t *testing.T) {
 		"mode": {
 			CompileJobID: firstCompileID, StationSlug: "station-a",
 			Mode: "bike", ContourMins: 30,
+		},
+		"service date": {
+			CompileJobID: firstCompileID, StationSlug: "station-a",
+			Mode: "walk", ContourMins: 30, DepartsOn: "2026-09-02",
 		},
 	}
 

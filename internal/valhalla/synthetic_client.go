@@ -123,6 +123,13 @@ func (c *SyntheticClient) Route(_ context.Context, req RouteRequest) (*RouteResp
 		Shape:      []LatLng{req.Origin, req.Destination},
 		Time:       int(math.Round(roadKm / speed * 3600.0)),
 		DistanceKm: roadKm,
+		// A multimodal answer here is timed at TransitSpeedKmH, so it does claim
+		// to have ridden something and says so. Reporting false instead would be
+		// the more literal answer — nothing was boarded, because there is no
+		// timetable here to board from — but it would make every local run look
+		// like the failure this flag exists to detect: a corridor whose feeds
+		// have expired answers with exactly that, zero legs that rode (SPA-274).
+		RodeTransit: req.Costing == CostingMultimodal,
 	}, nil
 }
 

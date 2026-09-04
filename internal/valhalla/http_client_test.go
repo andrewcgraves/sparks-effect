@@ -521,28 +521,41 @@ func TestTrailingSlashInBaseURLIsTolerated(t *testing.T) {
 	}
 }
 
+// pacific is the zone the corridor's origins actually sit in, and the zone
+// every case below states its clock in. Loaded rather than faked with a fixed
+// offset, so these exercise the same tzdata the client does, DST and all.
+func pacific(t *testing.T) *time.Location {
+	t.Helper()
+	loc, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Fatalf("load America/Los_Angeles: %v", err)
+	}
+	return loc
+}
+
 func TestWeekdayDepartAtPicksTheNextWeekdayMorning(t *testing.T) {
+	loc := pacific(t)
 	tests := []struct {
 		now  string
 		want string
 	}{
-		{"2026-08-31T15:00:00Z", "2026-08-31T08:00:00Z"}, // Monday stays Monday
-		{"2026-08-28T03:00:00Z", "2026-08-28T08:00:00Z"}, // Friday stays Friday
-		{"2026-08-29T15:00:00Z", "2026-08-31T08:00:00Z"}, // Saturday → Monday
-		{"2026-08-30T15:00:00Z", "2026-08-31T08:00:00Z"}, // Sunday → Monday
+		{"2026-08-31T09:00:00-07:00", "2026-08-31T08:00:00-07:00"}, // Monday stays Monday
+		{"2026-08-28T03:00:00-07:00", "2026-08-28T08:00:00-07:00"}, // Friday stays Friday
+		{"2026-08-29T15:00:00-07:00", "2026-08-31T08:00:00-07:00"}, // Saturday → Monday
+		{"2026-08-30T15:00:00-07:00", "2026-08-31T08:00:00-07:00"}, // Sunday → Monday
 	}
 	for _, tc := range tests {
 		now, err := time.Parse(time.RFC3339, tc.now)
 		if err != nil {
 			t.Fatalf("parse now: %v", err)
 		}
-		got := valhalla.WeekdayDepartAt(now)
+		got := valhalla.WeekdayDepartAt(now, loc)
 		want, err := time.Parse(time.RFC3339, tc.want)
 		if err != nil {
 			t.Fatalf("parse want: %v", err)
 		}
 		if !got.Equal(want) {
-			t.Errorf("WeekdayDepartAt(%s) = %s, want %s", tc.now, got.UTC().Format(time.RFC3339), tc.want)
+			t.Errorf("WeekdayDepartAt(%s) = %s, want %s", tc.now, got.Format(time.RFC3339), tc.want)
 		}
 		if got.Weekday() == time.Saturday || got.Weekday() == time.Sunday {
 			t.Errorf("WeekdayDepartAt(%s) landed on a weekend", tc.now)
@@ -551,6 +564,85 @@ func TestWeekdayDepartAtPicksTheNextWeekdayMorning(t *testing.T) {
 			t.Errorf("WeekdayDepartAt(%s) = %s, want 08:00", tc.now, got)
 		}
 	}
+}
+
+// The departure date is the rider's date, not UTC's.
+//
+// Resolved on the UTC calendar, every one of these afternoons rolled the date
+// forward: 18:00 Pacific is already tomorrow in UTC, so from roughly 17:00
+// onwards the same pin at the same budget was plotted against a different GTFS
+// service day than it was at lunchtime. Two of these are worse than merely
+// inconsistent. Friday evening asked for Monday, skipping the weekend it was
+// standing in; and a Tuesday evening in mid-September asked for a date past the
+// end of LA Metro Rail's calendar, bringing the service cliff forward by half a
+// day (SPA-274).
+func TestWeekdayDepartAt_resolvesOnTheRidersCalendarNotUTC(t *testing.T) {
+	loc := pacific(t)
+	tests := []struct {
+		name string
+		now  string
+		want string
+	}{
+		{"midday stays today", "2026-09-02T11:30:00-07:00", "2026-09-02T08:00"},
+		{"evening stays today", "2026-09-02T18:00:00-07:00", "2026-09-02T08:00"},
+		{"evening before a calendar boundary stays today", "2026-09-15T18:00:00-07:00", "2026-09-15T08:00"},
+		{"friday evening stays friday", "2026-09-04T18:00:00-07:00", "2026-09-04T08:00"},
+		{"saturday still moves to monday", "2026-09-05T18:00:00-07:00", "2026-09-07T08:00"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			now, err := time.Parse(time.RFC3339, tc.now)
+			if err != nil {
+				t.Fatalf("parse now: %v", err)
+			}
+			got := valhalla.WeekdayDepartAt(now, loc).Format("2006-01-02T15:04")
+			if got != tc.want {
+				t.Errorf("WeekdayDepartAt(%s) = %s, want %s", tc.now, got, tc.want)
+			}
+		})
+	}
+}
+
+// A departure resolved anywhere but the rider's own zone is a departure on the
+// wrong calendar, so the zone the client falls back to has to be the
+// corridor's.
+func TestServiceAreaZoneIsTheCorridorsZone(t *testing.T) {
+	loc := valhalla.ServiceAreaZone()
+	if loc == nil {
+		t.Fatal("ServiceAreaZone returned nil")
+	}
+	if loc.String() != "America/Los_Angeles" {
+		t.Errorf("ServiceAreaZone = %s, want America/Los_Angeles", loc)
+	}
+	// UTC is what a missing tzdata would silently degrade to, and it is exactly
+	// the calendar this replaces — so it must not be reachable.
+	if loc == time.UTC {
+		t.Error("ServiceAreaZone fell back to UTC")
+	}
+}
+
+// The date a transit cache row is keyed by has to be the date the request was
+// actually stamped with, so it is derived from that value rather than
+// recomputed beside it.
+func TestServiceDateIsTheDepartureDate(t *testing.T) {
+	depart := time.Date(2026, 9, 2, 8, 0, 0, 0, pacific(t))
+	if got := valhalla.ServiceDate(depart); got != "2026-09-02" {
+		t.Errorf("ServiceDate = %q, want 2026-09-02", got)
+	}
+	// An egress departure a few hours down the line is still the same service
+	// day; one that rolls past midnight is not, and the row it keys must agree.
+	if got := valhalla.ServiceDate(depart.Add(18 * time.Hour)); got != "2026-09-03" {
+		t.Errorf("ServiceDate past midnight = %q, want 2026-09-03", got)
+	}
+}
+
+// morningDeparture is the representative weekday 08:00 the multimodal cases
+// travel at. Stated rather than taken from the clock: since a zero departure is
+// refused, every multimodal case has to name one, and naming the same one keeps
+// them comparable.
+func morningDeparture(t *testing.T) time.Time {
+	t.Helper()
+	return time.Date(2026, 9, 2, 8, 0, 0, 0, pacific(t))
 }
 
 func assertMultimodalOptions(t *testing.T, body map[string]any) {
@@ -585,6 +677,7 @@ func TestIsochrone_multimodalRequestShape(t *testing.T) {
 		Origin:     valhalla.LatLng{Lat: 37.7, Lng: -122.4},
 		Costing:    valhalla.CostingMultimodal,
 		BudgetSecs: 1800,
+		DepartAt:   morningDeparture(t),
 	})
 	if err != nil {
 		t.Fatalf("Isochrone: %v", err)
@@ -598,6 +691,7 @@ func TestRoute_multimodalRequestShape(t *testing.T) {
 		Origin:      valhalla.LatLng{Lat: 37.7, Lng: -122.4},
 		Destination: valhalla.LatLng{Lat: 37.701, Lng: -122.4005},
 		Costing:     valhalla.CostingMultimodal,
+		DepartAt:    morningDeparture(t),
 	})
 	if err != nil {
 		t.Fatalf("Route: %v", err)
@@ -606,6 +700,193 @@ func TestRoute_multimodalRequestShape(t *testing.T) {
 		t.Errorf("path = %q, want /route", srv.path)
 	}
 	assertMultimodalOptions(t, srv.body)
+}
+
+// departValue reads the departure string off a captured request body.
+func departValue(t *testing.T, body map[string]any) string {
+	t.Helper()
+	dt, _ := body["date_time"].(map[string]any)
+	if dt == nil {
+		t.Fatal("date_time missing")
+	}
+	value, _ := dt["value"].(string)
+	return value
+}
+
+// A caller that has worked out when the rider is standing at this location gets
+// to say so, and the client sends that rather than recomputing a departure of
+// its own.
+//
+// This is what lets one chain hold one departure. Recomputed per call, a chain
+// straddling midnight drew its origin and its egress polygons on two different
+// service dates, and an egress polygon was drawn at the morning peak however
+// many hours of riding it took to arrive there (SPA-274).
+func TestMultimodalSendsTheRequestsOwnDeparture(t *testing.T) {
+	depart := time.Date(2026, 9, 2, 13, 6, 0, 0, pacific(t))
+
+	t.Run("isochrone", func(t *testing.T) {
+		srv := newCaptureServer(t, http.StatusOK, okIsochrone)
+		_, err := valhalla.NewHTTPClient(srv.URL).Isochrone(context.Background(), valhalla.IsochroneRequest{
+			Origin:     valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+			Costing:    valhalla.CostingMultimodal,
+			BudgetSecs: 1800,
+			DepartAt:   depart,
+		})
+		if err != nil {
+			t.Fatalf("Isochrone: %v", err)
+		}
+		if got := departValue(t, srv.body); got != "2026-09-02T13:06" {
+			t.Errorf("date_time.value = %q, want 2026-09-02T13:06", got)
+		}
+	})
+
+	t.Run("route", func(t *testing.T) {
+		srv := newCaptureServer(t, http.StatusOK, okRoute(shapeThreePoints))
+		_, err := valhalla.NewHTTPClient(srv.URL).Route(context.Background(), valhalla.RouteRequest{
+			Origin:      valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+			Destination: valhalla.LatLng{Lat: 37.701, Lng: -122.4005},
+			Costing:     valhalla.CostingMultimodal,
+			DepartAt:    depart,
+		})
+		if err != nil {
+			t.Fatalf("Route: %v", err)
+		}
+		if got := departValue(t, srv.body); got != "2026-09-02T13:06" {
+			t.Errorf("date_time.value = %q, want 2026-09-02T13:06", got)
+		}
+	})
+}
+
+// A multimodal request with no departure is refused here rather than defaulted.
+//
+// There is exactly one place that decides when the rider sets out — the chainer,
+// once per chain — and the cache key is derived from that same value. A second
+// default in this client could put a different moment on the wire than the key
+// names, which is the divergence the service date exists to prevent. Refusing
+// also keeps a mistaken caller off the wire, the way Matrix refuses multimodal,
+// and it must land in the permanent bucket: the same bytes will be refused
+// again.
+func TestMultimodalWithoutADepartureIsRefused(t *testing.T) {
+	var called atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called.Add(1)
+		_, _ = w.Write([]byte(okIsochrone))
+	}))
+	defer srv.Close()
+	client := valhalla.NewHTTPClient(srv.URL)
+
+	t.Run("isochrone", func(t *testing.T) {
+		_, err := client.Isochrone(context.Background(), valhalla.IsochroneRequest{
+			Origin:     valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+			Costing:    valhalla.CostingMultimodal,
+			BudgetSecs: 1800,
+		})
+		if !errors.Is(err, valhalla.ErrBadRequest) {
+			t.Errorf("Isochrone err = %v, want ErrBadRequest", err)
+		}
+	})
+
+	t.Run("route", func(t *testing.T) {
+		_, err := client.Route(context.Background(), valhalla.RouteRequest{
+			Origin:      valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+			Destination: valhalla.LatLng{Lat: 37.701, Lng: -122.4005},
+			Costing:     valhalla.CostingMultimodal,
+		})
+		if !errors.Is(err, valhalla.ErrBadRequest) {
+			t.Errorf("Route err = %v, want ErrBadRequest", err)
+		}
+	})
+
+	if n := called.Load(); n != 0 {
+		t.Errorf("the server was called %d times; a refused request must not reach the wire", n)
+	}
+}
+
+// The other costings have no timetable, so they are unaffected by the rule
+// above: a pedestrian request with no departure is perfectly well-formed.
+func TestNonMultimodalWithoutADepartureIsFine(t *testing.T) {
+	srv := newCaptureServer(t, http.StatusOK, okIsochrone)
+	_, err := valhalla.NewHTTPClient(srv.URL).Isochrone(context.Background(), valhalla.IsochroneRequest{
+		Origin:     valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+		Costing:    valhalla.CostingPedestrian,
+		BudgetSecs: 1800,
+	})
+	if err != nil {
+		t.Fatalf("Isochrone: %v", err)
+	}
+	if _, ok := srv.body["date_time"]; ok {
+		t.Error("date_time is a multimodal option; pedestrian must not send it")
+	}
+}
+
+// A pedestrian request still sends no departure at all, whatever the caller
+// put on it: date_time is a multimodal option, and the other costings reject
+// the request rather than ignore the field.
+func TestNonMultimodalNeverSendsADeparture(t *testing.T) {
+	srv := newCaptureServer(t, http.StatusOK, okIsochrone)
+	_, err := valhalla.NewHTTPClient(srv.URL).Isochrone(context.Background(), valhalla.IsochroneRequest{
+		Origin:     valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+		Costing:    valhalla.CostingPedestrian,
+		BudgetSecs: 1800,
+		DepartAt:   time.Date(2026, 9, 2, 13, 6, 0, 0, pacific(t)),
+	})
+	if err != nil {
+		t.Fatalf("Isochrone: %v", err)
+	}
+	if _, ok := srv.body["date_time"]; ok {
+		t.Error("date_time is a multimodal option; pedestrian must not send it")
+	}
+}
+
+// routeWithModes builds a /route answer whose maneuvers travel by the named
+// modes, which is the only place in the response that says whether a
+// multimodal answer actually boarded anything.
+func routeWithModes(shape string, modes ...string) string {
+	maneuvers := ""
+	for i, m := range modes {
+		if i > 0 {
+			maneuvers += ","
+		}
+		maneuvers += `{"travel_mode":"` + m + `"}`
+	}
+	return `{"trip":{"legs":[{"shape":"` + shape + `","maneuvers":[` + maneuvers +
+		`]}],"summary":{"time":420,"length":0.5}}}`
+}
+
+// Whether the rider rode anything is a fact only the maneuvers carry.
+//
+// Valhalla does not error on a multimodal request it can find no service for:
+// it walks the whole way and answers 200 with a plausible shape and a plausible
+// duration. Until this was read, a walking answer and a transit answer were
+// indistinguishable to everything downstream, which is how a corridor with
+// expired GTFS calendars looked healthy (SPA-274).
+func TestRoute_reportsWhetherItActuallyRodeTransit(t *testing.T) {
+	tests := []struct {
+		name  string
+		modes []string
+		want  bool
+	}{
+		{"walked the whole way", []string{"pedestrian", "pedestrian"}, false},
+		{"boarded something", []string{"pedestrian", "transit", "pedestrian"}, true},
+		{"no maneuvers at all", nil, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newCaptureServer(t, http.StatusOK, routeWithModes(shapeThreePoints, tc.modes...))
+			resp, err := valhalla.NewHTTPClient(srv.URL).Route(context.Background(), valhalla.RouteRequest{
+				Origin:      valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+				Destination: valhalla.LatLng{Lat: 37.701, Lng: -122.4005},
+				Costing:     valhalla.CostingMultimodal,
+				DepartAt:    morningDeparture(t),
+			})
+			if err != nil {
+				t.Fatalf("Route: %v", err)
+			}
+			if resp.RodeTransit != tc.want {
+				t.Errorf("RodeTransit = %v, want %v", resp.RodeTransit, tc.want)
+			}
+		})
+	}
 }
 
 // Matrix hard-rejects multimodal (error 140) whether or not transit tiles

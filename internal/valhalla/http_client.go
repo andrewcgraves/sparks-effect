@@ -9,7 +9,12 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
+
+	// Embedded so a departure date is resolved on the corridor's calendar even
+	// in an image carrying no zoneinfo database. See ServiceAreaZone.
+	_ "time/tzdata"
 )
 
 // Valhalla's native endpoint paths. Unlike the Stadia client this replaces,
@@ -71,23 +76,67 @@ const dateTimeDepartAt = 1
 
 const dateTimeLayout = "2006-01-02T15:04"
 
+// dateLayout is the service date a transit answer belongs to — the GTFS
+// calendar's own spelling, and the isochrone cache's departs_on column.
+const dateLayout = "2006-01-02"
+
+// serviceAreaTZ is the IANA zone the corridor's origins stand in.
+//
+// It is a constant rather than a lookup because resolving an arbitrary point to
+// a zone needs a timezone shapefile, which is a dependency and a data file this
+// worker does not otherwise want. Every scenario it serves is in California or
+// Nevada, both of them wholly Pacific, so the constant is exact for every
+// origin it will be asked about today. A corridor outside Pacific time is what
+// would make the lookup worth its weight; until then this is the honest
+// spelling of what the code already assumes.
+const serviceAreaTZ = "America/Los_Angeles"
+
+// ServiceAreaZone is the calendar a departure date is resolved on.
+//
+// tzdata is embedded rather than read from the host, because the worker runs in
+// a distroless-ish image that need not carry a zoneinfo database, and a missing
+// one would silently degrade every departure to UTC — which is the bug this
+// exists to fix. The fixed-offset fallback below is therefore unreachable in
+// practice; it is standing Pacific Standard Time, an hour out during DST but
+// never a day out, which is the failure worth having.
+var ServiceAreaZone = sync.OnceValue(func() *time.Location {
+	if loc, err := time.LoadLocation(serviceAreaTZ); err == nil {
+		return loc
+	}
+	return time.FixedZone("PST", -8*60*60)
+})
+
 // WeekdayDepartAt is the representative departure a multimodal request uses
 // when the caller has not picked one: 08:00 on the next weekday (today, if
-// today is one).
+// today is one), on loc's calendar.
 //
 // date_time is load-bearing for transit costing. The same pair was 781 s at
 // a weekday morning versus 3480 s without a time (waiting for the next trip).
-// Valhalla interprets the value in the origin's local timezone from its
-// timezone tiles, so the string carries no offset. The weekday is chosen on
-// the UTC calendar — close enough that a commute-hour request does not land
-// on a Saturday GTFS calendar (SPA-246).
-func WeekdayDepartAt(now time.Time) time.Time {
-	d := now.UTC()
-	t := time.Date(d.Year(), d.Month(), d.Day(), 8, 0, 0, 0, time.UTC)
+// Valhalla interprets the value in the origin's local timezone from its own
+// timezone tiles, so the string carries no offset — but *which day* it names
+// still has to be decided here, and deciding it on the UTC calendar meant the
+// date rolled over at about 17:00 Pacific. The same pin at the same budget
+// then drew a different surface in the evening than it did at lunchtime, a
+// Friday evening asked for Monday, and a request made the evening before a
+// feed's end_date asked for a day that feed does not cover (SPA-274).
+func WeekdayDepartAt(now time.Time, loc *time.Location) time.Time {
+	d := now.In(loc)
+	t := time.Date(d.Year(), d.Month(), d.Day(), 8, 0, 0, 0, loc)
 	for t.Weekday() == time.Saturday || t.Weekday() == time.Sunday {
 		t = t.AddDate(0, 0, 1)
 	}
 	return t
+}
+
+// ServiceDate names the GTFS service day a departure falls on.
+//
+// It is what the isochrone cache keys a transit row by, and it is derived from
+// the departure the request actually carried rather than recomputed from the
+// clock: a key computed separately from the request it describes is a key that
+// can disagree with it, which is how a cache serves one date's polygon for
+// another's question (SPA-269).
+func ServiceDate(departAt time.Time) string {
+	return departAt.Format(dateLayout)
 }
 
 // HTTPClient talks to a Valhalla server over HTTP.
@@ -133,22 +182,40 @@ func location(p LatLng) map[string]any {
 // attachMultimodalOptions adds the request fields multimodal costing needs
 // and pedestrian/bicycle/auto must not send.
 //
-// date_time is the representative weekday 08:00 (see WeekdayDepartAt).
+// date_time is the caller's departure, which is how one chain holds one
+// departure throughout and how an egress polygon is drawn at the hour the
+// rider actually steps off rather than at the morning peak (SPA-274).
+//
+// A zero departure is refused rather than defaulted, and that is deliberate:
+// the departure is a decision, and there must be exactly one place that makes
+// it. The chainer resolves it once per chain and the cache key is derived from
+// the same value, so a second default here could hand the wire a different
+// moment than the key names — which is the divergence ServiceDate exists to
+// prevent. Refusing locally also keeps a mistaken caller off the wire, the way
+// Matrix refuses multimodal, and lands in the same permanent bucket: sending
+// the zero time would ask Valhalla to depart in the year 1, and omitting
+// date_time entirely makes it wait for the next trip, which measured 3480 s
+// against 781 s on the same pair.
+//
 // multimodal_start_end_max_distance raises the 2415 m walk clip so a suburban
 // origin can still reach a station on foot before boarding (SPA-246).
-func attachMultimodalOptions(body map[string]any, costing Costing) {
+func attachMultimodalOptions(body map[string]any, costing Costing, departAt time.Time) error {
 	if costing != CostingMultimodal {
-		return
+		return nil
+	}
+	if departAt.IsZero() {
+		return fmt.Errorf("%w: multimodal costing needs a departure; see WeekdayDepartAt", ErrBadRequest)
 	}
 	body["date_time"] = map[string]any{
 		"type":  dateTimeDepartAt,
-		"value": WeekdayDepartAt(time.Now()).Format(dateTimeLayout),
+		"value": departAt.Format(dateTimeLayout),
 	}
 	body["costing_options"] = map[string]any{
 		"pedestrian": map[string]any{
 			"multimodal_start_end_max_distance": MultimodalStartEndMaxDistanceM,
 		},
 	}
+	return nil
 }
 
 func (c *HTTPClient) Isochrone(ctx context.Context, req IsochroneRequest) (*IsochroneResponse, error) {
@@ -161,7 +228,9 @@ func (c *HTTPClient) Isochrone(ctx context.Context, req IsochroneRequest) (*Isoc
 		"contours":  []map[string]any{{"time": req.BudgetSecs / 60}},
 		"polygons":  true,
 	}
-	attachMultimodalOptions(body, req.Costing)
+	if err := attachMultimodalOptions(body, req.Costing, req.DepartAt); err != nil {
+		return nil, err
+	}
 	var resp IsochroneResponse
 	if err := c.post(ctx, isochronePath, body, &resp); err != nil {
 		return nil, err
@@ -202,18 +271,47 @@ func (c *HTTPClient) Matrix(ctx context.Context, req MatrixRequest) (*MatrixResp
 }
 
 // routeBody is the slice of Valhalla's /route response this client reads. The
-// rest of it — maneuvers, narrative, per-leg summaries — is a turn-by-turn
-// answer to a question nobody here is asking.
+// rest of it — the narrative, per-leg summaries, everything on a maneuver but
+// its travel mode — is a turn-by-turn answer to a question nobody here is
+// asking.
+//
+// The maneuvers' travel_mode is read for one reason: it is the only place the
+// answer says whether the rider boarded anything. See maneuverModeTransit.
 type routeBody struct {
 	Trip struct {
 		Legs []struct {
-			Shape string `json:"shape"`
+			Shape     string `json:"shape"`
+			Maneuvers []struct {
+				TravelMode string `json:"travel_mode"`
+			} `json:"maneuvers"`
 		} `json:"legs"`
 		Summary struct {
 			Time   float64 `json:"time"`
 			Length float64 `json:"length"`
 		} `json:"summary"`
 	} `json:"trip"`
+}
+
+// maneuverModeTransit is Valhalla's travel_mode for a maneuver spent aboard a
+// scheduled service, as opposed to "pedestrian" for the walk at either end.
+const maneuverModeTransit = "transit"
+
+// rodeTransit reports whether any maneuver of the trip boarded a service.
+//
+// A multimodal request Valhalla can find no service for is not an error to it:
+// it walks the whole way and answers 200, with a shape and a duration that look
+// like any other answer. Every feed in the tiles having an expired calendar
+// therefore reads downstream as transit that merely happens to be no better
+// than walking (SPA-274).
+func (b routeBody) rodeTransit() bool {
+	for _, leg := range b.Trip.Legs {
+		for _, m := range leg.Maneuvers {
+			if m.TravelMode == maneuverModeTransit {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // minDrawableShapePoints is the fewest positions that are a line rather than a
@@ -227,7 +325,9 @@ func (c *HTTPClient) Route(ctx context.Context, req RouteRequest) (*RouteRespons
 		"costing":   req.Costing,
 		"units":     "kilometers",
 	}
-	attachMultimodalOptions(body, req.Costing)
+	if err := attachMultimodalOptions(body, req.Costing, req.DepartAt); err != nil {
+		return nil, err
+	}
 	var resp routeBody
 	if err := c.post(ctx, routePath, body, &resp); err != nil {
 		return nil, err
@@ -254,9 +354,10 @@ func (c *HTTPClient) Route(ctx context.Context, req RouteRequest) (*RouteRespons
 		return nil, fmt.Errorf("%w: route carried no drawable shape", ErrUpstream)
 	}
 	return &RouteResponse{
-		Shape:      shape,
-		Time:       int(math.Round(resp.Trip.Summary.Time)),
-		DistanceKm: resp.Trip.Summary.Length,
+		Shape:       shape,
+		Time:        int(math.Round(resp.Trip.Summary.Time)),
+		DistanceKm:  resp.Trip.Summary.Length,
+		RodeTransit: resp.rodeTransit(),
 	}, nil
 }
 

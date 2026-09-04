@@ -106,7 +106,14 @@ func newRoutingClient(ctx context.Context, cfg config.Config, log *logger.Logger
 		"valhalla_url", cfg.ValhallaURL,
 		"max_iso_contour_mins", cfg.Limits.MaxIsoContourMins,
 		"max_matrix_pairs", cfg.Limits.MaxMatrixPairs,
-		"max_concurrency", cfg.Limits.MaxConcurrency)
+		"max_concurrency", cfg.Limits.MaxConcurrency,
+		// The zone every transit departure date is resolved on. Reported here
+		// because its fallback is the one thing about it that could be wrong
+		// and invisible: an image without tzdata would degrade to a standing
+		// offset, which reads "PST" here instead of "America/Los_Angeles" and
+		// is otherwise indistinguishable from a correct run. See
+		// valhalla.ServiceAreaZone.
+		"service_area_zone", valhalla.ServiceAreaZone().String())
 	return client, reportTileset(ctx, client, log)
 }
 

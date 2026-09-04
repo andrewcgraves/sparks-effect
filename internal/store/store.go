@@ -55,10 +55,11 @@ type RoutingJobStore interface {
 
 // IsochroneKey identifies one cached egress polygon.
 //
-// The four fields are everything that decides the shape: the compiled graph,
+// The five fields are everything that decides the shape: the compiled graph,
 // whose node positions say where the polygon is centred; the station it is
-// centred on; how the rider travels; and how long they have left. Two requests
-// agreeing on all four get the same polygon, whatever else differs between them.
+// centred on; how the rider travels; how long they have left; and, for transit,
+// the service day whose timetable the answer was computed against. Two requests
+// agreeing on all five get the same polygon, whatever else differs between them.
 //
 // The compile job is doing more work here than identifying a graph — it is what
 // lets this table exist without any invalidation machinery, since a recompile
@@ -78,6 +79,21 @@ type IsochroneKey struct {
 	// so keying on the clamped value is what lets those budgets share one row
 	// instead of storing the same shape once per budget.
 	ContourMins int `json:"contour_mins"`
+	// DepartsOn is the GTFS service day the polygon was computed against, as
+	// YYYY-MM-DD, and is empty for the modes that have no timetable to read.
+	//
+	// A transit polygon is a function of that day's services. Without the date
+	// in the key, the first request against a compile job froze that day's
+	// answer for as long as the job lived — and for the seeded corridor, whose
+	// job is only re-minted when the seed rows compile to different bytes, that
+	// is indefinitely. Two dates being two rows is also what makes a GTFS
+	// calendar boundary self-correcting rather than a cache holding polygons
+	// from a timetable that has since stopped running (SPA-269).
+	//
+	// Empty is NULL on the API's side, and the constraint 00024 introduced
+	// treats NULLs as not distinct, so walk/bike/drive keep exactly one row per
+	// (graph, station, mode, contour) while two real dates stay two rows.
+	DepartsOn string `json:"departs_on,omitempty"`
 }
 
 // CachedIsochrone is one row of the cache: a key, the polygon, and the tiles it
@@ -116,6 +132,6 @@ type IsochroneCache interface {
 	Get(ctx context.Context, keys []IsochroneKey) (map[IsochroneKey]json.RawMessage, error)
 	// Put records freshly computed polygons. An entry whose key is already
 	// present is left alone: the row that is there was computed from the same
-	// four inputs and says the same thing.
+	// inputs and says the same thing.
 	Put(ctx context.Context, entries []CachedIsochrone) error
 }
