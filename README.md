@@ -301,9 +301,11 @@ chainer therefore:
    (valhalla/valhalla#5636) — and are never used as a station filter.
 4. Always sends `date_time`. Without it the same pair waits for the next
    trip and inflates by a factor of four.
-   `costing_options.pedestrian.multimodal_start_end_max_distance` is raised
+   `costing_options.pedestrian.transit_start_end_max_distance` is raised
    to 10 km (Valhalla's request default is 2415 m) so suburban walks to a
-   station are not clipped.
+   station are not clipped. The docs-renamed key
+   `multimodal_start_end_max_distance` is ignored by the costing engine
+   and must not be sent (SPA-297).
 
 ### The departure clock
 

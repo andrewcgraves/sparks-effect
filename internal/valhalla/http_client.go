@@ -63,11 +63,19 @@ const (
 	LocationMinReachability = 15
 )
 
-// MultimodalStartEndMaxDistanceM is the walking distance allowed at the start
-// or end of a multimodal route. Valhalla's request default is 2415 m, which
-// clips suburban walks to a station; 10 km matches the service-limit ceiling
-// pedestrian.max_multimodal_walking_distance (SPA-246).
-const MultimodalStartEndMaxDistanceM = 10000
+// TransitStartEndMaxDistanceM is the walking distance allowed at the start
+// or end of a multimodal route. Valhalla's request default is 2415 m (1.5
+// miles, kMultimodalStartEndMaxDistance), which clips suburban walks to a
+// station. 10 km is the walk we actually want, and it sits under the 15 km
+// service-limit ceiling pedestrian.max_multimodal_walking_distance, so the
+// request needs no matching config change (SPA-246, SPA-297).
+//
+// The wire key is transit_start_end_max_distance. Valhalla's docs renamed it
+// to multimodal_start_end_max_distance, but PedestrianCost still copies the
+// transit_* protobuf field into the engine, and the live server drops the
+// renamed key without a diagnostic — which is how every multimodal request
+// we ever made ran at the 2415 m default (SPA-297).
+const TransitStartEndMaxDistanceM = 10000
 
 // dateTimeDepartAt is Valhalla's date_time.type for a specified departure.
 // Type 0 is "now", which waits for the next trip rather than a representative
@@ -197,8 +205,10 @@ func location(p LatLng) map[string]any {
 // date_time entirely makes it wait for the next trip, which measured 3480 s
 // against 781 s on the same pair.
 //
-// multimodal_start_end_max_distance raises the 2415 m walk clip so a suburban
-// origin can still reach a station on foot before boarding (SPA-246).
+// transit_start_end_max_distance raises the 2415 m walk clip so a suburban
+// origin can still reach a station on foot before boarding (SPA-246). The
+// name is load-bearing: Valhalla silently drops unrecognised costing-option
+// keys, and multimodal_start_end_max_distance is one of those (SPA-297).
 func attachMultimodalOptions(body map[string]any, costing Costing, departAt time.Time) error {
 	if costing != CostingMultimodal {
 		return nil
@@ -212,7 +222,7 @@ func attachMultimodalOptions(body map[string]any, costing Costing, departAt time
 	}
 	body["costing_options"] = map[string]any{
 		"pedestrian": map[string]any{
-			"multimodal_start_end_max_distance": MultimodalStartEndMaxDistanceM,
+			"transit_start_end_max_distance": TransitStartEndMaxDistanceM,
 		},
 	}
 	return nil

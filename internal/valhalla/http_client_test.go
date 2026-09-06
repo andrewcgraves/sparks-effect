@@ -666,8 +666,51 @@ func assertMultimodalOptions(t *testing.T, body map[string]any) {
 	}
 	opts, _ := body["costing_options"].(map[string]any)
 	ped, _ := opts["pedestrian"].(map[string]any)
-	if ped["multimodal_start_end_max_distance"] != float64(valhalla.MultimodalStartEndMaxDistanceM) {
-		t.Errorf("multimodal_start_end_max_distance = %v, want %d", ped["multimodal_start_end_max_distance"], valhalla.MultimodalStartEndMaxDistanceM)
+	if ped == nil {
+		t.Fatal("costing_options.pedestrian missing")
+	}
+	if ped["transit_start_end_max_distance"] != float64(valhalla.TransitStartEndMaxDistanceM) {
+		t.Errorf("transit_start_end_max_distance = %v, want %d", ped["transit_start_end_max_distance"], valhalla.TransitStartEndMaxDistanceM)
+	}
+	assertPedestrianCostingOptionsValhallaHonours(t, ped)
+}
+
+// pedestrianCostingOptionsValhallaHonours is the pedestrian costing-option
+// keys ParsePedestrianCostOptions maps onto fields PedestrianCost actually
+// reads. Unknown keys are dropped with no diagnostic, so a typo on the wire
+// is indistinguishable from a working override (SPA-297).
+//
+// multimodal_start_end_max_distance is deliberately absent. Valhalla's docs
+// renamed the option, but the costing engine still copies
+// transit_start_end_max_distance into the walk-cap field, and the live
+// staging server ignores the new name entirely: sending 20000 on the
+// transit_* key is error 155, sending 9999999 on the renamed key is 200.
+var pedestrianCostingOptionsValhallaHonours = map[string]struct{}{
+	"type":                           {},
+	"max_distance":                   {},
+	"walking_speed":                  {},
+	"step_penalty":                   {},
+	"max_grade":                      {},
+	"max_hiking_difficulty":          {},
+	"mode_factor":                    {},
+	"walkway_factor":                 {},
+	"sidewalk_factor":                {},
+	"alley_factor":                   {},
+	"driveway_factor":                {},
+	"transit_start_end_max_distance": {},
+	"transit_transfer_max_distance":  {},
+	"bss_rent_cost":                  {},
+	"bss_rent_penalty":               {},
+	"use_hills":                      {},
+	"elevator_penalty":               {},
+}
+
+func assertPedestrianCostingOptionsValhallaHonours(t *testing.T, ped map[string]any) {
+	t.Helper()
+	for key := range ped {
+		if _, ok := pedestrianCostingOptionsValhallaHonours[key]; !ok {
+			t.Errorf("costing_options.pedestrian.%s is not a key Valhalla's pedestrian costing engine reads; unknown keys are dropped silently (SPA-297)", key)
+		}
 	}
 }
 
@@ -700,6 +743,16 @@ func TestRoute_multimodalRequestShape(t *testing.T) {
 		t.Errorf("path = %q, want /route", srv.path)
 	}
 	assertMultimodalOptions(t, srv.body)
+}
+
+// The docs-renamed walk-cap key is the SPA-297 misspelling: Valhalla parses
+// it into a field the costing engine does not read. Keeping it out of the
+// allowlist is what makes sending it fail the tests above rather than look
+// deliberate.
+func TestRenamedWalkCapKeyIsNotARecognisedCostingOption(t *testing.T) {
+	if _, ok := pedestrianCostingOptionsValhallaHonours["multimodal_start_end_max_distance"]; ok {
+		t.Fatal("multimodal_start_end_max_distance is in the allowlist; that is the key Valhalla ignores (SPA-297)")
+	}
 }
 
 // departValue reads the departure string off a captured request body.
