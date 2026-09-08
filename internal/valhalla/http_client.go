@@ -77,6 +77,18 @@ const (
 // we ever made ran at the 2415 m default (SPA-297).
 const TransitStartEndMaxDistanceM = 10000
 
+// IsochroneDenoise is Valhalla's /isochrone denoise parameter. The server
+// default is 1.0: keep only the largest contour for a given time and drop
+// the rest. A multimodal isochrone is inherently multi-part — a blob around
+// the pin plus a disconnected island around every stop the rider can alight
+// at — so that default deletes every transit-reached island smaller than
+// the largest piece. Which piece is largest flips with the time budget: a
+// 120 min Inner Richmond plot keeps the SF walking blob and a 180 min plot
+// keeps the East Bay, leaving the origin pin outside its own polygon
+// (SPA-302, valhalla#1607). Zero keeps every contour. A connected walkshed
+// is a no-op at this value, so pedestrian/bike/drive requests send it too.
+const IsochroneDenoise = 0
+
 // dateTimeDepartAt is Valhalla's date_time.type for a specified departure.
 // Type 0 is "now", which waits for the next trip rather than a representative
 // commute; type 1 is "depart at" the value below.
@@ -237,6 +249,7 @@ func (c *HTTPClient) Isochrone(ctx context.Context, req IsochroneRequest) (*Isoc
 		"costing":   req.Costing,
 		"contours":  []map[string]any{{"time": req.BudgetSecs / 60}},
 		"polygons":  true,
+		"denoise":   IsochroneDenoise,
 	}
 	if err := attachMultimodalOptions(body, req.Costing, req.DepartAt); err != nil {
 		return nil, err

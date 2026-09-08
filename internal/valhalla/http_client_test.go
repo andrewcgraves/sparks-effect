@@ -95,6 +95,57 @@ func TestIsochrone_requestShape(t *testing.T) {
 	if srv.body["polygons"] != true {
 		t.Errorf("polygons = %v, want true — without it Valhalla returns linestrings", srv.body["polygons"])
 	}
+	assertIsochroneDenoiseZero(t, srv.body)
+}
+
+// Valhalla's /isochrone denoise defaults to 1.0: keep only the largest
+// contour and drop the rest. A multimodal isochrone is multi-part — a blob
+// around the pin plus an island around every alighting stop — so that
+// default deletes every transit-reached island smaller than the largest
+// piece. Which piece is largest flips with the time budget, so a 120 min
+// Inner Richmond plot shows SF and a 180 min plot shows only the East Bay,
+// with the origin pin outside its own polygon (SPA-302, valhalla#1607).
+// Zero keeps every contour. Pedestrian/bike/drive send it too; a connected
+// walkshed is a no-op at 0. Origin and egress share this one request body.
+func TestIsochrone_sendsDenoiseZero(t *testing.T) {
+	tests := []struct {
+		name    string
+		costing valhalla.Costing
+		depart  func(*testing.T) time.Time
+	}{
+		{"pedestrian", valhalla.CostingPedestrian, nil},
+		{"bicycle", valhalla.CostingBicycle, nil},
+		{"auto", valhalla.CostingAuto, nil},
+		{"multimodal", valhalla.CostingMultimodal, morningDeparture},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newCaptureServer(t, http.StatusOK, okIsochrone)
+			req := valhalla.IsochroneRequest{
+				Origin:     valhalla.LatLng{Lat: 37.7805, Lng: -122.4679},
+				Costing:    tc.costing,
+				BudgetSecs: 7200,
+			}
+			if tc.depart != nil {
+				req.DepartAt = tc.depart(t)
+			}
+			if _, err := valhalla.NewHTTPClient(srv.URL).Isochrone(context.Background(), req); err != nil {
+				t.Fatalf("Isochrone: %v", err)
+			}
+			assertIsochroneDenoiseZero(t, srv.body)
+		})
+	}
+}
+
+func assertIsochroneDenoiseZero(t *testing.T, body map[string]any) {
+	t.Helper()
+	got, ok := body["denoise"]
+	if !ok {
+		t.Fatal("denoise missing from /isochrone body — Valhalla defaults to 1.0 and drops every contour but the largest (SPA-302)")
+	}
+	if got != float64(valhalla.IsochroneDenoise) {
+		t.Errorf("denoise = %v, want %v", got, valhalla.IsochroneDenoise)
+	}
 }
 
 // Every location on every call carries the widened radius/minimum_reachability
@@ -726,6 +777,7 @@ func TestIsochrone_multimodalRequestShape(t *testing.T) {
 		t.Fatalf("Isochrone: %v", err)
 	}
 	assertMultimodalOptions(t, srv.body)
+	assertIsochroneDenoiseZero(t, srv.body)
 }
 
 func TestRoute_multimodalRequestShape(t *testing.T) {
