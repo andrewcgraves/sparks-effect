@@ -9,14 +9,6 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-// Broker connects to the throwaway RabbitMQ named by TEST_AMQP_URL and returns
-// a channel on it, along with the URL for anything that needs its own
-// connection.
-//
-// A broker is not faked here for the same reason sparks-effect-api does not
-// fake it on the publishing side: acknowledgement, redelivery and prefetch are
-// properties of the broker conversation, and a fake that implemented them would
-// be asserting its own behaviour rather than RabbitMQ's.
 func Broker(t *testing.T) (url string, ch *amqp.Channel) {
 	t.Helper()
 
@@ -43,8 +35,6 @@ func Broker(t *testing.T) (url string, ch *amqp.Channel) {
 	return url, ch
 }
 
-// ResetQueues deletes and redeclares the given queues, so a test starts against
-// an empty broker whatever an earlier one left behind.
 func ResetQueues(t *testing.T, ch *amqp.Channel, queues ...string) {
 	t.Helper()
 	for _, q := range queues {
@@ -57,8 +47,6 @@ func ResetQueues(t *testing.T, ch *amqp.Channel, queues ...string) {
 	}
 }
 
-// Publish puts a message on a queue via the default exchange, the way
-// sparks-effect-api's publisher does.
 func Publish(t *testing.T, ch *amqp.Channel, queue string, body []byte) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -73,11 +61,6 @@ func Publish(t *testing.T, ch *amqp.Channel, queue string, body []byte) {
 	}
 }
 
-// QueueDepth reports how many messages are sitting on a queue.
-//
-// Read via a passive declare, which returns the queue's current message count
-// without modifying it. Messages that are delivered but not yet acknowledged do
-// not count, which is exactly the property the retry tests want to observe.
 func QueueDepth(t *testing.T, ch *amqp.Channel, queue string) int {
 	t.Helper()
 	q, err := ch.QueueDeclarePassive(queue, true, false, false, false, nil)
@@ -87,12 +70,6 @@ func QueueDepth(t *testing.T, ch *amqp.Channel, queue string) int {
 	return q.Messages
 }
 
-// WaitFor polls cond until it holds or the deadline passes.
-//
-// Polling rather than waiting on a signal because the things being waited for
-// — a row reaching a status, a message landing on a queue — happen in another
-// process or another goroutine, with no channel to hand. The timeout is what
-// turns "this never happened" into a failure rather than a hung test.
 func WaitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

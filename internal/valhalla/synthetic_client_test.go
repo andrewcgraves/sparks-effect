@@ -11,9 +11,6 @@ import (
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
 
-// The synthetic client stands in for a real server in production when none is
-// configured, so what it emits has to be GeoJSON a map can actually draw: a
-// closed polygon ring, in [lng, lat] order, sized by the budget.
 func TestSyntheticIsochroneIsADrawablePolygon(t *testing.T) {
 	client := valhalla.NewSyntheticClient()
 	origin := valhalla.LatLng{Lat: 37.7, Lng: -122.4}
@@ -43,7 +40,7 @@ func TestSyntheticIsochroneIsADrawablePolygon(t *testing.T) {
 	if feature.Type != "Feature" || feature.Geometry.Type != "Polygon" {
 		t.Errorf("got %s/%s, want Feature/Polygon", feature.Type, feature.Geometry.Type)
 	}
-	// A shape that reaches a map without a real server behind it must say so.
+
 	if feature.Properties["synthetic"] != true {
 		t.Errorf("properties = %v, want synthetic: true", feature.Properties)
 	}
@@ -58,15 +55,12 @@ func TestSyntheticIsochroneIsADrawablePolygon(t *testing.T) {
 	if len(ring) < 4 {
 		t.Fatalf("ring has %d points, too few for a polygon", len(ring))
 	}
-	// GeoJSON requires the ring to close on its first point exactly.
+
 	first, last := ring[0], ring[len(ring)-1]
 	if first[0] != last[0] || first[1] != last[1] {
 		t.Errorf("ring does not close: first %v, last %v", first, last)
 	}
 
-	// An hour's walk at 5 km/h over a 1.4 detour factor is ~3.6 km of reach.
-	// Every vertex should sit about that far from the origin — the check is
-	// loose because the ring is drawn in degrees, not on a sphere.
 	wantKm := 5.0 / geo.DetourFactor
 	for i, pt := range ring {
 		gotKm := geo.HaversineKm(origin.Lat, origin.Lng, pt[1], pt[0])
@@ -76,8 +70,6 @@ func TestSyntheticIsochroneIsADrawablePolygon(t *testing.T) {
 	}
 }
 
-// A larger budget must produce a larger polygon, or the synthetic loop would
-// pass while telling you nothing about whether the budget was plumbed through.
 func TestSyntheticIsochroneGrowsWithBudget(t *testing.T) {
 	client := valhalla.NewSyntheticClient()
 	origin := valhalla.LatLng{Lat: 37.7, Lng: -122.4}
@@ -114,8 +106,8 @@ func TestSyntheticMatrixTimesGrowWithDistance(t *testing.T) {
 	resp, err := client.Matrix(context.Background(), valhalla.MatrixRequest{
 		Origins: []valhalla.LatLng{{Lat: 37.7, Lng: -122.4}},
 		Destinations: []valhalla.LatLng{
-			{Lat: 37.71, Lng: -122.39}, // near
-			{Lat: 38.20, Lng: -122.39}, // far
+			{Lat: 37.71, Lng: -122.39},
+			{Lat: 38.20, Lng: -122.39},
 		},
 		Costing: valhalla.CostingAuto,
 	})
@@ -136,17 +128,12 @@ func TestSyntheticMatrixTimesGrowWithDistance(t *testing.T) {
 	if *far.Time <= *near.Time {
 		t.Errorf("far time %d is not greater than near time %d", *far.Time, *near.Time)
 	}
-	// The chainer measures a cell's distance against the straight line to the
-	// station, so a stand-in client that reported a shorter one would have
-	// every one of its own answers dropped.
+
 	if bLine := geo.HaversineKm(37.7, -122.4, 38.20, -122.39); *far.DistanceKm < bLine {
 		t.Errorf("far distance = %.2f km, want at least the %.2f km straight line", *far.DistanceKm, bLine)
 	}
 }
 
-// An unknown costing is a bad request here for the same reason it is one on the
-// real server: it is a permanent failure, and classifying it as anything else
-// would have the worker retry a job that can never succeed.
 func TestSyntheticRejectsUnknownCosting(t *testing.T) {
 	client := valhalla.NewSyntheticClient()
 
@@ -175,9 +162,6 @@ func TestSyntheticRejectsUnknownCosting(t *testing.T) {
 	}
 }
 
-// The synthetic route is the b-line the synthetic isochrone's circles already
-// imply: this client has no street network to follow, and pretending otherwise
-// by inventing bends would put a fiction on the map that reads as a real walk.
 func TestSyntheticRouteIsTheStraightSegment(t *testing.T) {
 	client := valhalla.NewSyntheticClient()
 
@@ -228,9 +212,6 @@ func TestSyntheticAcceptsMultimodalCosting(t *testing.T) {
 	}
 }
 
-// There is no tileset behind the synthetic client, and inventing a timestamp
-// for one would put a fiction in the cache's diagnostic column that later reads
-// as fact.
 func TestSyntheticReportsNoStatus(t *testing.T) {
 	if _, err := valhalla.NewSyntheticClient().Status(context.Background()); !errors.Is(err, valhalla.ErrNoStatus) {
 		t.Errorf("Status error = %v, want ErrNoStatus", err)

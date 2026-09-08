@@ -19,13 +19,6 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      # `make itest` brings up a throwaway RabbitMQ (via the same Makefile
-      # targets used locally), runs the full suite with the broker integration
-      # tests enabled, then tears the container down — DRY across local and CI.
-      #
-      # CI is set on GitHub Actions, and the broker integration suite treats a
-      # missing TEST_AMQP_URL as a hard failure when it is present, so a broken
-      # service here fails the job rather than silently skipping.
       - name: Test (with RabbitMQ integration)
         run: make itest
 
@@ -43,24 +36,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The golden fixture is supposed to be byte-identical in both
-      # repositories, and before this job nothing checked it: the two copies
-      # drifted for two releases and trace ids were silently dropped on this
-      # side (SPA-227).
-      #
-      # It is a job of its own rather than a step of `check`, so a drift
-      # failure reads as "the contract moved" and not as a broken test, and so
-      # it still reports when the test job is red for its own reasons.
-      #
-      # This can go red without anything in this repository changing —
-      # sparks-effect-api merging a new field is enough. That is the intended
-      # behaviour: the drift is real from that moment, and the job says so
-      # instead of leaving it to whoever next reads both files.
-      #
-      # The other way around — this side ahead of API main, matching an
-      # in-flight API branch — is accepted by `make check-contract` via
-      # CONTRACT_CANDIDATE_REFS, so a staged rollout does not fail the job
-      # for agreeing with a contract that is not yet on main.
       - name: Diff the golden fixture against sparks-effect-api
         run: make check-contract
 
@@ -110,13 +85,6 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
-          # `sha-<commit>` is the promotable artifact: immutable, and what
-          # kustomize-config's production overlay pins. `staging` is a moving
-          # tag for whatever the trunk last built.
-          #
-          # No `latest`. The cluster used to pull it, and Kubernetes defaults
-          # imagePullPolicy: Always for `:latest` — so every pod restart was an
-          # unrecorded production upgrade to whatever had merged most recently.
           tags: |
             type=sha
             type=raw,value=staging

@@ -11,12 +11,6 @@ import (
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/transit"
 )
 
-// testdata/message.golden.json is the same file, byte for byte, that
-// sparks-effect-api asserts it produces. It is the only check that the two
-// hand-maintained copies of Message still agree, so this test reads the bytes
-// off disk rather than round-tripping a struct: a fixture regenerated from this
-// repository's own struct would agree with itself no matter how far it had
-// drifted from the publisher.
 func goldenBytes(t *testing.T) []byte {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join("testdata", "message.golden.json"))
@@ -55,9 +49,6 @@ func TestDecodeGoldenFixture(t *testing.T) {
 	}
 }
 
-// trace_id is optional: the API added it after this worker shipped, and a
-// message published without it has to stay processable rather than being
-// rejected for a field nothing routes on.
 func TestDecodeAcceptsMessageWithoutTraceID(t *testing.T) {
 	var m map[string]any
 	if err := json.Unmarshal(goldenBytes(t), &m); err != nil {
@@ -98,10 +89,6 @@ func TestDecodeAcceptsTransitMode(t *testing.T) {
 	}
 }
 
-// The graph is the largest part of the message and the part with the most room
-// to decode into something plausible but wrong — a node list that arrives empty,
-// or edges whose endpoints no longer line up with node slugs. Decoding it is
-// not enough; it has to still answer the two questions the chainer asks of it.
 func TestDecodeGoldenFixtureGraphIsRoutable(t *testing.T) {
 	msg, err := Decode(goldenBytes(t))
 	if err != nil {
@@ -133,7 +120,7 @@ func TestDecodeGoldenFixtureGraphIsRoutable(t *testing.T) {
 	if !ok {
 		t.Fatal("Search from north did not reach south, want a path")
 	}
-	// 1800 s of riding plus the service's 300 s boarding wait.
+
 	if south.TotalSecs != 2100 {
 		t.Errorf("TotalSecs = %d, want 2100", south.TotalSecs)
 	}
@@ -146,12 +133,7 @@ func TestDecodeGoldenFixtureGraphIsRoutable(t *testing.T) {
 	if south.PredecessorSlug != "north" {
 		t.Errorf("PredecessorSlug = %q, want north", south.PredecessorSlug)
 	}
-	// The hop's placement reaches the chainer through the search, which is the
-	// only path it takes: a settled node names its predecessor, not the edge
-	// that arrived on it, so anything not carried here is unrecoverable. The
-	// fixture's chainages descend, a hop running against the direction its
-	// alignment was drawn in, which is deliberately the shape easiest to get
-	// wrong rather than the tidiest one.
+
 	if south.HopRouteID != "rt-spine" {
 		t.Errorf("HopRouteID = %q, want rt-spine", south.HopRouteID)
 	}
@@ -161,11 +143,6 @@ func TestDecodeGoldenFixtureGraphIsRoutable(t *testing.T) {
 	}
 }
 
-// A message published before the API emitted edge placement is still processed
-// rather than rejected. There is no schema version bump: the fields are
-// additive, an old edge decodes with an empty route and zero chainages, and the
-// worker's only response to that is to omit the decoration — which is precisely
-// the precedent set when the trace identifier was added.
 func TestDecodeMessageWithoutEdgePlacementIsStillRoutable(t *testing.T) {
 	older := bytes.NewBuffer(nil)
 	var m map[string]any
@@ -198,10 +175,6 @@ func TestDecodeMessageWithoutEdgePlacementIsStillRoutable(t *testing.T) {
 	}
 }
 
-// The fixture's own field order is the wire order the API emits, and Message's
-// field declaration order is what encoding/json would emit from this side. They
-// have to match, or a future fixture regenerated here would silently reorder
-// the contract.
 func TestGoldenFixtureKeyOrderMatchesStruct(t *testing.T) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(goldenBytes(t), &raw); err != nil {
@@ -231,8 +204,6 @@ func keysOf(m map[string]json.RawMessage) []string {
 }
 
 func TestDecodeRejectsUnusableMessages(t *testing.T) {
-	// Each case mutates one field of the golden fixture, so a case only ever
-	// exercises the check it names — the rest of the message is known good.
 	tests := []struct {
 		name  string
 		mutis func(m map[string]any)

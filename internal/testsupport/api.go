@@ -19,26 +19,14 @@ const (
 	statusFailed    = "failed"
 )
 
-// DefaultWorkerToken is the bearer token the fake API accepts. Tests that
-// construct a store.Client against one should send this, not a made-up value,
-// so a mistyped credential fails the same way a real one would.
 const DefaultWorkerToken = "test-worker-token"
 
-// FakeAPI is an in-process stand-in for the sparks-effect-api worker endpoints.
-//
-// It exists so the consumer integration tests can still run the whole loop —
-// a real broker, a real HTTP client, a job row driven queued → running →
-// succeeded — without a Postgres of this worker's own. The SQL those writes
-// used to hit now lives in the API; what this fake has to get right is the
-// HTTP contract the client speaks, including the 404 that means ErrJobNotFound
-// and the auth gate that rejects anything but the shared token.
 type FakeAPI struct {
 	Server *httptest.Server
 	Token  string
-
-	mu    sync.Mutex
-	jobs  map[string]*fakeJob
-	cache map[store.IsochroneKey]fakeCacheRow
+	mu     sync.Mutex
+	jobs   map[string]*fakeJob
+	cache  map[store.IsochroneKey]fakeCacheRow
 }
 
 type fakeJob struct {
@@ -52,8 +40,6 @@ type fakeCacheRow struct {
 	tilesetAt time.Time
 }
 
-// StartFakeAPI starts a server implementing the worker HTTP contract and
-// registers cleanup to close it.
 func StartFakeAPI(t *testing.T) *FakeAPI {
 	t.Helper()
 	f := &FakeAPI{
@@ -73,18 +59,14 @@ func StartFakeAPI(t *testing.T) *FakeAPI {
 	return f
 }
 
-// URL is the base URL a store.Client should be pointed at.
 func (f *FakeAPI) URL() string { return f.Server.URL }
 
-// SeedRoutingJob inserts a queued routing job, mirroring what the API does
-// before it publishes.
 func (f *FakeAPI) SeedRoutingJob(jobID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.jobs[jobID] = &fakeJob{status: statusQueued}
 }
 
-// JobStatus reads back a job's status, error and result.
 func (f *FakeAPI) JobStatus(t *testing.T, jobID string) (status, errMessage string, result []byte) {
 	t.Helper()
 	f.mu.Lock()
@@ -96,7 +78,6 @@ func (f *FakeAPI) JobStatus(t *testing.T, jobID string) (status, errMessage stri
 	return j.status, j.errMsg, append([]byte(nil), j.result...)
 }
 
-// IsochroneCacheCount counts the rows held for one compile job.
 func (f *FakeAPI) IsochroneCacheCount(compileJobID string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -109,8 +90,6 @@ func (f *FakeAPI) IsochroneCacheCount(compileJobID string) int {
 	return n
 }
 
-// IsochroneCacheStamps returns the tileset stamp on every row held for one
-// compile job, zero times included.
 func (f *FakeAPI) IsochroneCacheStamps(compileJobID string) []time.Time {
 	f.mu.Lock()
 	defer f.mu.Unlock()

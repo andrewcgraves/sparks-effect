@@ -17,21 +17,13 @@ import (
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/worker"
 )
 
-// goldenCompileJobID is the compile job the golden message names — the identity
-// every cache key from that message has to carry.
 const goldenCompileJobID = "0f3b7c2a-4d1e-4a5b-9c8d-2e6f1a0b3c4d"
 
-// fakeStore records the transitions a job was driven through, in order.
-//
-// Order is the point: "queued → running → succeeded" is an acceptance
-// criterion, and a store that only remembered the final status would pass
-// whether or not the job was ever marked running.
 type fakeStore struct {
-	mu     sync.Mutex
-	states []string
-	result json.RawMessage
-	errMsg string
-
+	mu           sync.Mutex
+	states       []string
+	result       json.RawMessage
+	errMsg       string
 	runningErr   error
 	succeededErr error
 	failedErr    error
@@ -75,9 +67,6 @@ func (f *fakeStore) snapshot() ([]string, json.RawMessage, string) {
 	return append([]string(nil), f.states...), f.result, f.errMsg
 }
 
-// goldenMessage is the fixture sparks-effect-api asserts it publishes, read
-// from the routing package's testdata so there is exactly one copy of it in the
-// repository.
 func goldenMessage(t *testing.T) []byte {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join("..", "routing", "testdata", "message.golden.json"))
@@ -87,8 +76,6 @@ func goldenMessage(t *testing.T) []byte {
 	return b
 }
 
-// mutateGolden returns the golden message with one field changed, so a case
-// only ever exercises the thing it names.
 func mutateGolden(t *testing.T, mut func(m map[string]any)) []byte {
 	t.Helper()
 	var m map[string]any
@@ -107,10 +94,6 @@ func newHandler(s store.RoutingJobStore, client valhalla.Client) *worker.Handler
 	return worker.NewHandler(s, client, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.Discard())
 }
 
-// recordingCache is the thinnest thing that answers as a cache: it holds
-// nothing and remembers what it was asked. Whether reuse *works* is settled in
-// internal/isochrone against a real one; what is in question here is only
-// whether the handler hands its cache down to the chain it builds.
 type recordingCache struct {
 	mu   sync.Mutex
 	gets []store.IsochroneKey
@@ -133,18 +116,12 @@ func (r *recordingCache) asked() []store.IsochroneKey {
 	return append([]store.IsochroneKey(nil), r.gets...)
 }
 
-// The cache is configured on the handler but consulted by the chainer it builds
-// per message, so the two are only connected if the handler passes it through.
 func TestHandle_consultsTheEgressCacheForTheMessagesCompileJob(t *testing.T) {
 	s := &fakeStore{}
 	cache := &recordingCache{}
 	h := worker.NewHandler(s, valhalla.NewSyntheticClient(), valhalla.DefaultLimits(),
 		isochrone.EgressCache{Store: cache}, logger.Discard())
 
-	// The golden fixture's 45-minute budget only reaches "north" on foot —
-	// exactly the walk-only case SPA-188 stops caching. Widened here so
-	// "south" is reached by riding svc-express from north, which is what
-	// this test needs the cache to be asked about.
 	msg := mutateGolden(t, func(m map[string]any) { m["budget_mins"] = 90 })
 
 	if res := h.Handle(context.Background(), msg); res.Outcome != worker.OutcomeSucceeded {
@@ -165,9 +142,6 @@ func TestHandle_consultsTheEgressCacheForTheMessagesCompileJob(t *testing.T) {
 	}
 }
 
-// The whole point of the worker: a message the API published becomes a
-// succeeded row with a chained result attached, having passed through running
-// on the way.
 func TestHandle_drivesJobToSucceeded(t *testing.T) {
 	s := &fakeStore{}
 	h := newHandler(s, valhalla.NewSyntheticClient())
@@ -191,7 +165,6 @@ func TestHandle_drivesJobToSucceeded(t *testing.T) {
 		}
 	}
 
-	// The result has to be a FeatureCollection the API can hand back untouched.
 	var parsed struct {
 		Type     string            `json:"type"`
 		Features []json.RawMessage `json:"features"`
@@ -217,9 +190,6 @@ func TestHandle_drivesJobToSucceeded(t *testing.T) {
 	}
 }
 
-// A permanent failure marks the job failed and does not ask to be retried.
-// Requeueing any of these would loop forever against a server with room for one
-// chain at a time.
 func TestHandle_permanentFailuresFailTheJobWithoutRetry(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -274,9 +244,6 @@ func TestHandle_permanentFailuresFailTheJobWithoutRetry(t *testing.T) {
 	}
 }
 
-// A transient failure asks to be retried and deliberately does NOT mark the job
-// failed: another attempt is still to come, and a client polling the row would
-// otherwise be told it was over while the worker was still working on it.
 func TestHandle_transientFailureRequeuesWithoutFailingTheJob(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -306,8 +273,6 @@ func TestHandle_transientFailureRequeuesWithoutFailingTheJob(t *testing.T) {
 	}
 }
 
-// An API that cannot be written to is transient, not permanent: the chain
-// itself was fine and the answer is worth another attempt.
 func TestHandle_storeFailuresAreTransient(t *testing.T) {
 	dbDown := errors.New("connection refused")
 
@@ -328,8 +293,6 @@ func TestHandle_storeFailuresAreTransient(t *testing.T) {
 	})
 }
 
-// A job whose row has gone — its compile job cascaded away — is permanent.
-// There is nothing left to write an answer to, so retrying cannot help.
 func TestHandle_missingRowIsPermanent(t *testing.T) {
 	s := &fakeStore{runningErr: store.ErrJobNotFound}
 	res := newHandler(s, valhalla.NewSyntheticClient()).Handle(context.Background(), goldenMessage(t))
@@ -339,9 +302,6 @@ func TestHandle_missingRowIsPermanent(t *testing.T) {
 	}
 }
 
-// A message too malformed to name a job can only be discarded: there is no row
-// to record the failure against. It must still be acked, or it redelivers
-// forever.
 func TestHandle_unreadableMessageIsDiscarded(t *testing.T) {
 	s := &fakeStore{}
 	res := newHandler(s, valhalla.NewSyntheticClient()).Handle(context.Background(), []byte("not json"))
@@ -357,12 +317,8 @@ func TestHandle_unreadableMessageIsDiscarded(t *testing.T) {
 	}
 }
 
-// goldenTraceID is the trace the golden message carries.
 const goldenTraceID = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
 
-// traceIDsIn reports the trace_id on every line the handler logged, using "" for
-// a line that carried none, so a test can assert the whole trail rather than
-// whichever line happened to be first.
 func traceIDsIn(t *testing.T, out string) []string {
 	t.Helper()
 	out = strings.TrimSpace(out)
@@ -381,9 +337,6 @@ func traceIDsIn(t *testing.T, out string) []string {
 	return ids
 }
 
-// The trace lives in the message body, and sparks-effect-api sets no
-// x-trace-id header at all, so a handler that only read the header logged every
-// job untraced and cross-service correlation did not work (SPA-227).
 func TestHandle_logsUnderTheTraceTheMessageCarries(t *testing.T) {
 	var buf strings.Builder
 	s := &fakeStore{}
@@ -394,8 +347,7 @@ func TestHandle_logsUnderTheTraceTheMessageCarries(t *testing.T) {
 	if res.Outcome != worker.OutcomeSucceeded {
 		t.Fatalf("Outcome = %v (err %v), want succeeded", res.Outcome, res.Err)
 	}
-	// The consumer reads it back off the Result to log the delivery's
-	// settlement under the same trace.
+
 	if res.TraceID != goldenTraceID {
 		t.Errorf("res.TraceID = %q, want the fixture's %q", res.TraceID, goldenTraceID)
 	}
@@ -407,9 +359,6 @@ func TestHandle_logsUnderTheTraceTheMessageCarries(t *testing.T) {
 	}
 }
 
-// A message rejected out of hand is exactly when the trace is most worth
-// having: the API recorded a request, and this is the only place that says what
-// became of it.
 func TestHandle_logsARejectedMessageUnderItsTrace(t *testing.T) {
 	var buf strings.Builder
 	s := &fakeStore{}
@@ -428,8 +377,6 @@ func TestHandle_logsARejectedMessageUnderItsTrace(t *testing.T) {
 	}
 }
 
-// A message with no trace of its own does not erase the one the delivery header
-// gave the context, and does not log an empty trace_id in its place.
 func TestHandle_messageWithoutATraceKeepsTheHeadersTrace(t *testing.T) {
 	var buf strings.Builder
 	s := &fakeStore{}
@@ -454,9 +401,6 @@ func TestHandle_messageWithoutATraceKeepsTheHeadersTrace(t *testing.T) {
 	}
 }
 
-// Fail is what the consumer calls once retries are exhausted, and it has to
-// leave the row saying failed with the reason attached — that is what stops the
-// client polling.
 func TestFail_marksTheJobFailedWithItsCause(t *testing.T) {
 	s := &fakeStore{}
 	h := newHandler(s, valhalla.NewSyntheticClient())
@@ -472,9 +416,6 @@ func TestFail_marksTheJobFailedWithItsCause(t *testing.T) {
 	}
 }
 
-// With no Valhalla configured the synthetic client serves the loop, and the
-// polygons it produces say so — a shape that reaches a map without a real
-// server behind it must be identifiable as such.
 func TestHandle_syntheticClientMarksItsOutput(t *testing.T) {
 	s := &fakeStore{}
 	h := newHandler(s, valhalla.NewSyntheticClient())

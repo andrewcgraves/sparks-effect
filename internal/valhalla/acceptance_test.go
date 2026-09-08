@@ -11,64 +11,21 @@ import (
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
 
-// The transit acceptance checks: does the server this points at actually route
-// anyone onto a train?
-//
-// Everything else in this package asserts what the client puts on the wire,
-// against an httptest server that answers whatever the test hands it. That is
-// the right shape for a request contract and it is worth nothing here, because
-// the failure these exist to catch is upstream of the client entirely: tiles
-// built from GTFS feeds whose calendars have expired. Valhalla does not error
-// on those. It walks the whole way and answers 200 with a plausible shape, a
-// plausible duration, and no service on it — so a test asserting a 200, or a
-// polygon, or a duration, passes in exactly the broken state (SPA-274).
-//
-// They need a real Valhalla with real transit tiles, so they skip unless
-// TEST_VALHALLA_URL is set:
-//
-//	make acceptance TEST_VALHALLA_URL=http://localhost:8002
-//
-// Against the cluster's server, that is a port-forward to the valhalla service.
-
-// The known pair: Wilshire/Western, the western terminus of LA Metro's D Line,
-// to Los Angeles Union Station, which is on it.
-//
-// It is chosen for being unambiguous rather than for being far. Seven
-// kilometres is walkable — an hour and a half of it — so a server with no
-// working transit still answers, which is what makes this a test rather than a
-// tautology: the pair is one where the correct answer rides and the broken
-// answer walks, and the two are told apart by the maneuvers, not the duration.
-//
-// mdb-30 (LA Metro Rail) is the feed that has to be in the tiles for this to
-// pass. If it is dropped from GTFS_SUBDIVISIONS or denylisted, this test is
-// asserting something the deployment no longer promises and should move to
-// whatever pair replaces it.
 var (
 	wilshireWestern = valhalla.LatLng{Lat: 34.0618, Lng: -118.3090}
 	unionStation    = valhalla.LatLng{Lat: 34.0562, Lng: -118.2365}
 )
 
-// acceptanceClient builds a client against TEST_VALHALLA_URL, or skips.
 func acceptanceClient(t *testing.T) *valhalla.HTTPClient {
 	t.Helper()
 	base := os.Getenv("TEST_VALHALLA_URL")
 	if base == "" {
 		t.Skip("set TEST_VALHALLA_URL to a Valhalla server with transit tiles to run the acceptance checks")
 	}
-	// Generous next to DefaultTimeout: a 180–240 min multimodal isochrone
-	// against a cold server with transit tiles is the slowest thing this
-	// client ever asks for, and a timeout here would read as a transit failure.
+
 	return valhalla.NewHTTPClient(base).WithTimeout(5 * time.Minute)
 }
 
-// acceptanceDeparture is when the acceptance checks ask to travel.
-//
-// It defaults to the same representative weekday morning a real chain uses, so
-// what is asserted is what production does. TEST_TRANSIT_DEPART_AT overrides it
-// with a YYYY-MM-DDTHH:MM local time, which is how a specific service date gets
-// checked — the corrected LA Metro Rail feed covers a fortnight at a time, and
-// "does the tileset still have live service the week after next" is a question
-// worth being able to ask directly.
 func acceptanceDeparture(t *testing.T) time.Time {
 	t.Helper()
 	raw := os.Getenv("TEST_TRANSIT_DEPART_AT")
@@ -82,12 +39,6 @@ func acceptanceDeparture(t *testing.T) time.Time {
 	return at
 }
 
-// A multimodal route over the known pair has to board something.
-//
-// This is the assertion the whole file exists for. A 200 with a polygon is
-// exactly what the broken state returns, so anything weaker proves nothing:
-// only a maneuver whose travel_mode is "transit" distinguishes a tileset with
-// live GTFS service from one whose feeds all expired months ago.
 func TestAcceptanceTransitRouteBoardsAService(t *testing.T) {
 	client := acceptanceClient(t)
 	at := acceptanceDeparture(t)
@@ -113,14 +64,6 @@ func TestAcceptanceTransitRouteBoardsAService(t *testing.T) {
 	}
 }
 
-// Riding beats walking on the same pair, which is the property a transit
-// isochrone is actually built on.
-//
-// The maneuver check above proves a service was boarded; this proves boarding
-// it was worth doing. A tileset carrying one stale feed can satisfy the first
-// and still fail here, and a transit surface that does not reach further than
-// the walking one is the user-visible complaint (SPA-272) whatever the
-// maneuvers say.
 func TestAcceptanceTransitBeatsWalkingOnTheSamePair(t *testing.T) {
 	client := acceptanceClient(t)
 	at := acceptanceDeparture(t)
@@ -148,11 +91,6 @@ func TestAcceptanceTransitBeatsWalkingOnTheSamePair(t *testing.T) {
 	}
 }
 
-// The tiles the server is serving, reported rather than asserted.
-//
-// Nothing here can say what tileset is correct, but "which tiles was this run
-// against?" is the first question asked of a failure above, and it is answered
-// by the same server in one call.
 func TestAcceptanceReportsTheTilesetUnderTest(t *testing.T) {
 	client := acceptanceClient(t)
 
@@ -166,10 +104,6 @@ func TestAcceptanceReportsTheTilesetUnderTest(t *testing.T) {
 	}
 }
 
-// The reported pin: outer Sunset, where the nearest surviving stop sits
-// beyond Valhalla's 2415 m default walk cap. With the wrong costing-option
-// key the origin never boards anything; with transit_start_end_max_distance
-// at 10 km it does (SPA-297). Distinct from missing Muni feeds (SPA-288).
 var (
 	sunsetPin               = valhalla.LatLng{Lat: 37.773347286345896, Lng: -122.50371950034662}
 	salesforceTransitCenter = valhalla.LatLng{Lat: 37.7897, Lng: -122.3967}
@@ -179,9 +113,6 @@ var (
 	minSunsetIsochroneKm2   = 600.0
 )
 
-// The user's reported trip has to board something. Error 442 / a walking
-// itinerary is what the ignored walk-cap key produced; a transit maneuver
-// is what the recognised key produces, even with Muni still missing.
 func TestAcceptanceSunsetRouteBoardsAService(t *testing.T) {
 	client := acceptanceClient(t)
 	at := acceptanceDeparture(t)
@@ -206,10 +137,6 @@ func TestAcceptanceSunsetRouteBoardsAService(t *testing.T) {
 	}
 }
 
-// A multimodal isochrone must never come back smaller than the walk isochrone
-// from the same origin and contour. That inversion is the user-visible
-// absurdity of SPA-297 (Sunset transit 15 km² vs walk 163 km² at 180 min),
-// and it is independent of which costing-option key caused it.
 func TestAcceptanceTransitIsochroneIsAtLeastAsLargeAsWalk(t *testing.T) {
 	client := acceptanceClient(t)
 	at := acceptanceDeparture(t)
@@ -261,10 +188,6 @@ func TestAcceptanceTransitIsochroneIsAtLeastAsLargeAsWalk(t *testing.T) {
 	}
 }
 
-// From the reported pin, 180 minutes of multimodal reach has to be a real
-// transit surface — hundreds of square kilometres, and still growing at 240
-// minutes. The ignored walk-cap key produced a ~15 km² blob that stopped
-// expanding at 180 because the origin never boarded.
 func TestAcceptanceSunsetIsochroneGrowsWithBudget(t *testing.T) {
 	client := acceptanceClient(t)
 	at := acceptanceDeparture(t)
@@ -309,9 +232,6 @@ func TestAcceptanceSunsetIsochroneGrowsWithBudget(t *testing.T) {
 
 const earthRadiusKm = 6371.0
 
-// isochroneAreaKm2 is the spherical area of every polygon in the collection,
-// outer rings minus holes. Used to compare transit and walk surfaces; it does
-// not need to be a geodesic authority, only monotonic and in the right units.
 func isochroneAreaKm2(iso *valhalla.IsochroneResponse) (float64, error) {
 	var total float64
 	for _, raw := range iso.Features {
@@ -358,8 +278,6 @@ func polygonAreaKm2(rings [][][]float64) float64 {
 	return area
 }
 
-// ringAreaKm2 is the spherical excess of a closed lon/lat ring, the same
-// trapezoidal formula GeoJSON area libraries use on WGS84.
 func ringAreaKm2(ring [][]float64) float64 {
 	if len(ring) < 4 {
 		return 0
@@ -376,9 +294,6 @@ func ringAreaKm2(ring [][]float64) float64 {
 	return area * earthRadiusKm * earthRadiusKm / 2
 }
 
-// The area helper has to report square kilometres in the right ballpark, or
-// the acceptance comparisons above are comparing noise. A 0.01° square on
-// the equator is about 1.23 km on a side.
 func TestIsochroneAreaOfAKnownSquare(t *testing.T) {
 	feature, err := json.Marshal(map[string]any{
 		"type": "Feature",
@@ -396,7 +311,7 @@ func TestIsochroneAreaOfAKnownSquare(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 0.01° ≈ 1.11195 km at the equator; square ≈ 1.236 km².
+
 	if got < 1.2 || got > 1.3 {
 		t.Errorf("area = %.4f km², want ~1.236", got)
 	}

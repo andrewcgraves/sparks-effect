@@ -19,22 +19,10 @@ import (
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
 
-// fakeGraph implements transit.GraphData directly, rather than building a
-// TransitGraph and letting CompiledGraph read it.
-//
-// It carried over from sparks-effect-api, where it stood in for a scenario
-// store, and it earns its place here for the same reason it did there: most of
-// these cases are about what the chainer *asks Valhalla for*, and stating a
-// travel time as one map entry keeps that the subject. transit's own Dijkstra
-// is exercised against a real graph in internal/routing, over the golden
-// fixture the API actually publishes.
 type fakeGraph struct {
 	nodes       []transit.Node
 	travelTimes map[[2]string]int
-	// waitTimes is per-pair boarding wait in seconds, defaulting to zero. A
-	// graph with no entry here declares no wait at all, which is what
-	// hasWait reports and what the chainer turns into wait_model "none".
-	waitTimes map[[2]string]int
+	waitTimes   map[[2]string]int
 }
 
 var _ transit.GraphData = (*fakeGraph)(nil)
@@ -53,10 +41,6 @@ func (f *fakeGraph) travelTime(fromSlug, toSlug string) (secs, wait int, ok bool
 	return 0, 0, false
 }
 
-// Search settles what the travel-time table states directly: every access
-// station, and every node one stated ride away from one. The table is pairs
-// rather than edges, so there is nothing here to chain through — a case about a
-// multi-hop journey builds a real transit.CompiledGraph instead.
 func (f *fakeGraph) Search(accessSecs map[string]int) map[string]transit.Reached {
 	out := make(map[string]transit.Reached)
 	consider := func(slug string, r transit.Reached) {
@@ -110,14 +94,6 @@ func node(slug string, lng, lat float64) transit.Node {
 	return transit.Node{Slug: slug, Lat: lat, Lng: lng}
 }
 
-// tokenRoadKm is the road distance a stubbed matrix cell reports, for the many
-// cases that are about a travel time and have no opinion about a distance.
-//
-// It cannot be a token zero. The chainer drops a cell whose distance undercuts
-// the straight line to the station it names, because no road does that and a
-// cell claiming one is a pair the server declined rather than routed (SPA-243).
-// Every station in these fixtures sits within a few kilometres of the origin,
-// so one comfortably longer value stands in for a real road to any of them.
 const tokenRoadKm = 10.0
 
 func newTestGraph() *fakeGraph {
@@ -141,9 +117,6 @@ func cannedIso() *valhalla.IsochroneResponse {
 	}
 }
 
-// newChainer builds a chainer at the limits the deployed container enforces,
-// caching nothing. Cases that are *about* a limit override the one they
-// exercise; cases about reuse live in cache_test.go and build their own.
 func newChainer(client valhalla.Client, graph transit.GraphData) isochrone.Chainer {
 	return isochrone.New(client, graph, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.Discard())
 }
@@ -155,23 +128,6 @@ func req(budgetMins int, mode transit.TravelMode) isochrone.ChainRequest {
 	}
 }
 
-// --- The journey the response describes ----------------------------------
-//
-// These cases drive the chainer over a real compiled graph rather than the
-// travel-time table above, because what they are about is the shape of a
-// journey across several hops and two services — which a table of pairs cannot
-// state.
-
-// interchangeGraph is a trunk with a spur off its middle station, the shape the
-// seeded California scenario has at Palmdale: a rider bound for the spur's end
-// boards the trunk, rides to the junction, and changes there.
-//
-//	alpha --trunk--> beta --trunk--> gamma
-//	                  \--spur--> delta
-//
-// The stations sit a kilometre or so apart so that all four are within walking
-// reach of the origin; which of them the rider can actually walk to is decided
-// by the matrix, not by the geography.
 func interchangeGraph() transit.CompiledGraph {
 	return transit.CompiledGraph{Graph: &transit.TransitGraph{
 		Nodes: []transit.GraphNode{
@@ -192,8 +148,6 @@ func interchangeGraph() transit.CompiledGraph {
 	}}
 }
 
-// walkableFrom builds a matrix answer in which only the named station is within
-// walking reach; every other node of interchangeGraph is unreachable on foot.
 func walkableFrom(accessSecs int, index int) *valhalla.MatrixResponse {
 	row := make([]valhalla.MatrixCell, 4)
 	for i := range row {
@@ -212,10 +166,6 @@ func stationsBySlug(t *testing.T, resp *isochrone.ChainResponse) map[string]isoc
 	return out
 }
 
-// Every station names the one it was ridden from, and following those names
-// arrives at a station the rider walked to. That is what makes the reported set
-// a tree rather than a list, and it is the whole reason the search keeps
-// predecessors.
 func TestChainer_reachableStationsFormATreeRootedAtTheAccessStations(t *testing.T) {
 	fc := &valhalla.StubClient{IsochroneResp: cannedIso(), MatrixResp: walkableFrom(300, 0)}
 	chainer := newChainer(fc, interchangeGraph())
@@ -245,9 +195,6 @@ func TestChainer_reachableStationsFormATreeRootedAtTheAccessStations(t *testing.
 	}
 }
 
-// A journey over an interchange is described hop by hop, each naming the
-// service actually ridden — which is what the single boarded-service field
-// cannot do, since it reports only the first.
 func TestChainer_legsNameTheServiceRiddenOnEachHop(t *testing.T) {
 	fc := &valhalla.StubClient{IsochroneResp: cannedIso(), MatrixResp: walkableFrom(300, 0)}
 	chainer := newChainer(fc, interchangeGraph())
@@ -271,15 +218,12 @@ func TestChainer_legsNameTheServiceRiddenOnEachHop(t *testing.T) {
 			t.Errorf("delta leg %d = %+v, want %+v", i, delta.Legs[i], want)
 		}
 	}
-	// A station the rider walked to rode nothing, so it has no legs at all.
+
 	if alpha := stations["alpha"]; len(alpha.Legs) != 0 {
 		t.Errorf("alpha legs = %+v, want none — the rider walked there", alpha.Legs)
 	}
 }
 
-// Boarding wait is paid once, at the station the rider gets on. Changing
-// service at the junction costs nothing, so the spur's longer wait is never
-// charged — which is the model this change was required to preserve exactly.
 func TestChainer_boardingWaitIsChargedOnceAndNotAgainOnAServiceChange(t *testing.T) {
 	fc := &valhalla.StubClient{IsochroneResp: cannedIso(), MatrixResp: walkableFrom(300, 0)}
 	chainer := newChainer(fc, interchangeGraph())
@@ -299,16 +243,12 @@ func TestChainer_boardingWaitIsChargedOnceAndNotAgainOnAServiceChange(t *testing
 			t.Errorf("%s paid %d s of boarding wait, want the trunk's 600 s once", slug, s.BoardWaitSecs)
 		}
 	}
-	// 300 s walk + 600 s wait + 900 s to beta + 600 s on to delta, with the
-	// spur's 1200 s wait never charged.
+
 	if got := stations["delta"].RemainingSecs; got != 120*60-2400 {
 		t.Errorf("delta remaining = %d s, want %d — a transfer costs nothing", got, 120*60-2400)
 	}
 }
 
-// Seconds are reported alongside the whole minutes that were always there, so a
-// caller adding hop to hop down a journey does not lose a minute at every stop.
-// The minute fields keep meaning exactly what they meant.
 func TestChainer_reportsSecondsAlongsideWholeMinutes(t *testing.T) {
 	fc := &valhalla.StubClient{IsochroneResp: cannedIso(), MatrixResp: walkableFrom(743, 0)}
 	chainer := newChainer(fc, interchangeGraph())
@@ -331,9 +271,6 @@ func TestChainer_reportsSecondsAlongsideWholeMinutes(t *testing.T) {
 	}
 }
 
-// A graph compiled before the API reported dwell carries none, and the response
-// describes the journey anyway — minus the dwell, which is incomplete but never
-// wrong. No backfill is required to deploy this.
 func TestChainer_describesAJourneyOverAGraphWithNoDwell(t *testing.T) {
 	g := interchangeGraph()
 	for si := range g.Graph.Services {
@@ -364,8 +301,8 @@ func TestChainer_happyPath_twoStations(t *testing.T) {
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
 				{
-					valhalla.Cell(600, tokenRoadKm),  // station-a: 10 mins
-					valhalla.Cell(3000, tokenRoadKm), // station-b: 50 mins
+					valhalla.Cell(600, tokenRoadKm),
+					valhalla.Cell(3000, tokenRoadKm),
 				},
 			},
 		},
@@ -382,9 +319,6 @@ func TestChainer_happyPath_twoStations(t *testing.T) {
 		t.Errorf("Type: want FeatureCollection, got %q", resp.Type)
 	}
 
-	// 1 origin feature + 1 egress feature: station-a's best path is a direct
-	// walk (no polygon, since SPA-188), station-b's is via transit through
-	// station-a (gets one).
 	if len(resp.Features) != 2 {
 		t.Errorf("Features len: want 2, got %d", len(resp.Features))
 	}
@@ -397,8 +331,7 @@ func TestChainer_happyPath_twoStations(t *testing.T) {
 	if resp.Metadata.OriginBudgetMins != 90 {
 		t.Errorf("OriginBudgetMins: want 90, got %d", resp.Metadata.OriginBudgetMins)
 	}
-	// The compile job replaces the scenario slug the API's chainer reported:
-	// it is the only identity the queue message carries for a graph.
+
 	if resp.Metadata.CompileJobID != "compile-1" {
 		t.Errorf("CompileJobID: want compile-1, got %q", resp.Metadata.CompileJobID)
 	}
@@ -412,15 +345,14 @@ func TestChainer_noStations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Chain: %v", err)
 	}
-	// Only origin feature
+
 	if len(resp.Features) != 1 {
 		t.Errorf("Features len: want 1, got %d", len(resp.Features))
 	}
 	if len(resp.Metadata.ReachableStations) != 0 {
 		t.Errorf("ReachableStations: want 0, got %d", len(resp.Metadata.ReachableStations))
 	}
-	// An empty graph has nothing to put in a matrix, so no matrix call should
-	// go out at all — Valhalla rejects a matrix with no targets.
+
 	if _, matrix := fc.Calls(); len(matrix) != 0 {
 		t.Errorf("MatrixCalls: want 0 for an empty graph, got %d", len(matrix))
 	}
@@ -453,15 +385,13 @@ func TestChainer_allUnreachable(t *testing.T) {
 }
 
 func TestChainer_zeroRemainingExcludesStation(t *testing.T) {
-	// budget=30 min=1800s, station-a access=600s, transit a→b=1800s: 600+1800=2400 > 1800 budget
-	// station-b direct: unreachable (-1)
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
 				{
-					valhalla.Cell(600, tokenRoadKm), // station-a: 10 mins
-					{},                              // station-b: unreachable
+					valhalla.Cell(600, tokenRoadKm),
+					{},
 				},
 			},
 		},
@@ -472,8 +402,7 @@ func TestChainer_zeroRemainingExcludesStation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Chain: %v", err)
 	}
-	// station-a listed, reached by direct walk (no egress polygon, per
-	// SPA-188); station-b excluded entirely (1800-600-1800 = -600s ≤ 0).
+
 	if len(resp.Metadata.ReachableStations) != 1 {
 		t.Fatalf("ReachableStations: want 1, got %d", len(resp.Metadata.ReachableStations))
 	}
@@ -482,19 +411,13 @@ func TestChainer_zeroRemainingExcludesStation(t *testing.T) {
 	}
 }
 
-// SPA-188: a station reached purely by walking — no transit boarded — is just
-// "how far you can walk from a station you already walked to," which the
-// origin polygon already covers. It gets no isochrone feature of its own, but
-// it still stays in the reachable-stations list: a later ticket (SPA-191)
-// draws a walking path to it off that entry.
 func TestChainer_directAccess_AequalsB(t *testing.T) {
-	// Single station, directly reachable; no transit leg.
 	graph := &fakeGraph{nodes: []transit.Node{node("station-a", -122.39, 37.71)}}
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
-				{valhalla.Cell(600, tokenRoadKm)}, // 10 mins
+				{valhalla.Cell(600, tokenRoadKm)},
 			},
 		},
 	}
@@ -511,13 +434,13 @@ func TestChainer_directAccess_AequalsB(t *testing.T) {
 	if rs.StationSlug != "station-a" {
 		t.Errorf("slug: want station-a, got %q", rs.StationSlug)
 	}
-	if rs.RemainingMins != 50 { // 60 - 10
+	if rs.RemainingMins != 50 {
 		t.Errorf("remaining: want 50, got %d", rs.RemainingMins)
 	}
 	if rs.ViaService != "" {
 		t.Errorf("ViaService: want empty (no service boarded), got %q", rs.ViaService)
 	}
-	// Origin feature only — no egress polygon for a walk-only station.
+
 	if len(resp.Features) != 1 {
 		t.Errorf("Features len: want 1 (origin only), got %d", len(resp.Features))
 	}
@@ -537,10 +460,6 @@ func TestChainer_directAccess_AequalsB(t *testing.T) {
 }
 
 func TestChainer_concurrentFanOut_noRace(t *testing.T) {
-	// One hub reachable on foot, five stations reachable only by riding a
-	// service from it, to trigger concurrent egress fan-out. A directly
-	// walkable station gets no egress isochrone at all since SPA-188, so the
-	// fan-out this test means to exercise needs stations reached by transit.
 	const stationCount = 5
 	nodes := make([]transit.Node, stationCount+1)
 	cells := make([]valhalla.MatrixCell, stationCount+1)
@@ -566,17 +485,10 @@ func TestChainer_concurrentFanOut_noRace(t *testing.T) {
 	}
 }
 
-// The egress fan-out is as wide as the graph has stations reached by transit,
-// and the routing server is a single small container. Without a bound, one
-// large scenario would open hundreds of concurrent requests against a server
-// sized for a handful — so the bound is measured, not just configured.
 func TestChainer_egressFanOutIsBoundedByConfiguration(t *testing.T) {
 	const nodeCount = 40
 	const concurrency = 3
 
-	// One hub reachable on foot; every other node reached only by riding a
-	// service from it, since a directly walkable station gets no egress
-	// isochrone since SPA-188 and so would never enter this fan-out.
 	nodes := make([]transit.Node, nodeCount+1)
 	cells := make([]valhalla.MatrixCell, nodeCount+1)
 	tt := make(map[[2]string]int)
@@ -604,8 +516,6 @@ func TestChainer_egressFanOutIsBoundedByConfiguration(t *testing.T) {
 			}
 			mu.Unlock()
 
-			// Long enough that genuinely concurrent calls overlap here rather
-			// than completing one after another and never revealing the peak.
 			time.Sleep(5 * time.Millisecond)
 
 			mu.Lock()
@@ -628,8 +538,7 @@ func TestChainer_egressFanOutIsBoundedByConfiguration(t *testing.T) {
 	if peak > concurrency {
 		t.Errorf("peak concurrent routing calls = %d, want at most %d", peak, concurrency)
 	}
-	// A peak of one would mean the fan-out had become serial, which passes the
-	// bound while losing the whole point of running it concurrently.
+
 	if peak < 2 {
 		t.Errorf("peak concurrent routing calls = %d; the fan-out is not running concurrently at all", peak)
 	}
@@ -676,9 +585,6 @@ func TestChainer_haversineFilterExcludesFarStations(t *testing.T) {
 	}
 }
 
-// A 90-minute drive budget reaches ~86 km of b-line distance, so a station 30 km
-// out is a legitimate access candidate. The matrix b-line limit for auto is
-// 400 km, not 20 km, so nothing should cut the reach short here (SPA-136).
 func TestChainer_driveReachFollowsBudgetNotA20kmFloor(t *testing.T) {
 	graph := &fakeGraph{nodes: []transit.Node{
 		node("station-near", -122.39, 37.71),
@@ -706,13 +612,10 @@ func TestChainer_driveReachFollowsBudgetNotA20kmFloor(t *testing.T) {
 	}
 }
 
-// Valhalla rejects the whole matrix when any source→target b-line distance
-// exceeds max_matrix_distance — 400 km for auto — so the pre-filter must still
-// cap reach there however large the budget.
 func TestChainer_driveReachCappedAtAutoMatrixBLineLimit(t *testing.T) {
 	graph := &fakeGraph{nodes: []transit.Node{
 		node("station-near", -122.39, 37.71),
-		// ~5.5° of latitude north ≈ 610 km, beyond the 400 km auto cap.
+
 		node("station-610km", -122.40, 43.20),
 	}}
 	fc := &valhalla.StubClient{
@@ -735,9 +638,6 @@ func TestChainer_driveReachCappedAtAutoMatrixBLineLimit(t *testing.T) {
 	}
 }
 
-// Valhalla enforces max_matrix_location_pairs as sources × targets. With one
-// source that is a destination cap, and exceeding it is a 400 for the whole
-// request — so the chainer truncates to the nearest rather than finding out.
 func TestChainer_matrixPairCap_truncates(t *testing.T) {
 	const cap = 600
 	const nodeCount = 620
@@ -745,7 +645,6 @@ func TestChainer_matrixPairCap_truncates(t *testing.T) {
 	nodes := make([]transit.Node, nodeCount)
 	cells := make([]valhalla.MatrixCell, nodeCount)
 	for i := range nodeCount {
-		// All within ~1 km of origin — well within walk budget haversine reach.
 		nodes[i] = node(
 			fmt.Sprintf("station-%d", i),
 			-122.40+0.001*float64(i%30),
@@ -775,9 +674,6 @@ func TestChainer_matrixPairCap_truncates(t *testing.T) {
 	}
 }
 
-// The 600-destination cap the API carried was a Stadia plan allowance. Valhalla
-// allows 2500 pairs, so a scenario between the two sizes must now go out whole
-// rather than being silently cut down to its 600 nearest stations.
 func TestChainer_defaultMatrixCapIsValhallasNotStadias(t *testing.T) {
 	const nodeCount = 900
 
@@ -807,9 +703,6 @@ func TestChainer_defaultMatrixCapIsValhallasNotStadias(t *testing.T) {
 	}
 }
 
-// SPA-136: a 60-minute drive origin polygon is requested at its full 60 minutes.
-// It used to be clamped to 15 min and then dropped entirely, which is what made
-// the rendered drive isochrone look far too small.
 func TestChainer_drive_largeBudget_originFeatureAtFullBudget(t *testing.T) {
 	fc := &valhalla.StubClient{IsochroneResp: cannedIso()}
 	chainer := newChainer(fc, &fakeGraph{})
@@ -847,12 +740,7 @@ func TestChainer_drive_largeBudget_originFeatureAtFullBudget(t *testing.T) {
 	}
 }
 
-// SPA-136: egress polygons were silently clamped to 15 min for drive with no
-// metadata flag, so every station's drive coverage was undersized too.
 func TestChainer_drive_egressIsoUsesFullRemainingBudget(t *testing.T) {
-	// station-a is directly reachable but, since SPA-188, a walk-only station
-	// gets no egress isochrone at all — so this needs a station reached by
-	// transit for there to be an egress budget to check.
 	graph := &fakeGraph{
 		nodes: []transit.Node{
 			node("hub", -122.40, 37.70),
@@ -864,13 +752,12 @@ func TestChainer_drive_egressIsoUsesFullRemainingBudget(t *testing.T) {
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
-				{valhalla.Cell(600, tokenRoadKm), {}}, // hub: 10 min access
+				{valhalla.Cell(600, tokenRoadKm), {}},
 			},
 		},
 	}
 	chainer := newChainer(fc, graph)
 
-	// budget 90 min − 10 min access − 1 min transit = 79 min remaining at station-a.
 	resp, err := chainer.Chain(context.Background(), req(90, transit.TravelModeDrive))
 	if err != nil {
 		t.Fatalf("Chain: %v", err)
@@ -879,7 +766,7 @@ func TestChainer_drive_egressIsoUsesFullRemainingBudget(t *testing.T) {
 	if sa.RemainingMins != 79 {
 		t.Fatalf("RemainingMins: want 79, got %d", sa.RemainingMins)
 	}
-	// Match on origin coordinates rather than call order, which errgroup doesn't fix.
+
 	iso, _ := fc.Calls()
 	var egressBudget int
 	for _, call := range iso {
@@ -892,23 +779,11 @@ func TestChainer_drive_egressIsoUsesFullRemainingBudget(t *testing.T) {
 	}
 }
 
-// Valhalla's contour is minute-granular, so a station with under a minute of
-// budget left cannot be asked for a polygon: the request would go out as
-// {"time": 0}, which Valhalla rejects, failing the whole errgroup and with it
-// the entire request.
-//
-// That used to be settled by dropping the station outright, which denied an
-// arrival the rider genuinely made — the narrow version of the fault SPA-264
-// exists to fix. The two conditions are now separated: reaching a station and
-// being able to draw a polygon from it are different questions, and only the
-// second is minute-granular. The station is reported and its dot lights; the
-// fan-out skips it, reusing the seam a walk-only station already sits in.
 func TestChainer_subMinuteRemainingBudget_stationReachedWithoutAnEgressPolygon(t *testing.T) {
 	graph := &fakeGraph{nodes: []transit.Node{node("station-a", -122.39, 37.71)}}
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
-			// 600 s budget − 570 s access = 30 s remaining → 0 whole minutes.
 			SourcesToTargets: [][]valhalla.MatrixCell{{valhalla.Cell(570, tokenRoadKm)}},
 		},
 	}
@@ -942,10 +817,6 @@ func TestChainer_subMinuteRemainingBudget_stationReachedWithoutAnEgressPolygon(t
 	}
 }
 
-// The three routing failure modes have to stay distinguishable all the way out
-// of the chainer: the consumer decides whether to requeue a job by asking which
-// one it was, and collapsing them would either loop forever on a bad request or
-// abandon a job the server would have answered a second later.
 func TestChainer_routingErrorsPropagateByCause(t *testing.T) {
 	tests := []struct {
 		name string
@@ -994,13 +865,7 @@ func TestChainer_routingErrorsPropagateByCause(t *testing.T) {
 	}
 }
 
-// A failure part-way through the egress fan-out fails the whole chain rather
-// than returning a surface with holes in it. A partial isochrone is worse than
-// none: it looks like an answer and understates reachability.
 func TestChainer_egressFailureFailsTheChain(t *testing.T) {
-	// station-b must be reached by transit, not walked to directly: a
-	// walk-only station makes no egress request at all since SPA-188, so it
-	// could never fail one.
 	graph := &fakeGraph{
 		nodes: []transit.Node{
 			node("station-a", -122.39, 37.71),
@@ -1028,9 +893,6 @@ func TestChainer_egressFailureFailsTheChain(t *testing.T) {
 	}
 }
 
-// The contour ceiling is patched to 320 minutes on the deployed container
-// (kustomize-config sets ISOCHRONE_MAX_TIME_MINUTES=320). Nothing may go out
-// above it, whatever the budget, because that is a 400 for the whole request.
 func TestChainer_isochroneBudgetNeverExceedsContourCeiling(t *testing.T) {
 	limits := valhalla.DefaultLimits()
 	maxContourSecs := limits.MaxIsoContourMins * 60
@@ -1057,9 +919,6 @@ func TestChainer_isochroneBudgetNeverExceedsContourCeiling(t *testing.T) {
 	}
 }
 
-// The 120-minute ceiling the API hard-coded was Stadia's, and it is nearly
-// three times too strict against the deployed container. A 300-minute budget
-// must now go out whole.
 func TestChainer_contourCeilingIsThePatched320NotStadias120(t *testing.T) {
 	fc := &valhalla.StubClient{IsochroneResp: cannedIso()}
 	chainer := newChainer(fc, &fakeGraph{})
@@ -1100,13 +959,6 @@ func TestChainer_bikeIsoBudgetUnclampedBelowCeiling(t *testing.T) {
 	}
 }
 
-// A graph whose services declare no boarding wait charges none, and says so.
-//
-// The API decided this by scenario slug — ca-hsr was the wait-free one. The
-// queue message carries no scenario identity, so the question is put to the
-// graph itself, which is the thing that actually determines the answer. The
-// arithmetic is unchanged: budget 5400s − 600s access − 1800s transit − 0 wait
-// = 3000s = 50 min.
 func TestChainer_graphWithoutWait_waitModelNone(t *testing.T) {
 	graph := &fakeGraph{
 		nodes: []transit.Node{
@@ -1120,8 +972,8 @@ func TestChainer_graphWithoutWait_waitModelNone(t *testing.T) {
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
 				{
-					valhalla.Cell(600, tokenRoadKm),  // hsr-a: 10 min
-					valhalla.Cell(3000, tokenRoadKm), // hsr-b: 50 min direct
+					valhalla.Cell(600, tokenRoadKm),
+					valhalla.Cell(3000, tokenRoadKm),
 				},
 			},
 		},
@@ -1143,8 +995,6 @@ func TestChainer_graphWithoutWait_waitModelNone(t *testing.T) {
 	}
 }
 
-// A graph whose services declare a boarding wait charges it, and says so:
-// budget 5400s − 600s access − 1800s transit − 900s wait = 2100s = 35 min.
 func TestChainer_graphWithWait_waitModelHeadway(t *testing.T) {
 	graph := &fakeGraph{
 		nodes: []transit.Node{
@@ -1154,15 +1004,14 @@ func TestChainer_graphWithWait_waitModelHeadway(t *testing.T) {
 		travelTimes: map[[2]string]int{{"station-a", "station-b"}: 1800},
 		waitTimes:   map[[2]string]int{{"station-a", "station-b"}: 900},
 	}
-	// station-b is not directly reachable from origin (-1); the only path is
-	// via station-a, so the wait is unavoidable.
+
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{
 				{
-					valhalla.Cell(600, tokenRoadKm), // station-a: 10 min
-					{},                              // station-b: not directly reachable
+					valhalla.Cell(600, tokenRoadKm),
+					{},
 				},
 			},
 		},
@@ -1184,11 +1033,7 @@ func TestChainer_graphWithWait_waitModelHeadway(t *testing.T) {
 	}
 }
 
-// Every egress feature carries the station it was cut from, so a client can
-// attribute a polygon without matching it back by geometry.
 func TestChainer_egressFeaturesCarryTheirStation(t *testing.T) {
-	// station-a must be reached by transit, not walked to directly: a
-	// walk-only station carries no egress feature at all since SPA-188.
 	graph := &fakeGraph{
 		nodes: []transit.Node{
 			node("hub", -122.40, 37.70),
@@ -1243,9 +1088,6 @@ func findStation(t *testing.T, resp *isochrone.ChainResponse, slug string) isoch
 	return isochrone.ReachableStation{}
 }
 
-// cannedRoute is a routed shape that is unmistakably not a two-point segment:
-// it bends, the way a walk along streets does, and its endpoints are Valhalla's
-// snapped ones rather than either of the points that were asked about.
 func cannedRoute() *valhalla.RouteResponse {
 	return &valhalla.RouteResponse{Shape: []valhalla.LatLng{
 		{Lat: 37.7001, Lng: -122.4002},
@@ -1255,8 +1097,6 @@ func cannedRoute() *valhalla.RouteResponse {
 	}}
 }
 
-// starterWalkGeometry decodes the LineString the chain reports, so a case can
-// assert on coordinates rather than on bytes.
 func starterWalkGeometry(t *testing.T, walk *isochrone.StarterWalk) [][]float64 {
 	t.Helper()
 	if walk == nil {
@@ -1275,16 +1115,14 @@ func starterWalkGeometry(t *testing.T, walk *isochrone.StarterWalk) [][]float64 
 	return geom.Coordinates
 }
 
-// The point of the whole ticket: what is drawn is the shape that was walked,
-// not the chord across whatever lies between the two points.
 func TestChainer_starterWalkCarriesTheRoutedShape(t *testing.T) {
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
 		RouteResp:     cannedRoute(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{{
-				valhalla.Cell(600, tokenRoadKm),  // station-a: 10 mins on foot
-				valhalla.Cell(3000, tokenRoadKm), // station-b: 50 mins on foot
+				valhalla.Cell(600, tokenRoadKm),
+				valhalla.Cell(3000, tokenRoadKm),
 			}},
 		},
 	}
@@ -1307,9 +1145,7 @@ func TestChainer_starterWalkCarriesTheRoutedShape(t *testing.T) {
 	if len(coords) != 4 {
 		t.Fatalf("geometry has %d points, want the 4 Valhalla routed: %v", len(coords), coords)
 	}
-	// Endpoints are Valhalla's, not the request origin (37.7, -122.4) or the
-	// graph node (37.71, -122.39): the line starts and ends where the timing
-	// actually started and ended.
+
 	if coords[0][0] != -122.4002 || coords[0][1] != 37.7001 {
 		t.Errorf("first point = %v, want Valhalla's snapped origin [-122.4002 37.7001]", coords[0])
 	}
@@ -1318,9 +1154,6 @@ func TestChainer_starterWalkCarriesTheRoutedShape(t *testing.T) {
 	}
 }
 
-// Only the starter station gets a route. Every other station's access time
-// comes from the matrix and none of them need geometry: they are reached by
-// riding, and their egress isochrones already say what that buys.
 func TestChainer_onlyTheStarterStationIsRouted(t *testing.T) {
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
@@ -1342,8 +1175,7 @@ func TestChainer_onlyTheStarterStationIsRouted(t *testing.T) {
 	if len(routes) != 1 {
 		t.Fatalf("Route calls = %d, want exactly 1", len(routes))
 	}
-	// Asked from the request's own origin and to the graph node's coordinates:
-	// the two ends of the leg the matrix timed.
+
 	if routes[0].Origin != (valhalla.LatLng{Lat: 37.7, Lng: -122.4}) {
 		t.Errorf("route origin = %v, want the request origin", routes[0].Origin)
 	}
@@ -1355,13 +1187,6 @@ func TestChainer_onlyTheStarterStationIsRouted(t *testing.T) {
 	}
 }
 
-// A plot that reached no station on foot has no walking leg to draw, and asking
-// Valhalla to route to nowhere would be a request with no destination.
-//
-// This is also the only shape that case takes. Every station in the accounting
-// was reached from some station walked to from the origin, and that station's
-// own remaining budget is the largest of any it reaches — so a plot with any
-// reachable station at all has a walked-to one among them.
 func TestChainer_noReachedStation_noStarterWalk(t *testing.T) {
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
@@ -1387,11 +1212,6 @@ func TestChainer_noReachedStation_noStarterWalk(t *testing.T) {
 	}
 }
 
-// The starter is the shortest walk, and whole-minute ties are broken by slug so
-// the same plot names the same station every time. Access times are truncated
-// to minutes before the comparison, which is what makes those ties common —
-// station-b is 12 seconds nearer here and still loses, because both walks are
-// reported as 10 minutes and the slug decides.
 func TestChainer_starterIsTheShortestWalkThenTheSlug(t *testing.T) {
 	graph := &fakeGraph{
 		nodes: []transit.Node{
@@ -1404,8 +1224,8 @@ func TestChainer_starterIsTheShortestWalkThenTheSlug(t *testing.T) {
 		RouteResp:     cannedRoute(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{{
-				valhalla.Cell(612, tokenRoadKm), // station-a: 10 mins
-				valhalla.Cell(600, tokenRoadKm), // station-b: 10 mins
+				valhalla.Cell(612, tokenRoadKm),
+				valhalla.Cell(600, tokenRoadKm),
 			}},
 		},
 	}
@@ -1418,14 +1238,13 @@ func TestChainer_starterIsTheShortestWalkThenTheSlug(t *testing.T) {
 		t.Errorf("StarterWalk = %+v, want station-a on the slug tie-break", resp.Metadata.StarterWalk)
 	}
 
-	// And a station a clear minute nearer wins outright, tie-break or not.
 	fc2 := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
 		RouteResp:     cannedRoute(),
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{{
-				valhalla.Cell(660, tokenRoadKm), // station-a: 11 mins
-				valhalla.Cell(600, tokenRoadKm), // station-b: 10 mins
+				valhalla.Cell(660, tokenRoadKm),
+				valhalla.Cell(600, tokenRoadKm),
 			}},
 		},
 	}
@@ -1438,21 +1257,7 @@ func TestChainer_starterIsTheShortestWalkThenTheSlug(t *testing.T) {
 	}
 }
 
-// SPA-243: a pair Valhalla declined to route is not a station next door.
-//
-// It declines by answering nulls, which decode to a zero time beside a zero
-// distance, and taking that at face value makes a station a hundred kilometres
-// away the nearest thing in the plot: nearer than the one across the road, so
-// the access leg is drawn to it and the search is seeded with the rider already
-// standing on its platform. Both spellings of "no route" are covered, and so is
-// the third shape the same nonsense takes — a road shorter than the straight
-// line it is supposed to span, which no road is.
-//
-// Drive is where this bit. It is the only mode whose reach admits a station far
-// enough away for the routing graph not to have it at all.
 func TestChainer_matrixPairThatWasNeverRoutedIsNotAnAccessStation(t *testing.T) {
-	// far-station is some 150 km off: within a four-hour drive, and nowhere
-	// near the origin by any measure.
 	graph := &fakeGraph{
 		nodes: []transit.Node{
 			node("near-station", -122.39, 37.71),
@@ -1466,7 +1271,7 @@ func TestChainer_matrixPairThatWasNeverRoutedIsNotAnAccessStation(t *testing.T) 
 			RouteResp:     cannedRoute(),
 			MatrixResp: &valhalla.MatrixResponse{
 				SourcesToTargets: [][]valhalla.MatrixCell{{
-					valhalla.Cell(600, tokenRoadKm), // near-station: a 10-minute drive
+					valhalla.Cell(600, tokenRoadKm),
 					far,
 				}},
 			},
@@ -1499,8 +1304,6 @@ func TestChainer_matrixPairThatWasNeverRoutedIsNotAnAccessStation(t *testing.T) 
 		})
 	}
 
-	// And the rule bites only on the impossible: a genuinely long drive, stated
-	// as a genuinely long road, is still an access leg.
 	t.Run("a real drive to a distant station is kept", func(t *testing.T) {
 		resp := chainWithFarCell(t, valhalla.Cell(7200, 190.0))
 
@@ -1514,10 +1317,6 @@ func TestChainer_matrixPairThatWasNeverRoutedIsNotAnAccessStation(t *testing.T) 
 	})
 }
 
-// A station the routing graph cannot answer for is a gap in the map data, and
-// the plot is the only thing that ever notices. Dropping it silently is how
-// SPA-243 stayed invisible until it produced a visibly wrong plot, so each drop
-// names its station at a level that is on in production.
 func TestChainer_droppedMatrixPairsAreLoggedByName(t *testing.T) {
 	graph := &fakeGraph{
 		nodes: []transit.Node{
@@ -1532,8 +1331,8 @@ func TestChainer_droppedMatrixPairsAreLoggedByName(t *testing.T) {
 		MatrixResp: &valhalla.MatrixResponse{
 			SourcesToTargets: [][]valhalla.MatrixCell{{
 				valhalla.Cell(600, tokenRoadKm),
-				valhalla.MatrixCell{},  // no route found
-				valhalla.Cell(60, 0.5), // a road shorter than the line it spans
+				valhalla.MatrixCell{},
+				valhalla.Cell(60, 0.5),
 			}},
 		},
 	}
@@ -1550,15 +1349,12 @@ func TestChainer_droppedMatrixPairsAreLoggedByName(t *testing.T) {
 			t.Errorf("%s was dropped without being named in the log:\n%s", want, logged)
 		}
 	}
-	// The station that was answered for is not a drop, so it has nothing to
-	// report — a log line per station would bury the two that matter.
+
 	if strings.Contains(logged, "near-station") {
 		t.Errorf("near-station was reached and should not appear in the log:\n%s", logged)
 	}
 }
 
-// A station reached by riding is never the starter, however short the hop: the
-// walking line is the leg before boarding anything.
 func TestChainer_starterIsNeverAStationReachedByRiding(t *testing.T) {
 	graph := &fakeGraph{
 		nodes: []transit.Node{
@@ -1584,9 +1380,6 @@ func TestChainer_starterIsNeverAStationReachedByRiding(t *testing.T) {
 	}
 }
 
-// The routed leg is annotation on a surface that is already complete without
-// it. An origin dropped somewhere Valhalla cannot route from — a lake, an
-// island — must lose the line, not the plot.
 func TestChainer_routeFailureLeavesTheChainIntact(t *testing.T) {
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
@@ -1607,7 +1400,7 @@ func TestChainer_routeFailureLeavesTheChainIntact(t *testing.T) {
 	if resp.Metadata.StarterWalk != nil {
 		t.Errorf("StarterWalk = %+v, want nil after a failed route", resp.Metadata.StarterWalk)
 	}
-	// The accounting the surface rests on is untouched.
+
 	if len(resp.Metadata.ReachableStations) != 2 {
 		t.Errorf("ReachableStations = %d, want 2", len(resp.Metadata.ReachableStations))
 	}
@@ -1616,13 +1409,6 @@ func TestChainer_routeFailureLeavesTheChainIntact(t *testing.T) {
 	}
 }
 
-// The extra call is issued alongside the egress fan-out rather than after it.
-// The fan-out is the bulk of a chain's routing work, so a route that waited for
-// it would add its own latency to every plot for nothing.
-//
-// It cannot be issued alongside the matrix, as SPA-196 supposed: which station
-// is the starter is only known once the matrix has said how long each walk
-// takes. Alongside the fan-out is the earliest it can go.
 func TestChainer_starterRouteRunsAlongsideTheEgressFanOut(t *testing.T) {
 	const stationCount = 4
 	nodes := make([]transit.Node, stationCount+1)
@@ -1648,9 +1434,6 @@ func TestChainer_starterRouteRunsAlongsideTheEgressFanOut(t *testing.T) {
 			return cannedRoute(), nil
 		},
 		IsochroneFn: func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
-			// The origin polygon precedes the matrix, so it precedes any
-			// knowledge of which station the starter is; only the fan-out is
-			// the thing the route should overlap.
 			if r.Origin.Lat == 37.7 && r.Origin.Lng == -122.4 {
 				return cannedIso(), nil
 			}
@@ -1689,9 +1472,6 @@ func transitAccessClient(accessSecs int) *valhalla.StubClient {
 	}
 }
 
-// Every Valid mode has to have a costing, or a message the API now accepts
-// (SPA-248) fails here as ErrInvalidMode. The mapping is asserted rather than
-// inferred so a fifth mode cannot land in TravelModes with no row in `modes`.
 func TestChainer_everyValidModeHasACosting(t *testing.T) {
 	want := map[transit.TravelMode]valhalla.Costing{
 		transit.TravelModeWalk:    valhalla.CostingPedestrian,
@@ -1725,8 +1505,6 @@ func TestChainer_everyValidModeHasACosting(t *testing.T) {
 	}
 }
 
-// Transit access times come from pairwise /route, never Matrix. Domain
-// "transit" maps to costing=multimodal, not costing=transit (SPA-246).
 func TestChainer_transitAccessUsesPairwiseRouteNotMatrix(t *testing.T) {
 	fc := transitAccessClient(600)
 	resp, err := newChainer(fc, newTestGraph()).Chain(context.Background(), req(90, transit.TravelModeTransit))
@@ -1761,10 +1539,6 @@ func TestChainer_transitAccessUsesPairwiseRouteNotMatrix(t *testing.T) {
 	}
 }
 
-// A 400 from a pairwise access /route drops that station the way a null Matrix
-// cell does. Failing the chain would turn "no transit near this station" into
-// a failed job, which is the wrong split: the origin polygon is still a
-// correct answer.
 func TestChainer_transitRoute400DropsThatStation(t *testing.T) {
 	stationB := node("station-b", -122.41, 37.69)
 	graph := &fakeGraph{nodes: []transit.Node{
@@ -1819,13 +1593,10 @@ func TestChainer_transitRouteRateLimitFailsTheChain(t *testing.T) {
 	}
 }
 
-// 40 km/h × 90 min / 1.4 detour ≈ 43 km of b-line. A station 50 km out is
-// outside that, even though walk/bike's 200 km matrix b-line would have
-// admitted it under a large enough budget.
 func TestChainer_transitReachFollowsBlendedSpeedNotThePedestrianBLine(t *testing.T) {
 	graph := &fakeGraph{nodes: []transit.Node{
 		node("station-near", -122.39, 37.71),
-		// ~50 km north: 0.45° of latitude.
+
 		node("station-50km", -122.40, 38.15),
 	}}
 	fc := transitAccessClient(600)
@@ -1839,7 +1610,7 @@ func TestChainer_transitReachFollowsBlendedSpeedNotThePedestrianBLine(t *testing
 			accessDests++
 		}
 	}
-	// Pairwise access plus the starter walk, all to the nearby station.
+
 	if accessDests < 1 {
 		t.Fatal("expected a route to the nearby station")
 	}
@@ -1850,14 +1621,10 @@ func TestChainer_transitReachFollowsBlendedSpeedNotThePedestrianBLine(t *testing
 	}
 }
 
-// Pairwise /route is unbounded in the number of stations, so the 80 km cap is
-// what keeps a huge budget from asking Valhalla about every station on the
-// graph. The 200 km pedestrian matrix b-line is explicitly not the target list
-// (SPA-246).
 func TestChainer_transitReachCappedAt80kmNotThePedestrianBLine(t *testing.T) {
 	graph := &fakeGraph{nodes: []transit.Node{
 		node("station-near", -122.39, 37.71),
-		// ~90 km north: past the 80 km transit cap, inside the 200 km other b-line.
+
 		node("station-90km", -122.40, 38.51),
 	}}
 	fc := transitAccessClient(600)

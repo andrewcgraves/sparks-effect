@@ -12,34 +12,6 @@ import (
 	"time"
 )
 
-// The HTTP contract this client speaks. sparks-effect-api owns the other half.
-// The two repositories share no Go code, so the paths and bodies are the
-// agreement — the same shape of contract as the queued message, just over
-// HTTPS instead of AMQP, and authenticated with a shared bearer token rather
-// than by being on a private broker.
-//
-//	GET  /api/internal/worker
-//	     204 with a valid token. The startup ping; a 401 here means the
-//	     token is wrong, which will never recover, so the process refuses
-//	     to boot rather than consuming jobs it cannot record.
-//
-//	POST /api/internal/routing-jobs/{id}/running
-//	     204, or 404 which this client reports as ErrJobNotFound. The API
-//	     treats a terminal job the same as a missing one: a late redelivery
-//	     must not drag a finished job back to running.
-//
-//	POST /api/internal/routing-jobs/{id}/succeeded
-//	     body {"result": <json>}. 204 or 404.
-//
-//	POST /api/internal/routing-jobs/{id}/failed
-//	     body {"error": "<message>"}. 204 or 404.
-//
-//	POST /api/internal/isochrone-cache/lookup
-//	     body {"keys": [<IsochroneKey>...]}. 200 {"entries":[{"key":...,"geometry":...}]}
-//
-//	POST /api/internal/isochrone-cache
-//	     body {"entries": [<CachedIsochrone>...]}. 204. Conflicts are left
-//	     alone, matching the ON CONFLICT DO NOTHING the SQL used to do.
 const (
 	pathWorkerReady  = "/api/internal/worker"
 	pathJobRunning   = "/api/internal/routing-jobs/%s/running"
@@ -49,13 +21,8 @@ const (
 	pathCachePut     = "/api/internal/isochrone-cache"
 )
 
-// DefaultTimeout bounds one call to the API. Job transitions are small; a
-// cache put of many polygons is the largest body this client sends, and thirty
-// seconds is long enough for that without holding a job slot indefinitely
-// against an API that is not answering.
 const DefaultTimeout = 30 * time.Second
 
-// Client is an HTTP-backed RoutingJobStore and IsochroneCache over the API.
 type Client struct {
 	baseURL    string
 	token      string
@@ -67,12 +34,6 @@ var (
 	_ IsochroneCache  = (*Client)(nil)
 )
 
-// Connect builds a Client against apiURL and verifies the token is accepted.
-//
-// The ping is what used to be pool.Ping: a worker that cannot record results
-// should not start consuming, because it would run indefinitely doing work it
-// has nowhere to put. A missing or rejected token is the same class of
-// failure as a DATABASE_URL that would not authenticate — refuse to boot.
 func Connect(ctx context.Context, apiURL, token string, timeout time.Duration) (*Client, error) {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
@@ -127,35 +88,14 @@ func (c *Client) ping(ctx context.Context) error {
 	}
 }
 
-// MarkRunning moves a job to running.
-//
-// It is the one transition that is allowed to be a no-op. A job redelivered
-// after a crash is already running, and refusing to re-mark it would fail work
-// that is otherwise perfectly recoverable — so the API matches any status
-// short of terminal rather than requiring `queued`. Terminal statuses are
-// excluded so a late redelivery cannot drag a finished job backwards, and
-// that case arrives here as ErrJobNotFound, the same as a missing row.
 func (c *Client) MarkRunning(ctx context.Context, jobID string) error {
 	return c.transition(ctx, fmt.Sprintf(pathJobRunning, url.PathEscape(jobID)), jobID, nil)
 }
 
-// MarkSucceeded records the computed isochrone and completes the job.
-//
-// This is the write the consumer acks behind: until it lands, a crash
-// redelivers the message and the chain runs again. That is safe because the
-// write is an unconditional overwrite keyed by id — recomputing an isochrone
-// over an immutable graph produces the same answer, so a second write is
-// indistinguishable from the first.
 func (c *Client) MarkSucceeded(ctx context.Context, jobID string, result json.RawMessage) error {
 	return c.transition(ctx, fmt.Sprintf(pathJobSucceeded, url.PathEscape(jobID)), jobID, jobSucceededBody{Result: result})
 }
 
-// MarkFailed records why a job cannot be completed.
-//
-// It is what stops a client polling forever, so it is called on every path that
-// abandons a job — a message the worker cannot read, a request Valhalla
-// refuses, retries exhausted. The message is stored as given; callers are
-// expected to have wrapped it into something a person can act on.
 func (c *Client) MarkFailed(ctx context.Context, jobID, message string) error {
 	return c.transition(ctx, fmt.Sprintf(pathJobFailed, url.PathEscape(jobID)), jobID, jobFailedBody{Error: message})
 }
@@ -201,12 +141,6 @@ type cachePutRequest struct {
 	Entries []CachedIsochrone `json:"entries"`
 }
 
-// Get looks every key up in one round trip.
-//
-// A key with no row is simply absent from the map. The keys it returns are
-// the caller's own, echoed back by the API rather than re-read off storage,
-// so a caller that spelled a uuid with different casing still finds the hit
-// in its own map.
 func (c *Client) Get(ctx context.Context, keys []IsochroneKey) (map[IsochroneKey]json.RawMessage, error) {
 	found := make(map[IsochroneKey]json.RawMessage, len(keys))
 	if len(keys) == 0 {
@@ -232,12 +166,6 @@ func (c *Client) Get(ctx context.Context, keys []IsochroneKey) (map[IsochroneKey
 	return found, nil
 }
 
-// Put writes the batch in one round trip.
-//
-// An entry whose key is already present is left alone: a conflict means
-// another worker chained over the same graph concurrently and computed the
-// same inputs into the same polygon. Overwriting it would churn the row
-// to no effect.
 func (c *Client) Put(ctx context.Context, entries []CachedIsochrone) error {
 	if len(entries) == 0 {
 		return nil

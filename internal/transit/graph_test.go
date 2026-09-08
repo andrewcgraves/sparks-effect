@@ -22,16 +22,10 @@ func edge(from, to string, secs int) transit.Edge {
 	return transit.Edge{FromSlug: from, ToSlug: to, Seconds: secs}
 }
 
-// from names one access station at the cost of walking to it, which is what a
-// search is seeded with.
 func from(slug string, accessSecs int) map[string]int {
 	return map[string]int{slug: accessSecs}
 }
 
-// Boarding wait is charged once, at the point of boarding, and not again per
-// hop: a rider waits for the service they board and then rides through
-// everything after. Charging it per hop would understate reachability badly on
-// any service with more than a couple of stops.
 func TestSearch_chargesWaitOnceAcrossManyHops(t *testing.T) {
 	g := graph(svc("express", 300,
 		edge("a", "b", 600),
@@ -54,9 +48,6 @@ func TestSearch_chargesWaitOnceAcrossManyHops(t *testing.T) {
 	}
 }
 
-// Two services sharing a node key are connected, because every service's edges
-// are pooled into one adjacency map. That pooling is the whole of interchange
-// in this system — there is no transfer edge type and no transfer table.
 func TestSearch_interchangesAcrossServicesSharingANode(t *testing.T) {
 	g := graph(
 		svc("north-line", 120, edge("a", "junction", 600)),
@@ -67,8 +58,7 @@ func TestSearch_interchangesAcrossServicesSharingANode(t *testing.T) {
 	if !ok {
 		t.Fatal("Search did not reach z through the shared node")
 	}
-	// 1500 s of riding plus the 120 s wait paid to board first. The second
-	// boarding is not charged, matching the single-wait model above.
+
 	if got.TotalSecs != 1620 {
 		t.Errorf("TotalSecs = %d, want 1620 (1500 s riding, one 120 s wait)", got.TotalSecs)
 	}
@@ -83,14 +73,11 @@ func TestSearch_interchangesAcrossServicesSharingANode(t *testing.T) {
 	}
 }
 
-// The quantity minimised is the access leg plus vehicle time plus one boarding
-// wait — not vehicle time alone. A nominally faster service that leaves less
-// often can be the slower way to arrive, and the search has to see that.
 func TestSearch_minimisesRideTimePlusWait(t *testing.T) {
 	g := graph(
-		// Quick ride, long wait: 600 + 1800 = 2400.
+
 		svc("infrequent-express", 1800, edge("a", "z", 600)),
-		// Slower ride, short wait: 1200 + 120 = 1320.
+
 		svc("frequent-local", 120, edge("a", "z", 1200)),
 	)
 
@@ -110,24 +97,12 @@ func TestSearch_reportsUnreachableNodesByOmission(t *testing.T) {
 	if _, ok := reached["elsewhere"]; ok {
 		t.Error("Search reached a node with no edges into it")
 	}
-	// Edges are directed, so the reverse of a one-way edge is not a path.
+
 	if _, ok := g.Search(from("b", 0))["a"]; ok {
 		t.Error("Search rode b -> a, but edges are directed")
 	}
 }
 
-// A bidirectional hop is two independent edges, and the API is free to give
-// them different durations: since SPA-245 it compiles a segment's optional
-// reverse_run_seconds into the reverse edge rather than mirroring the forward
-// run time. CA HSR has two such hops — Gilroy<->Merced over Pacheco Pass and
-// Bakersfield<->Palmdale over Tehachapi — where the northbound run is the
-// faster one.
-//
-// Nothing here has to change to honour that; the search already keys its
-// adjacency on Edge.FromSlug and never consults a pair's opposite. This pins
-// that, so a future pass that "simplifies" the pooling by treating a pair as
-// one undirected hop fails here rather than silently shifting every isochrone
-// that crosses one of those two hops.
 func TestSearch_honoursDifferentDurationsEachWayAcrossOnePair(t *testing.T) {
 	g := graph(svc("ca-hsr-local", 0,
 		edge("gilroy", "merced", 3140),
@@ -154,16 +129,9 @@ func TestSearch_honoursDifferentDurationsEachWayAcrossOnePair(t *testing.T) {
 	}
 }
 
-// The asymmetry survives a corridor rather than only a single hop: a journey
-// end to end is the sum of the edges actually ridden, so the two directions of
-// a line carrying one asymmetric hop arrive at different totals. This is the
-// shape the isochrones are plotted from, and the reason the departure surface
-// drawn from one terminus can no longer be read as the arrival surface of the
-// other.
 func TestSearch_corridorTotalsDifferByDirection(t *testing.T) {
 	g := graph(svc("ca-hsr-local", 0,
-		// Symmetric either side of the mountain hop, so the whole of the
-		// difference below comes from that one span.
+
 		edge("sf", "gilroy", 1200), edge("gilroy", "sf", 1200),
 		edge("gilroy", "merced", 3140), edge("merced", "gilroy", 3030),
 		edge("merced", "fresno", 900), edge("fresno", "merced", 900),
@@ -180,10 +148,6 @@ func TestSearch_corridorTotalsDifferByDirection(t *testing.T) {
 	}
 }
 
-// Dwell rides on the edge, so the two directions of one pair report their own.
-// The chainer subtracts HopDwellS off HopSecs to say how long the vehicle stood
-// at a station, and reading the forward edge's dwell against a reverse hop
-// would misreport that on exactly the hops SPA-245 made asymmetric.
 func TestSearch_carriesDwellPerDirectionOfAPair(t *testing.T) {
 	g := graph(svc("ca-hsr-local", 0,
 		transit.Edge{FromSlug: "gilroy", ToSlug: "merced", Seconds: 3140, DwellS: 90},
@@ -202,9 +166,6 @@ func TestSearch_carriesDwellPerDirectionOfAPair(t *testing.T) {
 	}
 }
 
-// An access station is reached at the cost of walking to it and nothing more.
-// The chainer relies on this for the station a rider walks straight to and does
-// not ride from.
 func TestSearch_accessStationCostsOnlyItsAccessLeg(t *testing.T) {
 	g := graph(svc("line", 300, edge("a", "b", 600)))
 
@@ -223,9 +184,6 @@ func TestSearch_accessStationCostsOnlyItsAccessLeg(t *testing.T) {
 	}
 }
 
-// One search, many access stations: each node is reported against whichever
-// access station leaves it cheapest, and the predecessor chain leads back to
-// that station rather than to whichever was seeded first.
 func TestSearch_picksTheCheapestAccessStationPerNode(t *testing.T) {
 	g := graph(
 		svc("slow-from-near", 0, edge("near", "z", 3000)),
@@ -241,10 +199,6 @@ func TestSearch_picksTheCheapestAccessStationPerNode(t *testing.T) {
 	}
 }
 
-// Riding through an access station beats walking to it and boarding there when
-// the wait avoided is worth more than the extra riding — the case a per-pair
-// search covered by starting again at every access station, and the reason a
-// label here is a node together with whether the rider has boarded yet.
 func TestSearch_ridesThroughAnAccessStationRatherThanPayingItsWait(t *testing.T) {
 	g := graph(svc("line", 1200,
 		edge("a", "b", 300),
@@ -252,9 +206,7 @@ func TestSearch_ridesThroughAnAccessStationRatherThanPayingItsWait(t *testing.T)
 	))
 
 	got := g.Search(map[string]int{"a": 0, "b": 60})["z"]
-	// Boarding at b costs 60 + 1200 + 600 = 1860. Boarding at a and staying on
-	// costs 0 + 1200 + 300 + 600 = 2100 — worse. But b itself is reported at
-	// the 60 s walk, not at the 1500 s ride, so the two labels differ.
+
 	if got.TotalSecs != 1860 {
 		t.Errorf("TotalSecs = %d, want 1860 (board at b)", got.TotalSecs)
 	}
@@ -266,8 +218,6 @@ func TestSearch_ridesThroughAnAccessStationRatherThanPayingItsWait(t *testing.T)
 	}
 }
 
-// Dwell rides along on the hop it belongs to, so a consumer can say how long
-// the vehicle stands at the node it arrived at.
 func TestSearch_carriesPerHopDwell(t *testing.T) {
 	g := graph(svc("line", 0,
 		transit.Edge{FromSlug: "a", ToSlug: "b", Seconds: 645, DwellS: 45},
@@ -279,9 +229,6 @@ func TestSearch_carriesPerHopDwell(t *testing.T) {
 	}
 }
 
-// The same query settles the same way twice. Predecessors decide the shape of
-// the tree drawn from them, so a tie resolved by map iteration order would
-// redraw the graph between two runs of one query.
 func TestSearch_isDeterministicAcrossRuns(t *testing.T) {
 	g := graph(
 		svc("west", 0, edge("west-end", "z", 600)),
@@ -313,10 +260,6 @@ func TestNodes_carriesPositions(t *testing.T) {
 	}
 }
 
-// A node with a routing anchor (SPA-234) reports the anchor as its position,
-// not its real Lat/Lng: every routing call — egress isochrone, matrix,
-// route — needs a point Valhalla's graph can actually reach, and Node carries
-// nothing that would need the real one instead.
 func TestNodes_reportsRoutingAnchorWhenSet(t *testing.T) {
 	anchorLat, anchorLng := 36.0545, -115.1706
 	g := transit.CompiledGraph{Graph: &transit.TransitGraph{
@@ -343,8 +286,6 @@ func TestNodes_reportsRoutingAnchorWhenSet(t *testing.T) {
 	}
 }
 
-// HasWait is what the chainer reports as its wait model, in place of the
-// scenario slug the API used to special-case on.
 func TestHasWait(t *testing.T) {
 	if graph(svc("a", 0, edge("x", "y", 60)), svc("b", 0, edge("y", "z", 60))).HasWait() {
 		t.Error("HasWait() = true for a graph whose services all declare zero wait")
@@ -354,9 +295,6 @@ func TestHasWait(t *testing.T) {
 	}
 }
 
-// A nil graph is what a malformed message decodes to, and it must answer
-// harmlessly rather than panicking — the decoder rejects it, and this is the
-// belt to that braces.
 func TestNilGraphIsHarmless(t *testing.T) {
 	var g transit.CompiledGraph
 
@@ -371,8 +309,6 @@ func TestNilGraphIsHarmless(t *testing.T) {
 	}
 }
 
-// Merge is carried but never read, so it has to survive decoding without the
-// worker modelling any of the four types behind it.
 func TestMergeIsCarriedButNotModelled(t *testing.T) {
 	const body = `{"services":[],"merge":{"clusters":[{"key":"a"}],"near_misses":[]},"nodes":[]}`
 
@@ -392,9 +328,6 @@ func TestMergeIsCarriedButNotModelled(t *testing.T) {
 	}
 }
 
-// Dwell decodes as zero on a graph compiled before the API reported it, which
-// is what every persisted graph looks like until its scenario is compiled
-// again. Absent and zero are the same thing on the wire, deliberately.
 func TestEdgeWithoutDwellDecodesAsZero(t *testing.T) {
 	var e transit.Edge
 	if err := json.Unmarshal([]byte(`{"from_slug":"a","to_slug":"b","seconds":600}`), &e); err != nil {
@@ -405,20 +338,6 @@ func TestEdgeWithoutDwellDecodesAsZero(t *testing.T) {
 	}
 }
 
-// --- Equivalence with the per-pair search this replaced -------------------
-//
-// The search behind every isochrone in the product changed shape. What must
-// not change is which stations a rider reaches and how much budget they have
-// left on arrival, and that is what these cases hold to: the multi-source pass
-// is checked against an independent transcription of the per-pair algorithm it
-// replaced, over graphs built to provoke the disagreements worth having.
-//
-// The reference below is the old implementation, kept here rather than in the
-// package so it cannot drift into sharing code with the thing it is checking.
-
-// referenceTravelTime is the pairwise Dijkstra CompiledGraph.TravelTimeBetween
-// used to run, transcribed. Wait is charged on the first hop out of the source
-// and carried unchanged after.
 func referenceTravelTime(g *transit.TransitGraph, src, dst string) (secs, wait int, ok bool) {
 	if src == dst {
 		return 0, 0, true
@@ -464,9 +383,6 @@ func referenceTravelTime(g *transit.TransitGraph, src, dst string) (secs, wait i
 	return 0, 0, false
 }
 
-// referenceReach is how the chainer used to work the answer out: every
-// reachable access station tried against every node, keeping whichever left the
-// most budget.
 func referenceReach(g *transit.TransitGraph, nodes []string, accessSecs map[string]int) map[string]int {
 	out := make(map[string]int)
 	for _, n := range nodes {
@@ -595,10 +511,6 @@ func TestSearch_matchesThePerPairSearchItReplaced(t *testing.T) {
 	}
 }
 
-// The hand-written cases above cover the disagreements that were thought of.
-// This one covers the ones that were not: random graphs, from a fixed seed so a
-// failure is reproducible, exercising several services, both directions, and
-// access sets ranging from one station to most of the graph.
 func TestSearch_matchesThePerPairSearchOnRandomGraphs(t *testing.T) {
 	rng := rand.New(rand.NewSource(223))
 

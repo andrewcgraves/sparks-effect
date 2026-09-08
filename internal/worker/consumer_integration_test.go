@@ -19,26 +19,18 @@ import (
 )
 
 const (
-	testQueue      = "test.routing.jobs"
-	testDeadLetter = "test.routing.jobs.dead"
-
-	// The ids the golden fixture carries. Using them rather than fresh ones
-	// means the row the worker updates is the row the published message names,
-	// which is the thing being tested.
+	testQueue       = "test.routing.jobs"
+	testDeadLetter  = "test.routing.jobs.dead"
 	goldenJobID     = "6f9619ff-8b86-d011-b42d-00c04fc964ff"
 	goldenCompileID = "0f3b7c2a-4d1e-4a5b-9c8d-2e6f1a0b3c4d"
 )
 
-// harness is one worker wired to a real broker and the worker HTTP contract,
-// with a routing client the test controls.
 type harness struct {
-	api    *testsupport.FakeAPI
-	store  *store.Client
-	ch     *amqp.Channel
-	client valhalla.Client
-	url    string
-	// tilesetAt is what main reads off the routing server once at startup and
-	// stamps on every cache row. Fixed here so a test can assert it landed.
+	api       *testsupport.FakeAPI
+	store     *store.Client
+	ch        *amqp.Channel
+	client    valhalla.Client
+	url       string
 	tilesetAt time.Time
 }
 
@@ -57,16 +49,9 @@ func newHarness(t *testing.T, client valhalla.Client) *harness {
 	}
 }
 
-// run starts a consumer and returns handles to stop it two ways.
-//
-// stop is the graceful path: cancel, wait for the delivery in hand to settle,
-// close. kill is the crash: drop the broker connection immediately, without
-// waiting for anything to settle, which is what leaves a delivery unacked and
-// makes the broker redeliver it.
 func (h *harness) run(t *testing.T, maxRetries int) (stop, kill func()) {
 	t.Helper()
-	// One client in both roles, exactly as main wires it: results are written
-	// through it and egress polygons are reused through it.
+
 	cache := isochrone.EgressCache{Store: h.store, TilesetAt: h.tilesetAt}
 	handler := worker.NewHandler(h.store, h.client, valhalla.DefaultLimits(), cache, logger.Discard())
 	consumer := worker.NewConsumer(h.url, testQueue, testDeadLetter, maxRetries, handler, logger.Discard())
@@ -92,9 +77,7 @@ func (h *harness) run(t *testing.T, maxRetries int) (stop, kill func()) {
 	kill = func() {
 		once.Do(func() {
 			cancel()
-			// Deliberately no wg.Wait(): the consumer may be blocked inside a
-			// routing call, and waiting for it would be waiting for the very
-			// thing this is simulating the death of.
+
 			consumer.Close()
 		})
 	}
@@ -109,9 +92,6 @@ func (h *harness) waitForStatus(t *testing.T, jobID, want string) {
 	})
 }
 
-// The headline acceptance criterion: a message the API published is consumed,
-// computed, and its row driven queued → running → succeeded with the chained
-// result attached.
 func TestEndToEnd_publishedJobIsComputedAndRecorded(t *testing.T) {
 	h := newHarness(t, valhalla.NewSyntheticClient())
 	h.api.SeedRoutingJob(goldenJobID)
@@ -147,7 +127,6 @@ func TestEndToEnd_publishedJobIsComputedAndRecorded(t *testing.T) {
 		t.Errorf("compile_job_id = %q, want %q", parsed.Metadata.CompileJobID, goldenCompileID)
 	}
 
-	// Acked, so nothing is left behind on either queue.
 	testsupport.WaitFor(t, 5*time.Second, "the queue to drain", func() bool {
 		return testsupport.QueueDepth(t, h.ch, testQueue) == 0
 	})
@@ -156,9 +135,6 @@ func TestEndToEnd_publishedJobIsComputedAndRecorded(t *testing.T) {
 	}
 }
 
-// countingClient counts the isochrone calls that reach the routing server. It
-// wraps a real client rather than replacing one because what a cached chain has
-// to produce is the same answer, not merely fewer calls.
 type countingClient struct {
 	valhalla.Client
 	isochroneCalls atomic.Int32
@@ -169,10 +145,6 @@ func (c *countingClient) Isochrone(ctx context.Context, req valhalla.IsochroneRe
 	return c.Client.Isochrone(ctx, req)
 }
 
-// Reuse, end to end: two routing jobs over one publication, through a real
-// broker and the worker HTTP contract. The second makes the single call the first one's
-// cache could not save it — the origin polygon, which starts where the user
-// clicked and is nobody else's to share.
 func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
 	const secondJobID = "7a0620ff-8b86-d011-b42d-00c04fc964ff"
 
@@ -183,10 +155,6 @@ func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
 	stop, _ := h.run(t, 3)
 	defer stop()
 
-	// The golden fixture's 45-minute budget only reaches "north" on foot —
-	// walk-only, so it caches nothing since SPA-188. Widened here so "south"
-	// is reached by riding svc-express from north, giving this test an
-	// egress polygon actually worth caching.
 	widerBudget := mutateGolden(t, func(m map[string]any) { m["budget_mins"] = 90 })
 	testsupport.Publish(t, h.ch, testQueue, widerBudget)
 	h.waitForStatus(t, goldenJobID, store.StatusSucceeded)
@@ -196,7 +164,7 @@ func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
 	if cached == 0 {
 		t.Fatal("the completed job cached no egress polygons")
 	}
-	// Everything but the origin call should have left a row behind.
+
 	if want := int(coldCalls) - 1; cached != want {
 		t.Errorf("cached %d polygons against %d isochrone calls, want %d (all but the origin)", cached, coldCalls, want)
 	}
@@ -206,8 +174,6 @@ func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
 		}
 	}
 
-	// A second job: same publication, same click, same budget — a different
-	// user asking the same question.
 	h.api.SeedRoutingJob(secondJobID)
 	client.isochroneCalls.Store(0)
 	testsupport.Publish(t, h.ch, testQueue,
@@ -225,7 +191,6 @@ func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
 		t.Errorf("warm job made %d isochrone calls, want 1 (the origin)", warmCalls)
 	}
 
-	// Cheaper, and the same answer.
 	_, _, coldResult := h.api.JobStatus(t, goldenJobID)
 	_, _, warmResult := h.api.JobStatus(t, secondJobID)
 	if len(features(t, coldResult)) != len(features(t, warmResult)) {
@@ -233,7 +198,6 @@ func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
 			len(features(t, warmResult)), len(features(t, coldResult)))
 	}
 
-	// Nothing new to write the second time round.
 	if got := h.api.IsochroneCacheCount(goldenCompileID); got != cached {
 		t.Errorf("cache holds %d rows after the warm job, want the %d the cold one left", got, cached)
 	}
@@ -250,8 +214,6 @@ func features(t *testing.T, result []byte) []any {
 	return parsed.Features
 }
 
-// A permanent failure marks the job failed and does not requeue. Redelivering
-// it would loop forever against a server with room for one chain at a time.
 func TestEndToEnd_permanentFailureFailsTheJobAndDoesNotRequeue(t *testing.T) {
 	h := newHarness(t, valhalla.NewSyntheticClient())
 	h.api.SeedRoutingJob(goldenJobID)
@@ -268,9 +230,6 @@ func TestEndToEnd_permanentFailureFailsTheJobAndDoesNotRequeue(t *testing.T) {
 		t.Error("job failed with no message; a caller has nothing to read")
 	}
 
-	// Give a requeue time to show up if the classification were wrong. Neither
-	// queue should ever hold anything: a permanent failure is acked outright,
-	// not dead-lettered.
 	time.Sleep(500 * time.Millisecond)
 	if got := testsupport.QueueDepth(t, h.ch, testQueue); got != 0 {
 		t.Errorf("queue depth = %d, want 0 — a permanent failure must not requeue", got)
@@ -280,9 +239,6 @@ func TestEndToEnd_permanentFailureFailsTheJobAndDoesNotRequeue(t *testing.T) {
 	}
 }
 
-// A transient failure is retried a bounded number of times, then dead-lettered
-// and the job marked failed — so the poller stops waiting rather than watching
-// a spinner forever.
 func TestEndToEnd_transientFailureRetriesThenDeadLetters(t *testing.T) {
 	const maxRetries = 2
 
@@ -303,8 +259,6 @@ func TestEndToEnd_transientFailureRetriesThenDeadLetters(t *testing.T) {
 	testsupport.Publish(t, h.ch, testQueue, goldenMessage(t))
 	h.waitForStatus(t, goldenJobID, store.StatusFailed)
 
-	// The first delivery plus maxRetries redeliveries. More would mean the
-	// bound is not being enforced; fewer, that it is too tight.
 	testsupport.WaitFor(t, 5*time.Second, "the message to reach the dead-letter queue", func() bool {
 		return testsupport.QueueDepth(t, h.ch, testDeadLetter) == 1
 	})
@@ -321,9 +275,6 @@ func TestEndToEnd_transientFailureRetriesThenDeadLetters(t *testing.T) {
 	}
 }
 
-// A transient failure that clears before the bound is reached completes
-// normally — the retry path has to be able to succeed, not just to give up
-// tidily.
 func TestEndToEnd_transientFailureThatRecoversSucceeds(t *testing.T) {
 	synthetic := valhalla.NewSyntheticClient()
 	var attempts atomic.Int32
@@ -347,22 +298,10 @@ func TestEndToEnd_transientFailureThatRecoversSucceeds(t *testing.T) {
 	h.waitForStatus(t, goldenJobID, store.StatusSucceeded)
 }
 
-// Killing the worker mid-chain redelivers the job rather than losing it.
-//
-// The ack happens only after the row is written, so a delivery interrupted
-// before that is still unacknowledged when the connection drops — and the
-// broker gives it to the next consumer. This is the crash path, distinct from
-// the worker's own bounded retry: nothing here reaches the requeue logic,
-// because the first worker never gets to decide anything.
-//
-// The first worker is stopped while it is inside a routing call that has not
-// returned. The second, with a working client, has to finish the job.
 func TestEndToEnd_workerKilledMidChainRedelivers(t *testing.T) {
 	h := newHarness(t, nil)
 	h.api.SeedRoutingJob(goldenJobID)
 
-	// blocked is released only at the very end, so the first worker is still
-	// genuinely inside the call when its connection is dropped.
 	blocked := make(chan struct{})
 	defer close(blocked)
 	entered := make(chan struct{}, 1)
@@ -387,20 +326,16 @@ func TestEndToEnd_workerKilledMidChainRedelivers(t *testing.T) {
 		t.Fatal("the first worker never started a routing call")
 	}
 
-	// The delivery is in flight and unacknowledged. Kill the connection under
-	// it — the first worker never acks, nacks, or republishes anything.
 	killFirst()
 
 	if status, _, _ := h.api.JobStatus(t, goldenJobID); status == store.StatusSucceeded {
 		t.Fatal("the job completed before the worker was killed; the test proves nothing")
 	}
 
-	// The broker must have put the unacked message back.
 	testsupport.WaitFor(t, 15*time.Second, "the unacked message to be redelivered to the queue", func() bool {
 		return testsupport.QueueDepth(t, h.ch, testQueue) == 1
 	})
 
-	// A second worker, with a client that works, picks it up and finishes it.
 	h.client = valhalla.NewSyntheticClient()
 	stopSecond, _ := h.run(t, 3)
 	defer stopSecond()
@@ -416,12 +351,8 @@ func TestEndToEnd_workerKilledMidChainRedelivers(t *testing.T) {
 	}
 }
 
-// A message naming a routing job with no row is acked and discarded: there is
-// nothing to write an answer to, so redelivering it forever would achieve
-// nothing but occupying the queue.
 func TestEndToEnd_messageForAMissingJobIsDiscarded(t *testing.T) {
 	h := newHarness(t, valhalla.NewSyntheticClient())
-	// Deliberately not seeded.
 
 	stop, _ := h.run(t, 3)
 	defer stop()

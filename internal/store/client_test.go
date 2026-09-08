@@ -29,8 +29,6 @@ func connect(t *testing.T, api *testsupport.FakeAPI) *store.Client {
 	return c
 }
 
-// The lifecycle the API polls: queued, then running, then succeeded with the
-// result attached.
 func TestRoutingJobLifecycle(t *testing.T) {
 	api := testsupport.StartFakeAPI(t)
 	api.SeedRoutingJob(testJobID)
@@ -69,9 +67,6 @@ func TestRoutingJobLifecycle(t *testing.T) {
 	}
 }
 
-// Redelivery after a crash re-marks a job that is already running. Refusing
-// that would fail work that is otherwise perfectly recoverable, so MarkRunning
-// is deliberately not conditional on the row being queued.
 func TestMarkRunningIsIdempotent(t *testing.T) {
 	api := testsupport.StartFakeAPI(t)
 	api.SeedRoutingJob(testJobID)
@@ -86,8 +81,6 @@ func TestMarkRunningIsIdempotent(t *testing.T) {
 	}
 }
 
-// A late redelivery must not drag a finished job backwards into running, or a
-// client that already saw its answer would start polling again.
 func TestMarkRunningWillNotReopenATerminalJob(t *testing.T) {
 	api := testsupport.StartFakeAPI(t)
 	client := connect(t, api)
@@ -117,9 +110,6 @@ func TestMarkRunningWillNotReopenATerminalJob(t *testing.T) {
 	}
 }
 
-// Recomputing over an immutable graph gives the same answer, which is what
-// makes acking after the write safe: a redelivered job overwrites its own
-// result rather than conflicting with it.
 func TestMarkSucceededOverwrites(t *testing.T) {
 	api := testsupport.StartFakeAPI(t)
 	api.SeedRoutingJob(testJobID)
@@ -254,10 +244,6 @@ func TestIsochroneCache_transitModeRoundTrips(t *testing.T) {
 	}
 }
 
-// A transit polygon is a function of the timetable it was computed against, so
-// two service dates are two rows and neither answers for the other. Walk, bike
-// and drive send no date at all, and keep the single row per station they had
-// (SPA-269).
 func TestIsochroneCache_serviceDateDiscriminatesTransitRows(t *testing.T) {
 	api := testsupport.StartFakeAPI(t)
 	client := connect(t, api)
@@ -457,9 +443,6 @@ func TestConnectRequiresAnAbsoluteURL(t *testing.T) {
 	}
 }
 
-// A 5xx on a job write is transient from the worker's point of view: the row
-// may well be writable on the next attempt. It must not be reported as
-// ErrJobNotFound, which the consumer treats as permanent.
 func TestServerErrorIsNotJobNotFound(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/internal/worker" {

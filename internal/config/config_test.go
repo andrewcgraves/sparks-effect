@@ -8,9 +8,6 @@ import (
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
 
-// The defaults have to be the limits the deployed container actually enforces,
-// because a limit exceeded is a 400 and a 400 is permanent — a wrong default
-// here fails jobs rather than merely slowing them down.
 func TestDefaultsMatchTheDeployedContainer(t *testing.T) {
 	cfg := config.Load()
 
@@ -24,13 +21,10 @@ func TestDefaultsMatchTheDeployedContainer(t *testing.T) {
 		t.Errorf("MaxRetries = %d, want a positive bound", cfg.MaxRetries)
 	}
 
-	// 320, not Stadia's 120: kustomize-config patches
-	// service_limits.isochrone.max_time_contour on every pod start.
 	if cfg.Limits.MaxIsoContourMins != 320 {
 		t.Errorf("MaxIsoContourMins = %d, want 320 (the patched ceiling)", cfg.Limits.MaxIsoContourMins)
 	}
-	// 2500, not Stadia's 600: matrix limits are not patched, so Valhalla's own
-	// max_matrix_location_pairs applies.
+
 	if cfg.Limits.MaxMatrixPairs != 2500 {
 		t.Errorf("MaxMatrixPairs = %d, want 2500 (Valhalla's default)", cfg.Limits.MaxMatrixPairs)
 	}
@@ -45,8 +39,6 @@ func TestDefaultsMatchTheDeployedContainer(t *testing.T) {
 	}
 }
 
-// Every limit is configuration, not a constant, because a deployment may patch
-// Valhalla differently — that is the whole reason they moved out of the code.
 func TestLimitsAreOverridable(t *testing.T) {
 	t.Setenv("VALHALLA_MAX_ISO_CONTOUR_MINS", "120")
 	t.Setenv("VALHALLA_MAX_MATRIX_PAIRS", "600")
@@ -67,9 +59,6 @@ func TestLimitsAreOverridable(t *testing.T) {
 	}
 }
 
-// A limit set to nonsense falls back rather than taking effect. Zero
-// concurrency would stall every chain forever and zero matrix pairs would send
-// an empty matrix; neither is what anyone meant by setting the variable.
 func TestNonsenseLimitsFallBackToDefaults(t *testing.T) {
 	t.Setenv("VALHALLA_MAX_CONCURRENCY", "0")
 	t.Setenv("VALHALLA_MAX_MATRIX_PAIRS", "not-a-number")
@@ -88,8 +77,6 @@ func TestNonsenseLimitsFallBackToDefaults(t *testing.T) {
 	}
 }
 
-// Zero retries is a real choice — fail on the first transient error — and has
-// to survive the parser that rejects zero everywhere else.
 func TestZeroRetriesIsRespected(t *testing.T) {
 	t.Setenv("ROUTING_MAX_RETRIES", "0")
 
@@ -98,18 +85,12 @@ func TestZeroRetriesIsRespected(t *testing.T) {
 	}
 }
 
-// An unset Valhalla URL is what selects the synthetic client, so it must stay
-// empty rather than acquiring a plausible-looking default that would be
-// dialled and fail.
 func TestValhallaURLHasNoDefault(t *testing.T) {
 	if got := config.Load().ValhallaURL; got != "" {
 		t.Errorf("ValhallaURL = %q, want empty when unset", got)
 	}
 }
 
-// The API URL and worker token have no useful defaults: a worker with nowhere
-// to record results, or one that would be rejected at the auth gate, should
-// fail at startup rather than boot into a degraded mode.
 func TestAPICredentialsHaveNoDefault(t *testing.T) {
 	if got := config.Load().APIURL; got != "" {
 		t.Errorf("APIURL = %q, want empty when unset", got)

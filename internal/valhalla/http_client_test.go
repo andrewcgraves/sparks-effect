@@ -15,9 +15,6 @@ import (
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
 
-// captureServer records the last request body it was sent, so a test can assert
-// on the JSON the client actually put on the wire rather than on the Go values
-// it was given.
 type captureServer struct {
 	*httptest.Server
 	path string
@@ -66,9 +63,6 @@ func TestIsochrone_requestShape(t *testing.T) {
 		t.Error("date_time is a multimodal option; pedestrian must not send it")
 	}
 
-	// Valhalla names the longitude field "lon"; this codebase spells it "lng"
-	// everywhere else, so the translation happens exactly here and is worth
-	// pinning.
 	locations, _ := srv.body["locations"].([]any)
 	if len(locations) != 1 {
 		t.Fatalf("locations: want 1, got %v", srv.body["locations"])
@@ -81,8 +75,6 @@ func TestIsochrone_requestShape(t *testing.T) {
 		t.Errorf("lon = %v, want -122.4", loc["lon"])
 	}
 
-	// The contour goes out in minutes, not seconds. Sending 2700 would be a
-	// 45-hour isochrone and a 400.
 	contours, _ := srv.body["contours"].([]any)
 	if len(contours) != 1 {
 		t.Fatalf("contours: want 1, got %v", srv.body["contours"])
@@ -98,15 +90,6 @@ func TestIsochrone_requestShape(t *testing.T) {
 	assertIsochroneDenoiseZero(t, srv.body)
 }
 
-// Valhalla's /isochrone denoise defaults to 1.0: keep only the largest
-// contour and drop the rest. A multimodal isochrone is multi-part — a blob
-// around the pin plus an island around every alighting stop — so that
-// default deletes every transit-reached island smaller than the largest
-// piece. Which piece is largest flips with the time budget, so a 120 min
-// Inner Richmond plot shows SF and a 180 min plot shows only the East Bay,
-// with the origin pin outside its own polygon (SPA-302, valhalla#1607).
-// Zero keeps every contour. Pedestrian/bike/drive send it too; a connected
-// walkshed is a no-op at 0. Origin and egress share this one request body.
 func TestIsochrone_sendsDenoiseZero(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -148,12 +131,6 @@ func assertIsochroneDenoiseZero(t *testing.T, body map[string]any) {
 	}
 }
 
-// Every location on every call carries the widened radius/minimum_reachability
-// (SPA-234), or a point near a small disconnected OSM fragment finds no
-// candidate edge and Valhalla answers 400 "Locations are in unconnected
-// regions" — see LocationRadiusM's doc comment. Checked once here for
-// isochrone's single location; TestMatrix_requestShape and
-// TestRoute_requestShape check the multi-location calls carry it identically.
 func TestIsochrone_locationCarriesWidenedRadiusAndReachability(t *testing.T) {
 	srv := newCaptureServer(t, http.StatusOK, okIsochrone)
 	client := valhalla.NewHTTPClient(srv.URL)
@@ -195,9 +172,7 @@ func TestMatrix_requestShape(t *testing.T) {
 	if got := srv.body["costing"]; got != "auto" {
 		t.Errorf("costing = %v, want auto", got)
 	}
-	// The chainer compares a cell's distance against a great-circle distance in
-	// kilometres, so the units the answer comes back in are not left to the
-	// server's configuration.
+
 	if got := srv.body["units"]; got != "kilometers" {
 		t.Errorf("units = %v, want kilometers", got)
 	}
@@ -209,8 +184,7 @@ func TestMatrix_requestShape(t *testing.T) {
 	if len(targets) != 2 {
 		t.Errorf("targets: want 2, got %v", srv.body["targets"])
 	}
-	// See TestIsochrone_locationCarriesWidenedRadiusAndReachability: every
-	// location on every call, sources and targets alike, must carry this.
+
 	if src, _ := sources[0].(map[string]any); src["radius"] != float64(valhalla.LocationRadiusM) {
 		t.Errorf("sources[0] radius = %v, want %d", src["radius"], valhalla.LocationRadiusM)
 	}
@@ -225,18 +199,12 @@ func TestMatrix_requestShape(t *testing.T) {
 	if !routed.Routed() || *routed.Time != 600 || *routed.DistanceKm != 1.0 {
 		t.Errorf("cell 0 = %+v, want a routed 600 s / 1.0 km", routed)
 	}
-	// Valhalla reports a pair it could not route as a pair of nulls, and the
-	// difference between that and a zero has to survive decoding: zero seconds
-	// reads as "the rider is already there", which is how SPA-243 drew the
-	// access leg to a station two hours away.
+
 	if declined := resp.SourcesToTargets[0][1]; declined.Routed() {
 		t.Errorf("cell 1 = %+v, want an unrouted pair", declined)
 	}
 }
 
-// No Authorization header. The server is a ClusterIP service with no ingress,
-// so the network is the authorization; a stray vendor header carried over from
-// the Stadia client would be sent to something that never asked for it.
 func TestNoAuthorizationHeaderIsSent(t *testing.T) {
 	var sawAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -256,8 +224,6 @@ func TestNoAuthorizationHeaderIsSent(t *testing.T) {
 	}
 }
 
-// The status→cause mapping is what the retry decision rests on, so it is
-// asserted per status rather than inferred.
 func TestErrorsAreClassifiedByCause(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -297,9 +263,6 @@ func TestErrorsAreClassifiedByCause(t *testing.T) {
 	}
 }
 
-// Valhalla's error_code catalogue is how a failed job says which limit it hit —
-// 150 is too many matrix pairs, 154 a pair too far apart — so it has to survive
-// into the message a caller reads off the row.
 func TestBadRequestCarriesValhallasErrorCode(t *testing.T) {
 	srv := newCaptureServer(t, http.StatusBadRequest,
 		`{"error_code":150,"error":"Exceeded max matrix location pairs"}`)
@@ -319,12 +282,10 @@ func TestBadRequestCarriesValhallasErrorCode(t *testing.T) {
 	}
 }
 
-// An unreachable server is transient. This is the case that decides whether a
-// job survives a Valhalla pod restart or is thrown away by it.
 func TestUnreachableServerIsUpstream(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	url := srv.URL
-	srv.Close() // nothing is listening now
+	srv.Close()
 
 	_, err := valhalla.NewHTTPClient(url).Isochrone(context.Background(), valhalla.IsochroneRequest{
 		Origin: valhalla.LatLng{Lat: 1, Lng: 2}, Costing: valhalla.CostingAuto, BudgetSecs: 600,
@@ -334,9 +295,6 @@ func TestUnreachableServerIsUpstream(t *testing.T) {
 	}
 }
 
-// tileset_last_modified is what the isochrone cache records alongside a cached
-// polygon, and Valhalla exposes it without allow_verbose — which the deployed
-// container leaves off.
 func TestStatusReportsTilesetTimestamp(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"version":"3.5.1","tileset_last_modified":1750000000}`))
@@ -355,8 +313,6 @@ func TestStatusReportsTilesetTimestamp(t *testing.T) {
 	}
 }
 
-// A server that reports no tileset timestamp must leave the field zero rather
-// than claiming the Unix epoch, which would later read as a real date.
 func TestStatusWithoutTilesetLeavesTheTimeZero(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"version":"3.5.1"}`))
@@ -372,13 +328,6 @@ func TestStatusWithoutTilesetLeavesTheTimeZero(t *testing.T) {
 	}
 }
 
-// shapeThreePoints is a genuine polyline6 encoding of
-//
-//	(37.700000, -122.400000) → (37.700500, -122.401000) → (37.701000, -122.400500)
-//
-// written out rather than produced by an encoder here on purpose: an encoder
-// written alongside the decoder would agree with it whether or not either
-// matches what Valhalla actually sends.
 const shapeThreePoints = `_y_|fA~numhFg^n}@g^g^`
 
 func okRoute(shape string) string {
@@ -414,8 +363,7 @@ func TestRoute_requestShape(t *testing.T) {
 	if len(locations) != 2 {
 		t.Fatalf("locations: want 2, got %v", srv.body["locations"])
 	}
-	// lon, not lng: the wire spelling is Valhalla's, applied here rather than
-	// in the domain types.
+
 	first, _ := locations[0].(map[string]any)
 	if first["lat"] != 37.7 || first["lon"] != -122.4 {
 		t.Errorf("locations[0] = %v, want lat 37.7 lon -122.4", first)
@@ -424,9 +372,7 @@ func TestRoute_requestShape(t *testing.T) {
 	if last["lat"] != 37.701 || last["lon"] != -122.4005 {
 		t.Errorf("locations[1] = %v, want lat 37.701 lon -122.4005", last)
 	}
-	// See TestIsochrone_locationCarriesWidenedRadiusAndReachability: origin and
-	// destination alike must carry this, or the walking-directions call hits
-	// the same "unconnected regions" failure the egress isochrone does.
+
 	if first["radius"] != float64(valhalla.LocationRadiusM) {
 		t.Errorf("locations[0] radius = %v, want %d", first["radius"], valhalla.LocationRadiusM)
 	}
@@ -455,9 +401,6 @@ func TestRoute_requestShape(t *testing.T) {
 	}
 }
 
-// Valhalla's shape is polyline6, not the polyline5 most encoders default to.
-// Decoding it at five digits puts the walk ten degrees away, which is exactly
-// the kind of failure that looks like a routing bug rather than a decoding one.
 func TestRouteShapeIsDecodedAtSixDigitPrecision(t *testing.T) {
 	srv := newCaptureServer(t, http.StatusOK, okRoute(shapeThreePoints))
 
@@ -474,9 +417,6 @@ func TestRouteShapeIsDecodedAtSixDigitPrecision(t *testing.T) {
 	}
 }
 
-// Legs are joined rather than concatenated: the point a leg ends on is the one
-// the next begins on, and emitting it twice would put a zero-length segment in
-// the middle of the walk.
 func TestRouteJoinsLegsWithoutRepeatingTheSharedPoint(t *testing.T) {
 	two := `{"trip":{"legs":[{"shape":"` + shapeThreePoints + `"},{"shape":"` + shapeThreePoints + `"}]}}`
 	srv := newCaptureServer(t, http.StatusOK, two)
@@ -493,9 +433,6 @@ func TestRouteJoinsLegsWithoutRepeatingTheSharedPoint(t *testing.T) {
 	}
 }
 
-// A response the client cannot draw a line from is an upstream failure, not a
-// route with an empty shape: the caller's choice is to retry or to give up, and
-// silently returning nothing would look like the former succeeding.
 func TestRouteWithoutADrawableShapeIsUpstream(t *testing.T) {
 	tests := []struct {
 		name string
@@ -504,18 +441,11 @@ func TestRouteWithoutADrawableShapeIsUpstream(t *testing.T) {
 		{"no legs", `{"trip":{"legs":[]}}`},
 		{"empty shape", `{"trip":{"legs":[{"shape":""}]}}`},
 		{"single point", `{"trip":{"legs":[{"shape":"_y_|fA~numhF"}]}}`},
-		// A latitude with no longitude after it: positions come in pairs, and
-		// half of one is not a position.
+
 		{"truncated pair", `{"trip":{"legs":[{"shape":"_y_|fA"}]}}`},
-		// Every byte a continuation byte, so the value never terminates.
+
 		{"unterminated value", `{"trip":{"legs":[{"shape":"~~~~~~~~~~~~~~~~"}]}}`},
-		// Bytes outside the 63..126 an encoder emits are not a polyline at all.
-		// A low one is the case that has to be rejected rather than merely
-		// survived: it masks down to a valid-looking five-bit chunk with the
-		// continuation bit clear, so it terminates a value instead of failing
-		// it. The shape below is otherwise well-formed and pairs up exactly, so
-		// without the range check it decodes to two positions — one of them
-		// nowhere near the walk — and is drawn as a route rather than refused.
+
 		{"byte below the encodable range", `{"trip":{"legs":[{"shape":"_y_|fA ~numhFg^"}]}}`},
 		{"byte above the encodable range", `{"trip":{"legs":[{"shape":"_y_|fAÿÿ"}]}}`},
 	}
@@ -534,8 +464,6 @@ func TestRouteWithoutADrawableShapeIsUpstream(t *testing.T) {
 	}
 }
 
-// Valhalla answers "no path could be found" with a 400, which is permanent —
-// an origin in the middle of a lake will be refused again on a retry.
 func TestRouteWithNoPathIsABadRequest(t *testing.T) {
 	srv := newCaptureServer(t, http.StatusBadRequest,
 		`{"error_code":442,"error":"No path could be found for input"}`)
@@ -549,9 +477,6 @@ func TestRouteWithNoPathIsABadRequest(t *testing.T) {
 	}
 }
 
-// Coordinates are compared with a tolerance rather than for equality: they
-// arrive as a fixed-point integer divided by 1e6, which is not exactly the
-// decimal literal a test writes.
 func nearly(got, want float64) bool {
 	const tolerance = 1e-9
 	d := got - want
@@ -572,9 +497,6 @@ func TestTrailingSlashInBaseURLIsTolerated(t *testing.T) {
 	}
 }
 
-// pacific is the zone the corridor's origins actually sit in, and the zone
-// every case below states its clock in. Loaded rather than faked with a fixed
-// offset, so these exercise the same tzdata the client does, DST and all.
 func pacific(t *testing.T) *time.Location {
 	t.Helper()
 	loc, err := time.LoadLocation("America/Los_Angeles")
@@ -590,10 +512,10 @@ func TestWeekdayDepartAtPicksTheNextWeekdayMorning(t *testing.T) {
 		now  string
 		want string
 	}{
-		{"2026-08-31T09:00:00-07:00", "2026-08-31T08:00:00-07:00"}, // Monday stays Monday
-		{"2026-08-28T03:00:00-07:00", "2026-08-28T08:00:00-07:00"}, // Friday stays Friday
-		{"2026-08-29T15:00:00-07:00", "2026-08-31T08:00:00-07:00"}, // Saturday → Monday
-		{"2026-08-30T15:00:00-07:00", "2026-08-31T08:00:00-07:00"}, // Sunday → Monday
+		{"2026-08-31T09:00:00-07:00", "2026-08-31T08:00:00-07:00"},
+		{"2026-08-28T03:00:00-07:00", "2026-08-28T08:00:00-07:00"},
+		{"2026-08-29T15:00:00-07:00", "2026-08-31T08:00:00-07:00"},
+		{"2026-08-30T15:00:00-07:00", "2026-08-31T08:00:00-07:00"},
 	}
 	for _, tc := range tests {
 		now, err := time.Parse(time.RFC3339, tc.now)
@@ -617,16 +539,6 @@ func TestWeekdayDepartAtPicksTheNextWeekdayMorning(t *testing.T) {
 	}
 }
 
-// The departure date is the rider's date, not UTC's.
-//
-// Resolved on the UTC calendar, every one of these afternoons rolled the date
-// forward: 18:00 Pacific is already tomorrow in UTC, so from roughly 17:00
-// onwards the same pin at the same budget was plotted against a different GTFS
-// service day than it was at lunchtime. Two of these are worse than merely
-// inconsistent. Friday evening asked for Monday, skipping the weekend it was
-// standing in; and a Tuesday evening in mid-September asked for a date past the
-// end of LA Metro Rail's calendar, bringing the service cliff forward by half a
-// day (SPA-274).
 func TestWeekdayDepartAt_resolvesOnTheRidersCalendarNotUTC(t *testing.T) {
 	loc := pacific(t)
 	tests := []struct {
@@ -654,9 +566,6 @@ func TestWeekdayDepartAt_resolvesOnTheRidersCalendarNotUTC(t *testing.T) {
 	}
 }
 
-// A departure resolved anywhere but the rider's own zone is a departure on the
-// wrong calendar, so the zone the client falls back to has to be the
-// corridor's.
 func TestServiceAreaZoneIsTheCorridorsZone(t *testing.T) {
 	loc := valhalla.ServiceAreaZone()
 	if loc == nil {
@@ -665,32 +574,23 @@ func TestServiceAreaZoneIsTheCorridorsZone(t *testing.T) {
 	if loc.String() != "America/Los_Angeles" {
 		t.Errorf("ServiceAreaZone = %s, want America/Los_Angeles", loc)
 	}
-	// UTC is what a missing tzdata would silently degrade to, and it is exactly
-	// the calendar this replaces — so it must not be reachable.
+
 	if loc == time.UTC {
 		t.Error("ServiceAreaZone fell back to UTC")
 	}
 }
 
-// The date a transit cache row is keyed by has to be the date the request was
-// actually stamped with, so it is derived from that value rather than
-// recomputed beside it.
 func TestServiceDateIsTheDepartureDate(t *testing.T) {
 	depart := time.Date(2026, 9, 2, 8, 0, 0, 0, pacific(t))
 	if got := valhalla.ServiceDate(depart); got != "2026-09-02" {
 		t.Errorf("ServiceDate = %q, want 2026-09-02", got)
 	}
-	// An egress departure a few hours down the line is still the same service
-	// day; one that rolls past midnight is not, and the row it keys must agree.
+
 	if got := valhalla.ServiceDate(depart.Add(18 * time.Hour)); got != "2026-09-03" {
 		t.Errorf("ServiceDate past midnight = %q, want 2026-09-03", got)
 	}
 }
 
-// morningDeparture is the representative weekday 08:00 the multimodal cases
-// travel at. Stated rather than taken from the clock: since a zero departure is
-// refused, every multimodal case has to name one, and naming the same one keeps
-// them comparable.
 func morningDeparture(t *testing.T) time.Time {
 	t.Helper()
 	return time.Date(2026, 9, 2, 8, 0, 0, 0, pacific(t))
@@ -726,16 +626,6 @@ func assertMultimodalOptions(t *testing.T, body map[string]any) {
 	assertPedestrianCostingOptionsValhallaHonours(t, ped)
 }
 
-// pedestrianCostingOptionsValhallaHonours is the pedestrian costing-option
-// keys ParsePedestrianCostOptions maps onto fields PedestrianCost actually
-// reads. Unknown keys are dropped with no diagnostic, so a typo on the wire
-// is indistinguishable from a working override (SPA-297).
-//
-// multimodal_start_end_max_distance is deliberately absent. Valhalla's docs
-// renamed the option, but the costing engine still copies
-// transit_start_end_max_distance into the walk-cap field, and the live
-// staging server ignores the new name entirely: sending 20000 on the
-// transit_* key is error 155, sending 9999999 on the renamed key is 200.
 var pedestrianCostingOptionsValhallaHonours = map[string]struct{}{
 	"type":                           {},
 	"max_distance":                   {},
@@ -797,17 +687,12 @@ func TestRoute_multimodalRequestShape(t *testing.T) {
 	assertMultimodalOptions(t, srv.body)
 }
 
-// The docs-renamed walk-cap key is the SPA-297 misspelling: Valhalla parses
-// it into a field the costing engine does not read. Keeping it out of the
-// allowlist is what makes sending it fail the tests above rather than look
-// deliberate.
 func TestRenamedWalkCapKeyIsNotARecognisedCostingOption(t *testing.T) {
 	if _, ok := pedestrianCostingOptionsValhallaHonours["multimodal_start_end_max_distance"]; ok {
 		t.Fatal("multimodal_start_end_max_distance is in the allowlist; that is the key Valhalla ignores (SPA-297)")
 	}
 }
 
-// departValue reads the departure string off a captured request body.
 func departValue(t *testing.T, body map[string]any) string {
 	t.Helper()
 	dt, _ := body["date_time"].(map[string]any)
@@ -818,14 +703,6 @@ func departValue(t *testing.T, body map[string]any) string {
 	return value
 }
 
-// A caller that has worked out when the rider is standing at this location gets
-// to say so, and the client sends that rather than recomputing a departure of
-// its own.
-//
-// This is what lets one chain hold one departure. Recomputed per call, a chain
-// straddling midnight drew its origin and its egress polygons on two different
-// service dates, and an egress polygon was drawn at the morning peak however
-// many hours of riding it took to arrive there (SPA-274).
 func TestMultimodalSendsTheRequestsOwnDeparture(t *testing.T) {
 	depart := time.Date(2026, 9, 2, 13, 6, 0, 0, pacific(t))
 
@@ -862,15 +739,6 @@ func TestMultimodalSendsTheRequestsOwnDeparture(t *testing.T) {
 	})
 }
 
-// A multimodal request with no departure is refused here rather than defaulted.
-//
-// There is exactly one place that decides when the rider sets out — the chainer,
-// once per chain — and the cache key is derived from that same value. A second
-// default in this client could put a different moment on the wire than the key
-// names, which is the divergence the service date exists to prevent. Refusing
-// also keeps a mistaken caller off the wire, the way Matrix refuses multimodal,
-// and it must land in the permanent bucket: the same bytes will be refused
-// again.
 func TestMultimodalWithoutADepartureIsRefused(t *testing.T) {
 	var called atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -907,8 +775,6 @@ func TestMultimodalWithoutADepartureIsRefused(t *testing.T) {
 	}
 }
 
-// The other costings have no timetable, so they are unaffected by the rule
-// above: a pedestrian request with no departure is perfectly well-formed.
 func TestNonMultimodalWithoutADepartureIsFine(t *testing.T) {
 	srv := newCaptureServer(t, http.StatusOK, okIsochrone)
 	_, err := valhalla.NewHTTPClient(srv.URL).Isochrone(context.Background(), valhalla.IsochroneRequest{
@@ -924,9 +790,6 @@ func TestNonMultimodalWithoutADepartureIsFine(t *testing.T) {
 	}
 }
 
-// A pedestrian request still sends no departure at all, whatever the caller
-// put on it: date_time is a multimodal option, and the other costings reject
-// the request rather than ignore the field.
 func TestNonMultimodalNeverSendsADeparture(t *testing.T) {
 	srv := newCaptureServer(t, http.StatusOK, okIsochrone)
 	_, err := valhalla.NewHTTPClient(srv.URL).Isochrone(context.Background(), valhalla.IsochroneRequest{
@@ -943,9 +806,6 @@ func TestNonMultimodalNeverSendsADeparture(t *testing.T) {
 	}
 }
 
-// routeWithModes builds a /route answer whose maneuvers travel by the named
-// modes, which is the only place in the response that says whether a
-// multimodal answer actually boarded anything.
 func routeWithModes(shape string, modes ...string) string {
 	maneuvers := ""
 	for i, m := range modes {
@@ -958,13 +818,6 @@ func routeWithModes(shape string, modes ...string) string {
 		`]}],"summary":{"time":420,"length":0.5}}}`
 }
 
-// Whether the rider rode anything is a fact only the maneuvers carry.
-//
-// Valhalla does not error on a multimodal request it can find no service for:
-// it walks the whole way and answers 200 with a plausible shape and a plausible
-// duration. Until this was read, a walking answer and a transit answer were
-// indistinguishable to everything downstream, which is how a corridor with
-// expired GTFS calendars looked healthy (SPA-274).
 func TestRoute_reportsWhetherItActuallyRodeTransit(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -994,9 +847,6 @@ func TestRoute_reportsWhetherItActuallyRodeTransit(t *testing.T) {
 	}
 }
 
-// Matrix hard-rejects multimodal (error 140) whether or not transit tiles
-// exist. Refusing locally keeps a mistaken caller off the wire and still
-// lands in ErrBadRequest, the permanent bucket.
 func TestMatrix_multimodalIsRejectedWithoutACall(t *testing.T) {
 	var called int32
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -1020,10 +870,6 @@ func TestMatrix_multimodalIsRejectedWithoutACall(t *testing.T) {
 	}
 }
 
-// Transit-costing 400s are permanent: the same bytes will be refused again.
-// Error 140 is Matrix's multimodal rejection (should not appear if Matrix is
-// skipped); "no transit near here" and "no path" are the pair-level 400s the
-// chainer drops as unrouted stations rather than failing the chain.
 func TestTransitCostingRejectionsAreBadRequests(t *testing.T) {
 	bodies := []string{
 		`{"error_code":140,"error":"Action does not support multimodal costing: sources_to_targets"}`,

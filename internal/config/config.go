@@ -1,4 +1,3 @@
-// Package config loads runtime configuration from the environment.
 package config
 
 import (
@@ -9,74 +8,26 @@ import (
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
 
-// Config holds the settings needed to run the routing worker.
 type Config struct {
-	// AMQPURL is the broker the worker consumes routing jobs from. It is the
-	// one setting with no useful default: a worker with no queue has nothing
-	// to do, so an empty value is a startup failure rather than a degraded
-	// mode.
-	AMQPURL string
-	// RoutingQueue is the queue routing jobs arrive on. It must match what
-	// sparks-effect-api publishes to — one of the few strings shared across
-	// the repository boundary, hence a setting rather than a constant.
-	RoutingQueue string
-	// DeadLetterQueue receives jobs that exhausted their retries. Nothing
-	// consumes it; it exists so an exhausted job is inspectable rather than
-	// discarded.
+	AMQPURL         string
+	RoutingQueue    string
 	DeadLetterQueue string
-	// MaxRetries bounds how many times a transient failure is redelivered
-	// before the job is dead-lettered and marked failed. Zero means a
-	// transient failure fails the job on first sight.
-	MaxRetries int
-	// APIURL is the sparks-effect-api base URL this worker records results
-	// through. The schema is owned by that repository's migration sequence;
-	// this worker never connects to Postgres, and talks to the API over the
-	// authenticated worker endpoints instead (SPA-273).
-	APIURL string
-	// WorkerToken is the shared bearer token the API's worker endpoints
-	// accept. It is a service credential, not a user session: the API
-	// compares it with constant-time equality rather than looking it up in
-	// the sessions table.
-	WorkerToken string
-	// APITimeout bounds one call to the API.
-	APITimeout time.Duration
-	// ValhallaURL points at the in-cluster routing service, e.g.
-	// http://valhalla:8002. When empty the synthetic client is used instead,
-	// which is what makes the whole loop runnable without a tileset.
-	ValhallaURL string
-	// ValhallaTimeout bounds one routing call.
+	MaxRetries      int
+	APIURL          string
+	WorkerToken     string
+	APITimeout      time.Duration
+	ValhallaURL     string
 	ValhallaTimeout time.Duration
-	// Limits are the request ceilings the routing server enforces. They
-	// default to what the deployed container actually applies; see
-	// valhalla.DefaultLimits.
-	Limits valhalla.Limits
-	// Debug enables verbose logging. Set LOG_LEVEL=debug or VERBOSE=true.
-	Debug bool
+	Limits          valhalla.Limits
+	Debug           bool
 }
 
-// defaultRoutingQueue is the queue name both sides of the routing contract use
-// unless deliberately overridden. Defaulted rather than required because
-// getting it wrong is silent — the API publishes happily to a queue nothing
-// consumes — so the two repositories agreeing by default is worth more than
-// forcing the operator to set it.
 const defaultRoutingQueue = "routing.jobs"
 
-// defaultDeadLetterQueue is where exhausted jobs land. Derived by suffix from
-// the routing queue's default rather than shared with the API, which has no
-// interest in it: only this side dead-letters anything.
 const defaultDeadLetterQueue = "routing.jobs.dead"
 
-// defaultMaxRetries bounds redelivery of a transient failure.
-//
-// Three, because the failures it covers are a routing server restarting or
-// briefly overloaded, and a chain takes seconds — so three attempts spans long
-// enough to ride out a pod rescheduling without holding a queue slot for
-// minutes. Past that the job is failed rather than retried forever, because a
-// caller polling it deserves an answer more than it deserves another attempt.
 const defaultMaxRetries = 3
 
-// Load reads configuration from environment variables, applying defaults for
-// anything unset.
 func Load() Config {
 	limits := valhalla.DefaultLimits()
 	limits.MaxMatrixPairs = envInt("VALHALLA_MAX_MATRIX_PAIRS", limits.MaxMatrixPairs)
@@ -89,8 +40,7 @@ func Load() Config {
 		AMQPURL:         os.Getenv("AMQP_URL"),
 		RoutingQueue:    getEnv("ROUTING_QUEUE", defaultRoutingQueue),
 		DeadLetterQueue: getEnv("ROUTING_DEAD_LETTER_QUEUE", defaultDeadLetterQueue),
-		// Zero is a meaningful setting here — fail on first transient error —
-		// so it is read with envIntAllowingZero rather than envInt.
+
 		MaxRetries:      envIntAllowingZero("ROUTING_MAX_RETRIES", defaultMaxRetries),
 		APIURL:          os.Getenv("API_URL"),
 		WorkerToken:     os.Getenv("WORKER_TOKEN"),
@@ -109,9 +59,6 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-// envInt reads a positive integer, falling back on anything unset, unparseable,
-// or non-positive. A zero or negative limit would disable the thing it bounds,
-// which is never what setting it was meant to express.
 func envInt(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -121,7 +68,6 @@ func envInt(key string, fallback int) int {
 	return fallback
 }
 
-// envIntAllowingZero is envInt for settings where zero is a real choice.
 func envIntAllowingZero(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
