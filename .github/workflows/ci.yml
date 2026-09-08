@@ -56,6 +56,11 @@ jobs:
       # sparks-effect-api merging a new field is enough. That is the intended
       # behaviour: the drift is real from that moment, and the job says so
       # instead of leaving it to whoever next reads both files.
+      #
+      # The other way around — this side ahead of API main, matching an
+      # in-flight API branch — is accepted by `make check-contract` via
+      # CONTRACT_CANDIDATE_REFS, so a staged rollout does not fail the job
+      # for agreeing with a contract that is not yet on main.
       - name: Diff the golden fixture against sparks-effect-api
         run: make check-contract
 

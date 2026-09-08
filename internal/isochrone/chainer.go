@@ -173,15 +173,32 @@ func (c *chainImpl) Chain(ctx context.Context, req ChainRequest) (*ChainResponse
 	accessSecs := c.accessTimes(ctx, req, nearbyNodes, matrixResp)
 	c.log.Debug(ctx, "chain: access reachability", "reachable", len(accessSecs), "total_nodes", len(nodes))
 
-	egressCandidates := c.bestEgressPerNode(req, nodes, accessSecs)
+	egressCandidates, reached := c.bestEgressPerNode(req, nodes, accessSecs)
 	c.log.Debug(ctx, "chain: egress candidates", "count", len(egressCandidates))
+
+	progress, omittedProgress := tripProgress(nodes, reached, req.BudgetMins*60)
+	if omittedProgress > 0 {
+		// Once per chain, not once per leg: a graph compiled before the API
+		// emitted edge routes omits every leg, and the condition is worth being
+		// able to see without the logs being flooded by it. Info rather than
+		// warn — the isochrone is entirely correct, only undecorated.
+		//
+		// The message names what the count actually establishes. A whole graph
+		// compiled before the fields existed and a single station that could
+		// not be placed on its alignment produce the same omission, and telling
+		// an operator the graph carries no routes at all would send them to the
+		// wrong place for the second.
+		c.log.Info(ctx, "chain: trip progress omitted, hops carry no corridor",
+			"compile_job_id", req.CompileJobID,
+			"omitted_legs", omittedProgress)
+	}
 
 	egressIsos, starterWalk, err := c.egressAndStarterWalk(ctx, req, costing, egressCandidates)
 	if err != nil {
 		return nil, err
 	}
 
-	return c.assemble(ctx, req, originIso, originIsoClamped, egressCandidates, egressIsos, starterWalk)
+	return c.assemble(ctx, req, originIso, originIsoClamped, egressCandidates, egressIsos, starterWalk, progress)
 }
 
 // egressAndStarterWalk runs the egress fan-out and the starter station's route
@@ -644,13 +661,22 @@ type egressCandidate struct {
 // keeps the predecessor of every node it settles, which is what lets the
 // response describe the trip rather than only its length.
 //
-// A node whose remaining budget is under a minute is dropped rather than
-// carried, because a sub-minute contour is a request Valhalla rejects.
+// A node the budget does not reach at all is left out; one reached with under a
+// minute to spare is not. That distinction used to be collapsed, because a
+// sub-minute contour is a request Valhalla rejects and dropping the station was
+// the cheapest way to never send one — at the cost of denying an arrival the
+// rider genuinely made. The polygon is what is minute-granular, not the arrival,
+// so the gate moved to egressIsochrones, where a walk-only station already sits
+// in the reachable list without one (SPA-264).
+//
+// The settled set is returned alongside, because it holds more than the reached
+// stations: every node the search settled, including those past the budget,
+// which is what tripProgress reads to find the frontier.
 func (c *chainImpl) bestEgressPerNode(
 	req ChainRequest,
 	nodes []transit.Node,
 	accessSecs map[string]int,
-) []egressCandidate {
+) ([]egressCandidate, map[string]transit.Reached) {
 	budgetSecs := req.BudgetMins * 60
 	reached := c.graph.Search(accessSecs)
 
@@ -664,10 +690,10 @@ func (c *chainImpl) bestEgressPerNode(
 		if !ok {
 			continue
 		}
-		rSecs := budgetSecs - journey.TotalSecs
-		if rSecs < minIsoContourSecs {
+		if !withinBudget(journey, budgetSecs) {
 			continue
 		}
+		rSecs := budgetSecs - journey.TotalSecs
 		aSecs := accessSecs[journey.SourceSlug]
 		candidates = append(candidates, egressCandidate{
 			node:          n,
@@ -680,7 +706,7 @@ func (c *chainImpl) bestEgressPerNode(
 			viaTransit:    journey.PredecessorSlug != "",
 		})
 	}
-	return candidates
+	return candidates, reached
 }
 
 // legsTo retraces the journey to one station, hop by hop, from the station the
@@ -784,9 +810,20 @@ func (c *chainImpl) egressIsochrones(
 		return isos, nil
 	}
 
+	// Two conditions, not one. A station is served a polygon only if the rider
+	// boarded something to get there — a walk-only station's reach is already
+	// covered by the origin polygon, drawn from the same starting point — and
+	// only if a minute or more of budget survives the arrival, since Valhalla's
+	// contour is minute-granular and a {"time": 0} request is rejected outright,
+	// failing the whole errgroup with it.
+	//
+	// The second condition used to be enforced upstream by dropping the station
+	// entirely. It sits here now so that a genuine arrival with 30 seconds to
+	// spare is still reported and still lights its dot; what it does not get is
+	// a polygon claiming a reach those seconds cannot support (SPA-264).
 	var served []int
 	for i, ec := range candidates {
-		if ec.viaTransit {
+		if ec.viaTransit && ec.remainingSecs >= minIsoContourSecs {
 			served = append(served, i)
 		}
 	}
@@ -899,6 +936,7 @@ func (c *chainImpl) assemble(
 	candidates []egressCandidate,
 	egressIsos []*valhalla.IsochroneResponse,
 	starterWalk *StarterWalk,
+	progress []TripProgress,
 ) (*ChainResponse, error) {
 	features := make([]json.RawMessage, 0)
 	if originIso != nil {
@@ -963,6 +1001,7 @@ func (c *chainImpl) assemble(
 			// wire for compatibility with clients that already read it.
 			OriginIsoAvailable: originIso != nil,
 			StarterWalk:        starterWalk,
+			TripProgress:       progress,
 		},
 	}, nil
 }

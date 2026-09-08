@@ -29,8 +29,14 @@ TEST_AMQP_URL     := amqp://guest:guest@localhost:$(TEST_MQ_PORT)/
 # repositories. `make check-contract` is what makes that true rather than
 # aspirational; see the target below.
 CONTRACT_FIXTURE := internal/routing/testdata/message.golden.json
-CONTRACT_REF     := main
-CONTRACT_URL     := https://raw.githubusercontent.com/andrewcgraves/sparks-effect-api/$(CONTRACT_REF)/$(CONTRACT_FIXTURE)
+CONTRACT_REPO    := andrewcgraves/sparks-effect-api
+CONTRACT_REF     ?= main
+# In-flight API branches whose fixture is this file while the matching API
+# change is not yet on main. Main is tried first, so once
+# sparks-effect-api#75 merges these are never consulted. A 404 is ignored so
+# deleting the branch after merge does not fail CI. Remove after that lands.
+CONTRACT_CANDIDATE_REFS ?= cursor/spa-264-trip-progress-d573 andrew/spa-264-trip-progress
+CONTRACT_URL     := https://raw.githubusercontent.com/$(CONTRACT_REPO)/$(CONTRACT_REF)/$(CONTRACT_FIXTURE)
 
 # --- Acceptance checks against a real Valhalla ---
 # The transit checks need tiles, which a fake cannot stand in for: the failure
@@ -118,23 +124,45 @@ acceptance: deps
 # a field and this side has not caught up, and the fix is to copy the fetched
 # file in and follow the failing tests until the struct agrees with it.
 #
+# The other direction also happens: this side ships a field the API has only
+# on a branch (SPA-264's edge placement, sparks-effect-api#75).
+# CONTRACT_CANDIDATE_REFS are those branches. A match against any of them is
+# agreement with a contract the API is about to publish — the same invariant,
+# just not yet on main. Once main matches, the candidates are never fetched.
+#
 # Not part of dev-workflow: it needs the network, and the rest of that target
 # deliberately does not.
 check-contract:
-	@echo "fetching $(CONTRACT_URL)"
 	@theirs=$$(mktemp); trap 'rm -f "$$theirs"' EXIT; \
+	echo "fetching $(CONTRACT_URL)"; \
 	curl -fsSL "$(CONTRACT_URL)" -o "$$theirs" || { \
 		echo "could not fetch the API's fixture from $(CONTRACT_URL)" >&2; exit 1; }; \
-	if diff -u "$$theirs" $(CONTRACT_FIXTURE); then \
+	if diff -q "$$theirs" $(CONTRACT_FIXTURE) >/dev/null; then \
 		echo "$(CONTRACT_FIXTURE) matches sparks-effect-api@$(CONTRACT_REF)"; \
-	else \
-		echo >&2; \
-		echo "the message contract has drifted from sparks-effect-api@$(CONTRACT_REF)." >&2; \
-		echo "'-' is the API's copy, '+' is this repository's." >&2; \
-		echo "copy the API's file over $(CONTRACT_FIXTURE) and make the struct in" >&2; \
-		echo "internal/routing/message.go agree with it." >&2; \
-		exit 1; \
-	fi
+		exit 0; \
+	fi; \
+	for ref in $(CONTRACT_CANDIDATE_REFS); do \
+		url="https://raw.githubusercontent.com/$(CONTRACT_REPO)/$$ref/$(CONTRACT_FIXTURE)"; \
+		echo "fetching $$url"; \
+		if ! curl -fsSL "$$url" -o "$$theirs"; then \
+			echo "skipping sparks-effect-api@$$ref (not fetchable)"; \
+			continue; \
+		fi; \
+		if diff -q "$$theirs" $(CONTRACT_FIXTURE) >/dev/null; then \
+			echo "$(CONTRACT_FIXTURE) matches sparks-effect-api@$$ref (in-flight; $(CONTRACT_REF) does not have it yet)"; \
+			exit 0; \
+		fi; \
+	done; \
+	echo "fetching $(CONTRACT_URL)"; \
+	curl -fsSL "$(CONTRACT_URL)" -o "$$theirs" || { \
+		echo "could not fetch the API's fixture from $(CONTRACT_URL)" >&2; exit 1; }; \
+	diff -u "$$theirs" $(CONTRACT_FIXTURE) || true; \
+	echo >&2; \
+	echo "the message contract has drifted from sparks-effect-api@$(CONTRACT_REF)." >&2; \
+	echo "'-' is the API's copy, '+' is this repository's." >&2; \
+	echo "copy the API's file over $(CONTRACT_FIXTURE) and make the struct in" >&2; \
+	echo "internal/routing/message.go agree with it." >&2; \
+	exit 1
 
 # mq-up starts (or reuses) a throwaway RabbitMQ and waits until it is running.
 # Idempotent: a running container is left in place.

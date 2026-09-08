@@ -114,6 +114,51 @@ type ReachableStation struct {
 	Legs []Leg `json:"legs,omitempty"`
 }
 
+// TripProgress is how far along a leg the rider's budget would have carried
+// them, for a leg they do not finish.
+//
+// It exists because a station the budget does not quite reach used to leave no
+// trace at all, so a rider who got 91% of the way from San José to Millbrae and
+// one who never left San José saw the same picture. This says how close they
+// came, and carries enough to draw it: the corridor the hop runs over and both
+// endpoint chainages, copied from the edge rather than referenced, because the
+// public scenario page fetches the scenario and never the compiled graph. With
+// the copy, every surface needs only this list and the routes array it already
+// holds.
+//
+// The field names deliberately match Leg's: from, to, service_id name the same
+// things there, and a reader should not have to learn a second vocabulary for
+// the leg a rider did not complete.
+//
+// Fraction is of the leg's *running* time, applied uniformly to arc length. It
+// is a fair impression of progress, not a physics-accurate claim about where a
+// train would be: no acceleration profile is integrated, and the point it
+// marks is simply that share of the way along the alignment.
+//
+// It is never a claim of arrival. The station named by ToSlug stays out of the
+// reachable set, unlit and without an egress polygon, even where Fraction is
+// exactly 1 — see the clamp in tripProgress.
+type TripProgress struct {
+	FromSlug  string `json:"from"`
+	ToSlug    string `json:"to"`
+	ServiceID string `json:"service_id,omitempty"`
+	RouteID   string `json:"route_id"`
+	// FromChainageM and ToChainageM are where the two stations sit along the
+	// route's alignment, in metres. They may descend, when the hop runs against
+	// the direction the alignment was drawn in; a consumer slicing between them
+	// needs no special case for that.
+	FromChainageM float64 `json:"from_chainage_m"`
+	ToChainageM   float64 `json:"to_chainage_m"`
+	Fraction      float64 `json:"fraction"`
+	// RemainingSecs is the budget left at FromSlug that buys motion — the raw
+	// remainder less any boarding wait the rider would still have to serve.
+	// RideSecs is the hop less its dwell. Fraction is the first over the
+	// second, clamped at one; both are reported so a caller can say how the
+	// number was arrived at rather than only what it is.
+	RemainingSecs int `json:"remaining_secs"`
+	RideSecs      int `json:"ride_secs"`
+}
+
 // StarterWalk is the routed access leg: the walk from the request's origin to
 // the station the rider boards at.
 //
@@ -156,6 +201,16 @@ type ChainMetadata struct {
 	// when the route call for one failed. Its absence is never a reason to
 	// distrust the surface above it — see chainer.starterWalk.
 	StarterWalk *StarterWalk `json:"starter_walk,omitempty"`
+	// TripProgress is the unfinished legs, one per branch that runs out of
+	// budget. It is a flat top-level list rather than something hung off
+	// ReachableStations, because none of its entries name a station that was
+	// reached — that is the whole point of them.
+	//
+	// Purely additive: nothing that reads the reachable stations sees any
+	// change, so no dot lights for a station nobody reaches and the
+	// time-remaining card's structure is untouched. Absent, rather than empty,
+	// on a graph that cannot support it.
+	TripProgress []TripProgress `json:"trip_progress,omitempty"`
 }
 
 // ChainResponse is a GeoJSON FeatureCollection plus the accounting behind it.

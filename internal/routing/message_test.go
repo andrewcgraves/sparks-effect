@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -144,6 +145,56 @@ func TestDecodeGoldenFixtureGraphIsRoutable(t *testing.T) {
 	}
 	if south.PredecessorSlug != "north" {
 		t.Errorf("PredecessorSlug = %q, want north", south.PredecessorSlug)
+	}
+	// The hop's placement reaches the chainer through the search, which is the
+	// only path it takes: a settled node names its predecessor, not the edge
+	// that arrived on it, so anything not carried here is unrecoverable. The
+	// fixture's chainages descend, a hop running against the direction its
+	// alignment was drawn in, which is deliberately the shape easiest to get
+	// wrong rather than the tidiest one.
+	if south.HopRouteID != "rt-spine" {
+		t.Errorf("HopRouteID = %q, want rt-spine", south.HopRouteID)
+	}
+	if south.HopFromChainageM != 27798.4 || south.HopToChainageM != 8123.9 {
+		t.Errorf("hop chainages = (%v, %v), want (27798.4, 8123.9)",
+			south.HopFromChainageM, south.HopToChainageM)
+	}
+}
+
+// A message published before the API emitted edge placement is still processed
+// rather than rejected. There is no schema version bump: the fields are
+// additive, an old edge decodes with an empty route and zero chainages, and the
+// worker's only response to that is to omit the decoration — which is precisely
+// the precedent set when the trace identifier was added.
+func TestDecodeMessageWithoutEdgePlacementIsStillRoutable(t *testing.T) {
+	older := bytes.NewBuffer(nil)
+	var m map[string]any
+	if err := json.Unmarshal(goldenBytes(t), &m); err != nil {
+		t.Fatalf("unmarshalling golden fixture: %v", err)
+	}
+	graph := m["graph"].(map[string]any)
+	svcs := graph["services"].([]any)
+	edge := svcs[0].(map[string]any)["edges"].([]any)[0].(map[string]any)
+	delete(edge, "route_id")
+	delete(edge, "from_chainage_m")
+	delete(edge, "to_chainage_m")
+	if err := json.NewEncoder(older).Encode(m); err != nil {
+		t.Fatalf("re-encoding: %v", err)
+	}
+
+	msg, err := Decode(older.Bytes())
+	if err != nil {
+		t.Fatalf("Decode(pre-SPA-264 message) = %v, want nil", err)
+	}
+	south, ok := transit.CompiledGraph{Graph: msg.Graph}.Search(map[string]int{"north": 0})["south"]
+	if !ok {
+		t.Fatal("Search from north did not reach south; an older message must still route")
+	}
+	if south.TotalSecs != 2100 {
+		t.Errorf("TotalSecs = %d, want 2100 — placement is decoration, not weight", south.TotalSecs)
+	}
+	if south.HopRouteID != "" {
+		t.Errorf("HopRouteID = %q, want empty on a message that carries none", south.HopRouteID)
 	}
 }
 

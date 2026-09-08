@@ -91,11 +91,30 @@ func TravelModes() []TravelMode {
 // hop would look like a harmless simplification and would move every isochrone
 // crossing those spans. See
 // TestSearch_honoursDifferentDurationsEachWayAcrossOnePair.
+//
+// RouteID, FromChainageM and ToChainageM say where the hop runs: the corridor
+// carrying it, and how far along that corridor's alignment each of its two
+// stations sits, in metres. They are what lets a rider's unfinished leg be drawn
+// as a stub along the real alignment rather than a chord between two dots.
+//
+// They are read but never interpreted here — copied onto a progress entry and
+// handed on, because the surface that draws the stub holds the route geometry
+// and this worker does not. The three travel together: an edge either names a
+// route and carries both chainages, or names neither, and a graph compiled
+// before the API emitted them decodes as the second, which is the shape a hop
+// that cannot be placed on an alignment has too. RouteID is the discriminator,
+// so a chainage of zero needs no distinguishing from an absent one.
+//
+// Descending chainage is ordinary: it is what a hop running against the
+// direction its alignment was drawn in produces.
 type Edge struct {
-	FromSlug string `json:"from_slug"`
-	ToSlug   string `json:"to_slug"`
-	Seconds  int    `json:"seconds"`
-	DwellS   int    `json:"dwell_s,omitempty"`
+	FromSlug      string  `json:"from_slug"`
+	ToSlug        string  `json:"to_slug"`
+	Seconds       int     `json:"seconds"`
+	DwellS        int     `json:"dwell_s,omitempty"`
+	RouteID       string  `json:"route_id,omitempty"`
+	FromChainageM float64 `json:"from_chainage_m,omitempty"`
+	ToChainageM   float64 `json:"to_chainage_m,omitempty"`
 }
 
 // ServiceGraph is one service's hops plus the boarding wait a rider pays to
@@ -185,6 +204,15 @@ type Reached struct {
 	HopSecs    int
 	HopDwellS  int
 	HopService string
+	// HopRouteID, HopFromChainageM and HopToChainageM carry that hop's Edge
+	// placement through unchanged (see Edge). They are here rather than looked
+	// up again later because a settled node names its predecessor, not the edge
+	// that arrived on it, and two services can serve one pair of stations at
+	// different costs — so recovering the edge afterwards would mean guessing
+	// which of them the search actually took.
+	HopRouteID       string
+	HopFromChainageM float64
+	HopToChainageM   float64
 	// BoardSlug, BoardService and BoardWaitSecs record the one boarding on this
 	// journey: where the rider got on, what they got on, and what they waited
 	// to do it. A journey that rode nothing has all three empty.
@@ -318,10 +346,15 @@ func graphSearch(g *TransitGraph, accessSecs map[string]int) map[string]Reached 
 	return out
 }
 
+// neighbor is one edge as the search reads it: the edge itself, plus the two
+// facts that live on the service carrying it rather than on the hop.
+//
+// The edge is embedded rather than unpacked field by field. Restating it was a
+// third hand-maintained copy of the same shape — Edge to neighbor to Reached —
+// and each new fact about a hop cost an edit in every one of them, with nothing
+// to catch a copy that was forgotten.
 type neighbor struct {
-	slug      string
-	secs      int
-	dwellS    int
+	Edge
 	serviceID string
 	waitSecs  int
 }
@@ -331,9 +364,7 @@ func poolEdges(g *TransitGraph) map[string][]neighbor {
 	for _, sg := range g.Services {
 		for _, e := range sg.Edges {
 			adj[e.FromSlug] = append(adj[e.FromSlug], neighbor{
-				slug:      e.ToSlug,
-				secs:      e.Seconds,
-				dwellS:    e.DwellS,
+				Edge:      e,
 				serviceID: sg.ServiceID,
 				waitSecs:  sg.WaitSecs,
 			})
@@ -362,15 +393,18 @@ func settleFrom(adj map[string][]neighbor, src string, accessSecs int) map[strin
 		}
 		for _, nb := range adj[cur.slug] {
 			next := Reached{
-				TotalSecs:       state.TotalSecs + nb.secs,
-				SourceSlug:      src,
-				PredecessorSlug: cur.slug,
-				HopSecs:         nb.secs,
-				HopDwellS:       nb.dwellS,
-				HopService:      nb.serviceID,
-				BoardSlug:       state.BoardSlug,
-				BoardService:    state.BoardService,
-				BoardWaitSecs:   state.BoardWaitSecs,
+				TotalSecs:        state.TotalSecs + nb.Seconds,
+				SourceSlug:       src,
+				PredecessorSlug:  cur.slug,
+				HopSecs:          nb.Seconds,
+				HopDwellS:        nb.DwellS,
+				HopService:       nb.serviceID,
+				HopRouteID:       nb.RouteID,
+				HopFromChainageM: nb.FromChainageM,
+				HopToChainageM:   nb.ToChainageM,
+				BoardSlug:        state.BoardSlug,
+				BoardService:     state.BoardService,
+				BoardWaitSecs:    state.BoardWaitSecs,
 			}
 			if cur.slug == src {
 				next.TotalSecs += nb.waitSecs
@@ -378,9 +412,9 @@ func settleFrom(adj map[string][]neighbor, src string, accessSecs int) map[strin
 				next.BoardService = nb.serviceID
 				next.BoardWaitSecs = nb.waitSecs
 			}
-			if prev, seen := best[nb.slug]; !seen || next.TotalSecs < prev.TotalSecs {
-				best[nb.slug] = next
-				heap.Push(h, dijkNode{nb.slug, next.TotalSecs})
+			if prev, seen := best[nb.ToSlug]; !seen || next.TotalSecs < prev.TotalSecs {
+				best[nb.ToSlug] = next
+				heap.Push(h, dijkNode{nb.ToSlug, next.TotalSecs})
 			}
 		}
 	}

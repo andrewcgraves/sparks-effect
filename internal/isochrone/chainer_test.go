@@ -893,9 +893,17 @@ func TestChainer_drive_egressIsoUsesFullRemainingBudget(t *testing.T) {
 }
 
 // Valhalla's contour is minute-granular, so a station with under a minute of
-// budget left would go out as {"time": 0} — which Valhalla rejects, failing the
-// whole errgroup and with it the entire request. Such stations are dropped.
-func TestChainer_subMinuteRemainingBudget_stationDropped(t *testing.T) {
+// budget left cannot be asked for a polygon: the request would go out as
+// {"time": 0}, which Valhalla rejects, failing the whole errgroup and with it
+// the entire request.
+//
+// That used to be settled by dropping the station outright, which denied an
+// arrival the rider genuinely made — the narrow version of the fault SPA-264
+// exists to fix. The two conditions are now separated: reaching a station and
+// being able to draw a polygon from it are different questions, and only the
+// second is minute-granular. The station is reported and its dot lights; the
+// fan-out skips it, reusing the seam a walk-only station already sits in.
+func TestChainer_subMinuteRemainingBudget_stationReachedWithoutAnEgressPolygon(t *testing.T) {
 	graph := &fakeGraph{nodes: []transit.Node{node("station-a", -122.39, 37.71)}}
 	fc := &valhalla.StubClient{
 		IsochroneResp: cannedIso(),
@@ -910,13 +918,26 @@ func TestChainer_subMinuteRemainingBudget_stationDropped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Chain: %v", err)
 	}
-	if len(resp.Metadata.ReachableStations) != 0 {
-		t.Errorf("ReachableStations: want 0 (under a minute left), got %d", len(resp.Metadata.ReachableStations))
+	stations := resp.Metadata.ReachableStations
+	if len(stations) != 1 || stations[0].StationSlug != "station-a" {
+		t.Fatalf("ReachableStations = %+v, want station-a listed: the rider did arrive", stations)
 	}
+	if stations[0].RemainingSecs != 30 {
+		t.Errorf("RemainingSecs = %d, want the 30 s actually left", stations[0].RemainingSecs)
+	}
+
 	iso, _ := fc.Calls()
 	for _, call := range iso {
 		if call.BudgetSecs < 60 {
 			t.Errorf("BudgetSecs=%d would send a 0-minute contour and trigger a 400", call.BudgetSecs)
+		}
+		if call.Origin.Lat == 37.71 && call.Origin.Lng == -122.39 {
+			t.Error("an egress polygon was requested for a station with under a minute left")
+		}
+	}
+	for _, f := range resp.Features {
+		if bytes.Contains(f, []byte(`"station_slug":"station-a"`)) {
+			t.Error("station-a contributed an egress feature; its remaining seconds cannot support one")
 		}
 	}
 }
