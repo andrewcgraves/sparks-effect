@@ -86,12 +86,137 @@ func TestZeroRetriesIsRespected(t *testing.T) {
 }
 
 func TestValhallaURLHasNoDefault(t *testing.T) {
+	t.Setenv("VALHALLA_URL", "")
 	if got := config.Load().ValhallaURL; got != "" {
 		t.Errorf("ValhallaURL = %q, want empty when unset", got)
 	}
 }
 
+func TestValhallaSyntheticDefaultsFalse(t *testing.T) {
+	t.Setenv("VALHALLA_SYNTHETIC", "")
+	if config.Load().ValhallaSynthetic {
+		t.Error("ValhallaSynthetic = true, want false when unset")
+	}
+}
+
+func setRequiredEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("AMQP_URL", "amqp://guest:guest@localhost:5672/")
+	t.Setenv("API_URL", "http://api.example")
+	t.Setenv("WORKER_TOKEN", "secret")
+	t.Setenv("VALHALLA_URL", "http://valhalla:8002")
+	t.Setenv("VALHALLA_SYNTHETIC", "")
+}
+
+func TestValidateAcceptsCompleteConfig(t *testing.T) {
+	setRequiredEnv(t)
+	if err := config.Load().Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
+func TestValidateRejectsMissingRequired(t *testing.T) {
+	cases := []struct {
+		unset string
+		want  string
+	}{
+		{"AMQP_URL", "AMQP_URL is required"},
+		{"API_URL", "API_URL is required"},
+		{"WORKER_TOKEN", "WORKER_TOKEN is required"},
+		{"VALHALLA_URL", "VALHALLA_URL is required (set VALHALLA_SYNTHETIC=true to serve synthetic isochrones)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.unset, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(tc.unset, "")
+			if err := config.Load().Validate(); err == nil || err.Error() != tc.want {
+				t.Errorf("Validate() = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateAcceptsSyntheticOptIn(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("VALHALLA_URL", "")
+	t.Setenv("VALHALLA_SYNTHETIC", "true")
+
+	cfg := config.Load()
+	if !cfg.ValhallaSynthetic {
+		t.Fatal("ValhallaSynthetic = false, want true")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
+func TestValidateRejectsURLAndSynthetic(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("VALHALLA_SYNTHETIC", "true")
+
+	const want = "VALHALLA_URL and VALHALLA_SYNTHETIC=true are mutually exclusive"
+	if err := config.Load().Validate(); err == nil || err.Error() != want {
+		t.Errorf("Validate() = %v, want %q", err, want)
+	}
+}
+
+func TestUnrecognizedEnvNamesLeftoverAndUnknown(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("DATABASE_URL", "postgres://legacy")
+	t.Setenv("DATABASE_MAX_CONNS", "8")
+	t.Setenv("SPARKS_NEW_FLAG", "1")
+
+	got := config.UnrecognizedEnv()
+	for _, want := range []string{"DATABASE_URL", "DATABASE_MAX_CONNS", "SPARKS_NEW_FLAG"} {
+		if !containsName(got, want) {
+			t.Errorf("UnrecognizedEnv() = %v, missing %q", got, want)
+		}
+	}
+	for _, known := range []string{"API_URL", "AMQP_URL", "VALHALLA_URL", "WORKER_TOKEN"} {
+		if containsName(got, known) {
+			t.Errorf("UnrecognizedEnv() = %v, unexpectedly includes known %q", got, known)
+		}
+	}
+}
+
+func TestUnrecognizedEnvSkipsKubernetesServiceLinks(t *testing.T) {
+	t.Setenv("VALHALLA_SERVICE_HOST", "10.0.0.8")
+	t.Setenv("VALHALLA_SERVICE_PORT", "8002")
+	t.Setenv("VALHALLA_PORT", "tcp://10.0.0.8:8002")
+	t.Setenv("VALHALLA_PORT_8002_TCP", "tcp://10.0.0.8:8002")
+	t.Setenv("VALHALLA_PORT_8002_TCP_ADDR", "10.0.0.8")
+	t.Setenv("API_SERVICE_HOST", "10.0.0.9")
+
+	got := config.UnrecognizedEnv()
+	for _, name := range []string{
+		"VALHALLA_SERVICE_HOST", "VALHALLA_SERVICE_PORT", "VALHALLA_PORT",
+		"VALHALLA_PORT_8002_TCP", "VALHALLA_PORT_8002_TCP_ADDR", "API_SERVICE_HOST",
+	} {
+		if containsName(got, name) {
+			t.Errorf("UnrecognizedEnv() = %v, includes Kubernetes service-link %q", got, name)
+		}
+	}
+}
+
+func TestUnrecognizedEnvIgnoresEmptyValues(t *testing.T) {
+	t.Setenv("SPARKS_EMPTY", "")
+	if containsName(config.UnrecognizedEnv(), "SPARKS_EMPTY") {
+		t.Error("empty SPARKS_EMPTY should not be reported as supplied")
+	}
+}
+
+func containsName(names []string, want string) bool {
+	for _, n := range names {
+		if n == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestAPICredentialsHaveNoDefault(t *testing.T) {
+	t.Setenv("API_URL", "")
+	t.Setenv("WORKER_TOKEN", "")
 	if got := config.Load().APIURL; got != "" {
 		t.Errorf("APIURL = %q, want empty when unset", got)
 	}

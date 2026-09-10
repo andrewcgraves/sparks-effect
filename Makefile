@@ -21,7 +21,7 @@ CONTRACT_URL     := https://raw.githubusercontent.com/$(CONTRACT_REPO)/$(CONTRAC
 
 TEST_VALHALLA_URL ?=
 
-.PHONY: all deps build run test test-integration itest acceptance check-contract \
+.PHONY: all deps build run test test-integration itest acceptance check-config check-contract \
 	mq-up mq-wait mq-down vet lint tidy clean dev-workflow
 
 all: build
@@ -36,6 +36,11 @@ build: deps
 
 run: build
 	$(BUILD_DIR)/$(BINARY_NAME)
+
+# Validate process env / .env without connecting to AMQP, the API, or Valhalla.
+# Same rules as startup. Local without a tileset: VALHALLA_SYNTHETIC=true.
+check-config: build
+	$(BUILD_DIR)/$(BINARY_NAME) -check
 
 test: deps
 	go test ./... -race -cover

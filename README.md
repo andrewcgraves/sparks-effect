@@ -131,11 +131,11 @@ API that cannot be reached all mean the same thing — compute the polygon,
 and log that the cache is not working.
 
 **Synthetic and real polygons share one keyspace.** Nothing in the key says
-which backend drew the shape, so a worker started with `VALHALLA_URL` unset
+which backend drew the shape, so a worker started with `VALHALLA_SYNTHETIC=true`
 against a cache another worker warmed will serve real polygons, and one
-started *with* it against a cache warmed synthetically will serve circles.
+started against Valhalla with a cache warmed synthetically will serve circles.
 Locally that is what a throwaway API (or the in-process fake the tests use)
-is for; anywhere shared, treat switching `VALHALLA_URL` as needing the cache
+is for; anywhere shared, treat switching backends as needing the cache
 cleared. A NULL `tileset_at` is the tell — synthetic rows have never seen a
 tile.
 
@@ -170,17 +170,40 @@ One trunk: `main`. Branch from it, PR into it. Production runs whichever
 
 ## Running it
 
-`VALHALLA_URL` decides what backs the routing calls. Unset, the worker serves
-**synthetic** isochrones — circles sized from the budget — which makes the whole
-publish → consume → API loop runnable in seconds with no tileset. Every
-synthetic feature carries `"synthetic": true`, and the fallback is logged
-loudly at startup, because it is the right default locally and a serious problem
-in production.
+`config.Validate()` is the same in every environment. It inspects the process
+env (and `.env` via godotenv) and refuses to boot if a required variable is
+missing or incoherent. It does not open a socket: a typo is caught before
+AMQP, the API, or Valhalla are contacted.
+
+Required everywhere — local `.env`, staging, production:
+
+| Variable | Local / non-live | Live Valhalla |
+|---|---|---|
+| `AMQP_URL` | required | required |
+| `API_URL` | required | required |
+| `WORKER_TOKEN` | required | required |
+| `VALHALLA_URL` | unset | required |
+| `VALHALLA_SYNTHETIC` | `true` | unset |
+
+`VALHALLA_URL` and `VALHALLA_SYNTHETIC=true` are mutually exclusive. A typo in
+the URL is a startup failure, not a silent fallback to circles. Every synthetic
+feature carries `"synthetic": true`, and the opt-in is logged loudly at startup.
+
+To check a `.env` (or any dotenv) without a live cluster:
 
 ```sh
-cp .env.example .env   # set AMQP_URL, API_URL and WORKER_TOKEN at minimum
+cp .env.example .env   # set AMQP_URL, API_URL, WORKER_TOKEN, and VALHALLA_URL
+                       # (or VALHALLA_SYNTHETIC=true) at minimum
+make check-config      # ./bin/sparks-effect-routing-worker -check
+# or, to judge a file as the source of truth (overrides the process env):
+# ./bin/sparks-effect-routing-worker -check -env-file path/to.env
 make run
 ```
+
+Unread worker-prefixed variables (`DATABASE_URL`, `SPARKS_*`, …) are warned
+about, not fatal. Kubernetes service-link injects are skipped. Unit tests cover
+the same rules with `t.Setenv` — they are how `make test` validates config
+with no `.env` and no running services.
 
 ## Observability
 
@@ -208,6 +231,7 @@ changes.
 
 ```sh
 make dev-workflow    # test, vet, lint, build — run this before pushing
+make check-config    # Validate() against .env; no AMQP/API/Valhalla
 make itest           # throwaway RabbitMQ, full integration suite, teardown
 make check-contract  # diff the golden message fixture against sparks-effect-api
 ```

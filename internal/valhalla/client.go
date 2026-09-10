@@ -131,3 +131,34 @@ func (l Limits) BLineLimitKm(c Costing) float64 {
 	}
 	return l.MatrixBLineOtherKm
 }
+
+type ClientConfig struct {
+	URL       string
+	Synthetic bool
+	Timeout   time.Duration
+}
+
+func (cfg ClientConfig) Validate() error {
+	switch {
+	case cfg.Synthetic && cfg.URL != "":
+		return errors.New("VALHALLA_URL and VALHALLA_SYNTHETIC=true are mutually exclusive")
+	case !cfg.Synthetic && cfg.URL == "":
+		return errors.New("VALHALLA_URL is required (set VALHALLA_SYNTHETIC=true to serve synthetic isochrones)")
+	default:
+		return nil
+	}
+}
+
+func NewClient(cfg ClientConfig) (Client, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	if cfg.Synthetic {
+		return NewSyntheticClient(), nil
+	}
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	return NewHTTPClient(cfg.URL).WithTimeout(timeout), nil
+}
