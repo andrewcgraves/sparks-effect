@@ -42,9 +42,10 @@ type Edge struct {
 }
 
 type ServiceGraph struct {
-	ServiceID string `json:"service_id"`
-	Edges     []Edge `json:"edges"`
-	WaitSecs  int    `json:"wait_secs"`
+	ServiceID  string `json:"service_id"`
+	Edges      []Edge `json:"edges"`
+	WaitSecs   int    `json:"wait_secs"`
+	WaitPolicy string `json:"wait_policy,omitempty"`
 }
 
 type GraphNode struct {

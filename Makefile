@@ -3,8 +3,6 @@ BUILD_DIR := ./bin
 CMD_DIR := ./cmd/worker
 
 GOLANGCI_LINT_VERSION := v2.12.2
-GOBIN := $(shell go env GOPATH)/bin
-GOLANGCI_LINT := $(GOBIN)/golangci-lint
 
 DOCKER := docker
 
@@ -16,7 +14,7 @@ TEST_AMQP_URL     := amqp://guest:guest@localhost:$(TEST_MQ_PORT)/
 CONTRACT_FIXTURE := internal/routing/testdata/message.golden.json
 CONTRACT_REPO    := andrewcgraves/sparks-effect-api
 CONTRACT_REF     ?= main
-CONTRACT_CANDIDATE_REFS ?= cursor/spa-264-trip-progress-d573 andrew/spa-264-trip-progress
+CONTRACT_CANDIDATE_REFS ?=
 CONTRACT_URL     := https://raw.githubusercontent.com/$(CONTRACT_REPO)/$(CONTRACT_REF)/$(CONTRACT_FIXTURE)
 
 TEST_VALHALLA_URL ?=
@@ -92,6 +90,10 @@ check-contract:
 	echo "'-' is the API's copy, '+' is this repository's." >&2; \
 	echo "copy the API's file over $(CONTRACT_FIXTURE) and make the struct in" >&2; \
 	echo "internal/routing/message.go agree with it." >&2; \
+	echo >&2; \
+	echo "if the API's side is still in flight, name its branch to compare" >&2; \
+	echo "against that instead:" >&2; \
+	echo "  make check-contract CONTRACT_CANDIDATE_REFS=their/branch" >&2; \
 	exit 1
 
 mq-up:
@@ -126,11 +128,12 @@ mq-down:
 vet: deps
 	go vet ./...
 
-lint: $(GOLANGCI_LINT)
-	$(GOLANGCI_LINT) run ./...
-
-$(GOLANGCI_LINT):
-	GOBIN=$(GOBIN) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+lint:
+	@gobin="$$(go env GOPATH)/bin"; \
+	if [ ! -x "$$gobin/golangci-lint" ]; then \
+		GOBIN="$$gobin" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
+	fi; \
+	"$$gobin/golangci-lint" run ./...
 
 tidy:
 	go mod tidy

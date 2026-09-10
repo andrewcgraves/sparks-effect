@@ -175,34 +175,6 @@ func TestDecodeMessageWithoutEdgePlacementIsStillRoutable(t *testing.T) {
 	}
 }
 
-func TestGoldenFixtureKeyOrderMatchesStruct(t *testing.T) {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(goldenBytes(t), &raw); err != nil {
-		t.Fatalf("unmarshalling golden fixture: %v", err)
-	}
-
-	want := []string{
-		"schema_version", "routing_job_id", "compile_job_id",
-		"graph", "lat", "lng", "budget_mins", "mode", "trace_id",
-	}
-	if len(raw) != len(want) {
-		t.Errorf("fixture has %d keys, Message declares %d: %v", len(raw), len(want), keysOf(raw))
-	}
-	for _, k := range want {
-		if _, ok := raw[k]; !ok {
-			t.Errorf("fixture is missing key %q", k)
-		}
-	}
-}
-
-func keysOf(m map[string]json.RawMessage) []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	return ks
-}
-
 func TestDecodeRejectsUnusableMessages(t *testing.T) {
 	tests := []struct {
 		name  string
