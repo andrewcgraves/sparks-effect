@@ -17,6 +17,22 @@ The Postgres schema is owned by sparks-effect-api's migration sequence. This
 repository runs no migrations and holds no database connection; job writes
 go through authenticated API endpoints.
 
+## Domain vocabulary
+
+[`CONTEXT.md`](CONTEXT.md) defines this repository's own words — chaining, access
+and egress legs, journey and leg, reached vs reachable, starter station and
+starter walk, publication, the departure clock, synthetic. Shared domain
+vocabulary (scenario, service, station, node, edge, dwell, boarding wait, mode vs
+costing, the error codes, the job statuses) is defined once in
+[sparks-effect-api's `CONTEXT.md`](https://github.com/andrewcgraves/sparks-effect-api/blob/main/CONTEXT.md),
+which this file links to rather than restating. Use those words; do not mint
+synonyms.
+
+Declaration-level doc comments were deliberately removed from this source in
+SPA-307 because they restated their declarations. Domain meaning belongs in
+`CONTEXT.md`; rationale belongs in in-function comments and the README. Do not
+reintroduce godoc that only repeats a name.
+
 ## Branching
 
 One trunk: `main`. Branch from it, PR into it. No `prd` branch here. See
