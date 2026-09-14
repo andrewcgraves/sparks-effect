@@ -14,6 +14,7 @@ import (
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
 
@@ -78,9 +79,9 @@ func TestConsumerHandle_settlementLoggingAdoptsTheMessagesTrace(t *testing.T) {
 	var buf bytes.Buffer
 	log := logger.New(&buf, false)
 	handler := NewHandler(nullStore{}, &valhalla.StubClient{IsochroneErr: valhalla.ErrUpstream},
-		valhalla.DefaultLimits(), isochrone.EgressCache{}, log)
+		valhalla.DefaultLimits(), isochrone.EgressCache{}, log, nil)
 
-	NewConsumer("amqp://unused", "q", "q.dead", 3, handler, log).
+	NewConsumer("amqp://unused", "q", "q.dead", 3, handler, log, nil).
 		handle(context.Background(), amqp.Delivery{Body: body})
 
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
@@ -95,6 +96,23 @@ func TestConsumerHandle_settlementLoggingAdoptsTheMessagesTrace(t *testing.T) {
 		if parsed["trace_id"] != wantTrace {
 			t.Errorf("log line %d has trace_id %v, want %q\nline: %s", i, parsed["trace_id"], wantTrace, line)
 		}
+	}
+}
+
+func TestConsumerHandle_countsDeadLettersWhenRetriesAreExhausted(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "routing", "testdata", "message.golden.json"))
+	if err != nil {
+		t.Fatalf("reading golden fixture: %v", err)
+	}
+
+	m := &metrics.Set{}
+	handler := NewHandler(nullStore{}, &valhalla.StubClient{IsochroneErr: valhalla.ErrUpstream},
+		valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.Discard(), m)
+
+	NewConsumer("amqp://unused", "q", "q.dead", 0, handler, logger.Discard(), m).
+		handle(context.Background(), amqp.Delivery{Body: body})
+	if got := m.DeadLetterCount(); got != 1 {
+		t.Errorf("dead-letter count = %d, want 1", got)
 	}
 }
 

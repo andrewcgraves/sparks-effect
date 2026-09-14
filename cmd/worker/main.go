@@ -10,10 +10,12 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/config"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/worker"
@@ -67,7 +69,8 @@ func main() {
 	if opts.check {
 		log.Info(ctx, "config: ok",
 			"valhalla_synthetic", cfg.ValhallaSynthetic,
-			"routing_queue", cfg.RoutingQueue)
+			"routing_queue", cfg.RoutingQueue,
+			"metrics_addr", cfg.MetricsAddr)
 		return
 	}
 
@@ -109,13 +112,23 @@ func run(cfg config.Config, log *logger.Logger) error {
 		return err
 	}
 
-	cache := isochrone.EgressCache{Store: repo, TilesetAt: tilesetAt}
+	routingClient = metrics.ObserveValhalla(routingClient)
+	cache := isochrone.EgressCache{Store: repo, TilesetAt: tilesetAt, Metrics: metrics.Process}
 
-	handler := worker.NewHandler(repo, routingClient, cfg.Limits, cache, log)
-	consumer := worker.NewConsumer(cfg.AMQPURL, cfg.RoutingQueue, cfg.DeadLetterQueue, cfg.MaxRetries, handler, log)
+	handler := worker.NewHandler(repo, routingClient, cfg.Limits, cache, log, metrics.Process)
+	consumer := worker.NewConsumer(cfg.AMQPURL, cfg.RoutingQueue, cfg.DeadLetterQueue, cfg.MaxRetries, handler, log, metrics.Process)
 	defer consumer.Close()
 
-	return consumer.Run(ctx)
+	log.Info(ctx, "routing: serving metrics", "addr", cfg.MetricsAddr)
+
+	g, ctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		return metrics.Serve(ctx, cfg.MetricsAddr)
+	})
+	g.Go(func() error {
+		return consumer.Run(ctx)
+	})
+	return g.Wait()
 }
 
 func newRoutingClient(ctx context.Context, cfg config.Config, log *logger.Logger) (valhalla.Client, time.Time, error) {

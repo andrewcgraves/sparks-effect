@@ -10,6 +10,7 @@ import (
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/transit"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
@@ -500,5 +501,88 @@ func TestChainer_fanOutFailureStillFailsTheChain(t *testing.T) {
 	}
 	if got := len(cache.written()); got != 0 {
 		t.Errorf("a failed chain wrote %d cache entries, want 0", got)
+	}
+}
+
+func TestChainer_cacheLookupsAreCounted(t *testing.T) {
+	cache := newFakeCache()
+	m := &metrics.Set{}
+	egress := isochrone.EgressCache{Store: cache, Metrics: m}
+
+	if _, err := newCachingChainer(twoReachableStations(), viaTransitGraph(), egress).
+		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
+		t.Fatalf("cold Chain: %v", err)
+	}
+	if got := m.CacheCount(metrics.ResultHit); got != 0 {
+		t.Errorf("cold hits = %d, want 0", got)
+	}
+	if got := m.CacheCount(metrics.ResultMiss); got != 2 {
+		t.Errorf("cold misses = %d, want 2", got)
+	}
+
+	if _, err := newCachingChainer(twoReachableStations(), viaTransitGraph(), egress).
+		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
+		t.Fatalf("warm Chain: %v", err)
+	}
+	if got := m.CacheCount(metrics.ResultHit); got != 2 {
+		t.Errorf("warm hits = %d, want 2", got)
+	}
+	if got := m.CacheCount(metrics.ResultMiss); got != 2 {
+		t.Errorf("warm misses = %d, want 2 (the cold misses still counted)", got)
+	}
+}
+
+func TestChainer_unavailableCacheCountsAsMisses(t *testing.T) {
+	cache := newFakeCache()
+	cache.getErr = errors.New("connection refused")
+	m := &metrics.Set{}
+
+	if _, err := newCachingChainer(twoReachableStations(), viaTransitGraph(), isochrone.EgressCache{Store: cache, Metrics: m}).
+		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	if got := m.CacheCount(metrics.ResultMiss); got != 2 {
+		t.Errorf("misses = %d, want 2", got)
+	}
+}
+
+func TestChainer_zeroCacheDoesNotCountLookups(t *testing.T) {
+	m := &metrics.Set{}
+
+	if _, err := newCachingChainer(twoReachableStations(), viaTransitGraph(), isochrone.EgressCache{Metrics: m}).
+		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	if got := m.CacheCount(metrics.ResultHit); got != 0 {
+		t.Errorf("hits = %d, want 0", got)
+	}
+	if got := m.CacheCount(metrics.ResultMiss); got != 0 {
+		t.Errorf("misses = %d, want 0 — no cache is not a miss", got)
+	}
+}
+
+func TestChainer_corruptEntryCountsAsAMiss(t *testing.T) {
+	cache := newFakeCache()
+	cache.seed(store.IsochroneKey{
+		CompileJobID: "compile-1", StationSlug: "station-a", Mode: "walk", ContourMins: 79,
+	}, json.RawMessage(`{"type":"FeatureColl`))
+	sound, err := json.Marshal(cannedIso())
+	if err != nil {
+		t.Fatalf("marshalling fixture: %v", err)
+	}
+	cache.seed(store.IsochroneKey{
+		CompileJobID: "compile-1", StationSlug: "station-b", Mode: "walk", ContourMins: 75,
+	}, sound)
+
+	m := &metrics.Set{}
+	if _, err := newCachingChainer(twoReachableStations(), viaTransitGraph(), isochrone.EgressCache{Store: cache, Metrics: m}).
+		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	if got := m.CacheCount(metrics.ResultHit); got != 1 {
+		t.Errorf("hits = %d, want 1 (the readable station)", got)
+	}
+	if got := m.CacheCount(metrics.ResultMiss); got != 1 {
+		t.Errorf("misses = %d, want 1 (the corrupt station)", got)
 	}
 }

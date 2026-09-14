@@ -8,6 +8,7 @@ import (
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/routing"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/transit"
@@ -48,6 +49,7 @@ type Handler struct {
 	limits  valhalla.Limits
 	cache   isochrone.EgressCache
 	log     *logger.Logger
+	metrics *metrics.Set
 }
 
 func NewHandler(
@@ -56,8 +58,9 @@ func NewHandler(
 	limits valhalla.Limits,
 	cache isochrone.EgressCache,
 	log *logger.Logger,
+	metricSet *metrics.Set,
 ) *Handler {
-	return &Handler{store: s, routing: routingClient, limits: limits, cache: cache, log: log}
+	return &Handler{store: s, routing: routingClient, limits: limits, cache: cache, log: log, metrics: metricSet}
 }
 
 func (h *Handler) Handle(ctx context.Context, body []byte) Result {
@@ -67,6 +70,7 @@ func (h *Handler) Handle(ctx context.Context, body []byte) Result {
 
 	res := h.handle(ctx, msg, err)
 	res.TraceID = msg.TraceID
+	h.metrics.Job(res.Outcome.String())
 	return res
 }
 

@@ -11,6 +11,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
 )
 
 const traceIDHeader = "x-trace-id"
@@ -26,12 +27,13 @@ type Consumer struct {
 	maxRetries int
 	handler    *Handler
 	log        *logger.Logger
+	metrics    *metrics.Set
 	mu         sync.Mutex
 	conn       *amqp.Connection
 	ch         *amqp.Channel
 }
 
-func NewConsumer(url, queue, deadLetter string, maxRetries int, handler *Handler, log *logger.Logger) *Consumer {
+func NewConsumer(url, queue, deadLetter string, maxRetries int, handler *Handler, log *logger.Logger, metricSet *metrics.Set) *Consumer {
 	return &Consumer{
 		url:        url,
 		queue:      queue,
@@ -39,6 +41,7 @@ func NewConsumer(url, queue, deadLetter string, maxRetries int, handler *Handler
 		maxRetries: maxRetries,
 		handler:    handler,
 		log:        log,
+		metrics:    metricSet,
 	}
 }
 
@@ -95,6 +98,7 @@ func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
 			if res.JobID != "" {
 				c.handler.Fail(ctx, res.JobID, fmt.Errorf("exhausted %d retries: %w", c.maxRetries, res.Err))
 			}
+			c.metrics.DeadLetter()
 			c.deadLetterDelivery(ctx, d, res)
 			return
 		}

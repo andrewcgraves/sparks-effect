@@ -9,6 +9,7 @@ import (
 )
 
 func TestDefaultsMatchTheDeployedContainer(t *testing.T) {
+	t.Setenv("METRICS_ADDR", "")
 	cfg := config.Load()
 
 	if cfg.RoutingQueue != "routing.jobs" {
@@ -19,6 +20,9 @@ func TestDefaultsMatchTheDeployedContainer(t *testing.T) {
 	}
 	if cfg.MaxRetries <= 0 {
 		t.Errorf("MaxRetries = %d, want a positive bound", cfg.MaxRetries)
+	}
+	if cfg.MetricsAddr != ":9090" {
+		t.Errorf("MetricsAddr = %q, want :9090", cfg.MetricsAddr)
 	}
 
 	if cfg.Limits.MaxIsoContourMins != 320 {
@@ -222,6 +226,13 @@ func TestAPICredentialsHaveNoDefault(t *testing.T) {
 	}
 	if got := config.Load().WorkerToken; got != "" {
 		t.Errorf("WorkerToken = %q, want empty when unset", got)
+	}
+}
+
+func TestMetricsAddrIsOverridable(t *testing.T) {
+	t.Setenv("METRICS_ADDR", "127.0.0.1:9191")
+	if got := config.Load().MetricsAddr; got != "127.0.0.1:9191" {
+		t.Errorf("MetricsAddr = %q, want 127.0.0.1:9191", got)
 	}
 }
 

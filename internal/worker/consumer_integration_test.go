@@ -12,6 +12,7 @@ import (
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/testsupport"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
@@ -32,6 +33,7 @@ type harness struct {
 	client    valhalla.Client
 	url       string
 	tilesetAt time.Time
+	metrics   *metrics.Set
 }
 
 func newHarness(t *testing.T, client valhalla.Client) *harness {
@@ -52,9 +54,10 @@ func newHarness(t *testing.T, client valhalla.Client) *harness {
 func (h *harness) run(t *testing.T, maxRetries int) (stop, kill func()) {
 	t.Helper()
 
-	cache := isochrone.EgressCache{Store: h.store, TilesetAt: h.tilesetAt}
-	handler := worker.NewHandler(h.store, h.client, valhalla.DefaultLimits(), cache, logger.Discard())
-	consumer := worker.NewConsumer(h.url, testQueue, testDeadLetter, maxRetries, handler, logger.Discard())
+	h.metrics = &metrics.Set{}
+	cache := isochrone.EgressCache{Store: h.store, TilesetAt: h.tilesetAt, Metrics: h.metrics}
+	handler := worker.NewHandler(h.store, h.client, valhalla.DefaultLimits(), cache, logger.Discard(), h.metrics)
+	consumer := worker.NewConsumer(h.url, testQueue, testDeadLetter, maxRetries, handler, logger.Discard(), h.metrics)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -267,6 +270,9 @@ func TestEndToEnd_transientFailureRetriesThenDeadLetters(t *testing.T) {
 	}
 	if got := testsupport.QueueDepth(t, h.ch, testQueue); got != 0 {
 		t.Errorf("live queue depth = %d, want 0 — the message should have moved on", got)
+	}
+	if got := h.metrics.DeadLetterCount(); got != 1 {
+		t.Errorf("dead-letter counter = %d, want 1", got)
 	}
 
 	_, errMsg, _ := h.api.JobStatus(t, goldenJobID)

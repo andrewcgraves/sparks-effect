@@ -24,6 +24,7 @@ type Config struct {
 	ValhallaTimeout   time.Duration
 	Limits            valhalla.Limits
 	Debug             bool
+	MetricsAddr       string
 }
 
 const defaultRoutingQueue = "routing.jobs"
@@ -50,6 +51,7 @@ const (
 	envMaxConcurrency    = "VALHALLA_MAX_CONCURRENCY"
 	envLogLevel          = "LOG_LEVEL"
 	envVerbose           = "VERBOSE"
+	envMetricsAddr       = "METRICS_ADDR"
 )
 
 var knownEnv = map[string]struct{}{
@@ -70,6 +72,7 @@ var knownEnv = map[string]struct{}{
 	envMaxConcurrency:    {},
 	envLogLevel:          {},
 	envVerbose:           {},
+	envMetricsAddr:       {},
 }
 
 var watchedPrefixes = []string{
@@ -103,6 +106,7 @@ func Load() Config {
 		ValhallaTimeout:   time.Duration(envInt(envValhallaTimeout, int(valhalla.DefaultTimeout.Seconds()))) * time.Second,
 		Limits:            limits,
 		Debug:             os.Getenv(envLogLevel) == "debug" || os.Getenv(envVerbose) == "true",
+		MetricsAddr:       getEnv(envMetricsAddr, ":9090"),
 	}
 }
 

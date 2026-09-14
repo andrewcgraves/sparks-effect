@@ -12,6 +12,7 @@ import (
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/worker"
@@ -91,7 +92,7 @@ func mutateGolden(t *testing.T, mut func(m map[string]any)) []byte {
 }
 
 func newHandler(s store.RoutingJobStore, client valhalla.Client) *worker.Handler {
-	return worker.NewHandler(s, client, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.Discard())
+	return worker.NewHandler(s, client, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.Discard(), nil)
 }
 
 type recordingCache struct {
@@ -120,7 +121,7 @@ func TestHandle_consultsTheEgressCacheForTheMessagesCompileJob(t *testing.T) {
 	s := &fakeStore{}
 	cache := &recordingCache{}
 	h := worker.NewHandler(s, valhalla.NewSyntheticClient(), valhalla.DefaultLimits(),
-		isochrone.EgressCache{Store: cache}, logger.Discard())
+		isochrone.EgressCache{Store: cache}, logger.Discard(), nil)
 
 	msg := mutateGolden(t, func(m map[string]any) { m["budget_mins"] = 90 })
 
@@ -341,7 +342,7 @@ func TestHandle_logsUnderTheTraceTheMessageCarries(t *testing.T) {
 	var buf strings.Builder
 	s := &fakeStore{}
 	h := worker.NewHandler(s, valhalla.NewSyntheticClient(), valhalla.DefaultLimits(),
-		isochrone.EgressCache{}, logger.New(&buf, false))
+		isochrone.EgressCache{}, logger.New(&buf, false), nil)
 
 	res := h.Handle(context.Background(), goldenMessage(t))
 	if res.Outcome != worker.OutcomeSucceeded {
@@ -363,7 +364,7 @@ func TestHandle_logsARejectedMessageUnderItsTrace(t *testing.T) {
 	var buf strings.Builder
 	s := &fakeStore{}
 	h := worker.NewHandler(s, valhalla.NewSyntheticClient(), valhalla.DefaultLimits(),
-		isochrone.EgressCache{}, logger.New(&buf, false))
+		isochrone.EgressCache{}, logger.New(&buf, false), nil)
 
 	body := mutateGolden(t, func(m map[string]any) { m["mode"] = "teleport" })
 	if res := h.Handle(context.Background(), body); res.TraceID != goldenTraceID {
@@ -381,7 +382,7 @@ func TestHandle_messageWithoutATraceKeepsTheHeadersTrace(t *testing.T) {
 	var buf strings.Builder
 	s := &fakeStore{}
 	h := worker.NewHandler(s, valhalla.NewSyntheticClient(), valhalla.DefaultLimits(),
-		isochrone.EgressCache{}, logger.New(&buf, false))
+		isochrone.EgressCache{}, logger.New(&buf, false), nil)
 
 	body := mutateGolden(t, func(m map[string]any) { delete(m, "trace_id") })
 	ctx := logger.WithTraceID(context.Background(), "from-the-header")
@@ -439,6 +440,45 @@ func TestHandle_syntheticClientMarksItsOutput(t *testing.T) {
 	for i, f := range parsed.Features {
 		if f.Properties["synthetic"] != true {
 			t.Errorf("feature %d is not marked synthetic: %v", i, f.Properties)
+		}
+	}
+}
+
+func TestHandle_countsJobOutcomes(t *testing.T) {
+	tests := []struct {
+		name   string
+		body   []byte
+		client valhalla.Client
+		want   string
+	}{
+		{"succeeded", goldenMessage(t), valhalla.NewSyntheticClient(), "succeeded"},
+		{"permanent", mutateGolden(t, func(m map[string]any) { m["mode"] = "teleport" }), valhalla.NewSyntheticClient(), "permanent"},
+		{"transient", goldenMessage(t), &valhalla.StubClient{IsochroneErr: valhalla.ErrUpstream}, "transient"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &metrics.Set{}
+			h := worker.NewHandler(&fakeStore{}, tc.client, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.Discard(), m)
+			res := h.Handle(context.Background(), tc.body)
+			if res.Outcome.String() != tc.want {
+				t.Fatalf("Outcome = %s, want %s (err %v)", res.Outcome, tc.want, res.Err)
+			}
+			if got := m.JobCount(tc.want); got != 1 {
+				t.Errorf("%s count = %d, want 1", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestFail_doesNotCountAJob(t *testing.T) {
+	m := &metrics.Set{}
+	h := worker.NewHandler(&fakeStore{}, valhalla.NewSyntheticClient(), valhalla.DefaultLimits(),
+		isochrone.EgressCache{}, logger.Discard(), m)
+	h.Fail(context.Background(), "job-1", errors.New("exhausted 3 retries"))
+
+	for _, outcome := range []string{"succeeded", "permanent", "transient"} {
+		if got := m.JobCount(outcome); got != 0 {
+			t.Errorf("JobsTotal{%s} = %d; Fail is not a settlement", outcome, got)
 		}
 	}
 }

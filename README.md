@@ -213,10 +213,28 @@ fields — written via the standard library's `log/slog`. `LOG_LEVEL=debug` (or
 hits, per-candidate routing decisions. Anything else — including the
 default, unset — stays at info level: a job's arrival, the decisions that
 shape its result (contour clamping, matrix truncation, cache hits/misses),
-and its outcome, but not the blow-by-blow. This worker runs no migrations and
-ships no metrics exporter of its own; these logs are what SPA-193 exists to
-make queryable, ahead of the Grafana Alloy hookup that will ship them
-somewhere queryable.
+and its outcome, but not the blow-by-blow.
+
+The worker also serves four Prometheus counters on `:9090/metrics` (override
+with `METRICS_ADDR`):
+
+| Metric | Labels | What it counts |
+|---|---|---|
+| `routing_jobs_total` | `outcome=succeeded\|permanent\|transient` | Jobs settled by the handler |
+| `isochrone_cache_total` | `result=hit\|miss` | Egress-polygon cache lookups |
+| `routing_dead_letters_total` | — | Jobs moved to the dead-letter queue after retries run out |
+| `valhalla_errors_total` | `class=bad_request\|rate_limit\|upstream` | Errors from the Valhalla client |
+
+Label values are the same vocabulary the handler and client already use
+(`Outcome.String()`, `ErrBadRequest` / `ErrRateLimit` / `ErrUpstream`).
+Series are initialised at zero so a cold cache is `hit=0, miss>0` on a
+dashboard, not an empty panel. An unreadable cache entry and a failed Get
+count as misses; no cache configured is not a miss.
+
+Scraping is configured in `kustomize-config`: a `prometheus.io/scrape` /
+`prometheus.io/port` annotation on the worker Deployment, and pod-metrics
+discovery in `config.alloy`. Without those, `/metrics` is served but never
+collected.
 
 A `trace_id` field is attached to every log line written while a job is being
 processed, so one isochrone can be followed across both services on one value.

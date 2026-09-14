@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
@@ -13,6 +14,7 @@ import (
 type EgressCache struct {
 	Store     store.IsochroneCache
 	TilesetAt time.Time
+	Metrics   *metrics.Set
 }
 
 func (e EgressCache) lookup(
@@ -27,6 +29,7 @@ func (e EgressCache) lookup(
 	rows, err := e.Store.Get(ctx, keys)
 	if err != nil {
 		log.Warn(ctx, "isochrone: egress cache unavailable, computing instead", "err", err.Error())
+		e.Metrics.Cache(metrics.ResultMiss, len(keys))
 		return nil
 	}
 
@@ -45,6 +48,17 @@ func (e EgressCache) lookup(
 		}
 		hits[k] = &iso
 	}
+
+	nHit, nMiss := 0, 0
+	for _, k := range keys {
+		if _, ok := hits[k]; ok {
+			nHit++
+		} else {
+			nMiss++
+		}
+	}
+	e.Metrics.Cache(metrics.ResultHit, nHit)
+	e.Metrics.Cache(metrics.ResultMiss, nMiss)
 	return hits
 }
 
