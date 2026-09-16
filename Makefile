@@ -11,11 +11,13 @@ TEST_MQ_CONTAINER := sparks-effect-worker-test-mq
 TEST_MQ_PORT      := 5673
 TEST_AMQP_URL     := amqp://guest:guest@localhost:$(TEST_MQ_PORT)/
 
-CONTRACT_FIXTURE := internal/routing/testdata/message.golden.json
 CONTRACT_REPO    := andrewcgraves/sparks-effect-api
 CONTRACT_REF     ?= main
 CONTRACT_CANDIDATE_REFS ?=
-CONTRACT_URL     := https://raw.githubusercontent.com/$(CONTRACT_REPO)/$(CONTRACT_REF)/$(CONTRACT_FIXTURE)
+MESSAGE_FIXTURE     := internal/routing/testdata/message.golden.json
+STORE_FIXTURE       := internal/store/testdata/worker-store.golden.json
+API_MESSAGE_FIXTURE := internal/routing/testdata/message.golden.json
+API_STORE_FIXTURE   := internal/handler/testdata/worker-store.golden.json
 
 TEST_VALHALLA_URL ?=
 
@@ -60,41 +62,60 @@ acceptance: deps
 	TEST_TRANSIT_DEPART_AT="$(TEST_TRANSIT_DEPART_AT)" \
 		go test ./internal/valhalla/ -run Acceptance -count=1 -v
 
+# Diff both golden fixtures against the API's copies. The message and the
+# worker-store envelope are two files; matching the message must not skip
+# the store check. Fetching unpinned main is deliberate — see the API Makefile.
+#
+# The API keeps the store golden at internal/handler/; this repo keeps it
+# next to the client that sends it. check-contract maps the paths. The API's
+# job curls this file at $(STORE_FIXTURE).
 check-contract:
 	@theirs=$$(mktemp); trap 'rm -f "$$theirs"' EXIT; \
-	echo "fetching $(CONTRACT_URL)"; \
-	curl -fsSL "$(CONTRACT_URL)" -o "$$theirs" || { \
-		echo "could not fetch the API's fixture from $(CONTRACT_URL)" >&2; exit 1; }; \
-	if diff -q "$$theirs" $(CONTRACT_FIXTURE) >/dev/null; then \
-		echo "$(CONTRACT_FIXTURE) matches sparks-effect-api@$(CONTRACT_REF)"; \
-		exit 0; \
-	fi; \
-	for ref in $(CONTRACT_CANDIDATE_REFS); do \
-		url="https://raw.githubusercontent.com/$(CONTRACT_REPO)/$$ref/$(CONTRACT_FIXTURE)"; \
-		echo "fetching $$url"; \
-		if ! curl -fsSL "$$url" -o "$$theirs"; then \
-			echo "skipping sparks-effect-api@$$ref (not fetchable)"; \
-			continue; \
+	failed=0; \
+	check_one() { \
+		_local=$$1; _remote=$$2; _name=$$3; \
+		_url="https://raw.githubusercontent.com/$(CONTRACT_REPO)/$(CONTRACT_REF)/$$_remote"; \
+		echo "fetching $$_url"; \
+		if ! curl -fsSL "$$_url" -o "$$theirs"; then \
+			echo "could not fetch the API's $$_name fixture from $$_url" >&2; \
+			return 1; \
 		fi; \
-		if diff -q "$$theirs" $(CONTRACT_FIXTURE) >/dev/null; then \
-			echo "$(CONTRACT_FIXTURE) matches sparks-effect-api@$$ref (in-flight; $(CONTRACT_REF) does not have it yet)"; \
-			exit 0; \
+		if diff -q "$$theirs" "$$_local" >/dev/null; then \
+			echo "$$_local matches sparks-effect-api@$(CONTRACT_REF)"; \
+			return 0; \
 		fi; \
-	done; \
-	echo "fetching $(CONTRACT_URL)"; \
-	curl -fsSL "$(CONTRACT_URL)" -o "$$theirs" || { \
-		echo "could not fetch the API's fixture from $(CONTRACT_URL)" >&2; exit 1; }; \
-	diff -u "$$theirs" $(CONTRACT_FIXTURE) || true; \
-	echo >&2; \
-	echo "the message contract has drifted from sparks-effect-api@$(CONTRACT_REF)." >&2; \
-	echo "'-' is the API's copy, '+' is this repository's." >&2; \
-	echo "copy the API's file over $(CONTRACT_FIXTURE) and make the struct in" >&2; \
-	echo "internal/routing/message.go agree with it." >&2; \
-	echo >&2; \
-	echo "if the API's side is still in flight, name its branch to compare" >&2; \
-	echo "against that instead:" >&2; \
-	echo "  make check-contract CONTRACT_CANDIDATE_REFS=their/branch" >&2; \
-	exit 1
+		set -- $(CONTRACT_CANDIDATE_REFS); \
+		for _ref in "$$@"; do \
+			_curl="https://raw.githubusercontent.com/$(CONTRACT_REPO)/$$_ref/$$_remote"; \
+			echo "fetching $$_curl"; \
+			if ! curl -fsSL "$$_curl" -o "$$theirs"; then \
+				echo "skipping sparks-effect-api@$$_ref (not fetchable)"; \
+				continue; \
+			fi; \
+			if diff -q "$$theirs" "$$_local" >/dev/null; then \
+				echo "$$_local matches sparks-effect-api@$$_ref (in-flight; $(CONTRACT_REF) does not have it yet)"; \
+				return 0; \
+			fi; \
+		done; \
+		_url="https://raw.githubusercontent.com/$(CONTRACT_REPO)/$(CONTRACT_REF)/$$_remote"; \
+		curl -fsSL "$$_url" -o "$$theirs" || { \
+			echo "could not fetch the API's $$_name fixture from $$_url" >&2; \
+			return 1; \
+		}; \
+		diff -u "$$theirs" "$$_local" || true; \
+		echo >&2; \
+		echo "the $$_name contract has drifted from sparks-effect-api@$(CONTRACT_REF)." >&2; \
+		echo "'-' is the API's copy, '+' is this repository's." >&2; \
+		echo "copy the API's file over $$_local and make the wire types agree with it." >&2; \
+		echo >&2; \
+		echo "if the API's side is still in flight, name its branch to compare" >&2; \
+		echo "against that instead:" >&2; \
+		echo "  make check-contract CONTRACT_CANDIDATE_REFS=their/branch" >&2; \
+		return 1; \
+	}; \
+	check_one "$(MESSAGE_FIXTURE)" "$(API_MESSAGE_FIXTURE)" "message" || failed=1; \
+	check_one "$(STORE_FIXTURE)" "$(API_STORE_FIXTURE)" "worker-store" || failed=1; \
+	exit $$failed
 
 mq-up:
 	@if [ -z "$$($(DOCKER) ps -q -f name=^/$(TEST_MQ_CONTAINER)$$)" ]; then \

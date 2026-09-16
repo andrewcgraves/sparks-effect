@@ -27,13 +27,15 @@ publishing. By the time a message exists it names one specific immutable
 compiled graph and carries it inline, so this worker needs no database of its
 own to read graphs from and no piece of resolution logic crosses the boundary.
 
-The message contract is pinned by `internal/routing/testdata/message.golden.json`
-— the same file, byte for byte, that the API asserts it produces. Nothing else
-stops the two hand-maintained copies of the struct drifting apart, so
-`make check-contract` fetches the API's copy and diffs it, and CI runs it on
+The queue-message contract is pinned by `internal/routing/testdata/message.golden.json`
+and the worker-store HTTP envelope by `internal/store/testdata/worker-store.golden.json`
+— the same files, byte for byte, that the API asserts it produces. Nothing else
+stops the two hand-maintained copies of the structs drifting apart, so
+`make check-contract` fetches the API's copies and diffs them, and CI runs it on
 every push. That check can go red without anything here changing: the API
 merging a new field is enough, and means this side has a fixture to copy in and
-a struct to update.
+a struct to update. The API's contract job curls these paths; a missing file
+here 404s that job rather than reporting drift.
 
 ## What it owns
 
@@ -251,7 +253,7 @@ changes.
 make dev-workflow    # test, vet, lint, build — run this before pushing
 make check-config    # Validate() against .env; no AMQP/API/Valhalla
 make itest           # throwaway RabbitMQ, full integration suite, teardown
-make check-contract  # diff the golden message fixture against sparks-effect-api
+make check-contract  # diff the golden fixtures against sparks-effect-api
 ```
 
 `check-contract` is not part of `dev-workflow` because it needs the network and

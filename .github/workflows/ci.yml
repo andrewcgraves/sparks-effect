@@ -31,7 +31,7 @@ jobs:
           version: v2.12.2
 
   contract:
-    name: Message contract
+    name: API↔worker contract
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,7 +39,7 @@ jobs:
       # No setup-go: check-contract is curl and diff. Keep it that way — a
       # variable that expands `go` anywhere in the Makefile puts a toolchain
       # download in front of this job.
-      - name: Diff the golden fixture against sparks-effect-api
+      - name: Diff the golden fixtures against sparks-effect-api
         run: make check-contract
 
   build:
