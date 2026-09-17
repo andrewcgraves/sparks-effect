@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
@@ -98,6 +99,7 @@ func newHandler(s store.RoutingJobStore, client valhalla.Client) *worker.Handler
 type recordingCache struct {
 	mu   sync.Mutex
 	gets []store.IsochroneKey
+	puts []store.CachedIsochrone
 }
 
 var _ store.IsochroneCache = (*recordingCache)(nil)
@@ -109,12 +111,49 @@ func (r *recordingCache) Get(_ context.Context, keys []store.IsochroneKey) (map[
 	return nil, nil
 }
 
-func (r *recordingCache) Put(context.Context, []store.CachedIsochrone) error { return nil }
+func (r *recordingCache) Put(_ context.Context, entries []store.CachedIsochrone) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.puts = append(r.puts, entries...)
+	return nil
+}
 
 func (r *recordingCache) asked() []store.IsochroneKey {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]store.IsochroneKey(nil), r.gets...)
+}
+
+func (r *recordingCache) written() []store.CachedIsochrone {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]store.CachedIsochrone(nil), r.puts...)
+}
+
+type stubStatusClient struct {
+	*valhalla.StubClient
+	routing valhalla.Client
+}
+
+func (c *stubStatusClient) Isochrone(
+	ctx context.Context,
+	req valhalla.IsochroneRequest,
+) (*valhalla.IsochroneResponse, error) {
+	return c.routing.Isochrone(ctx, req)
+}
+
+func (c *stubStatusClient) Matrix(
+	ctx context.Context,
+	req valhalla.MatrixRequest,
+) (*valhalla.MatrixResponse, error) {
+	return c.routing.Matrix(ctx, req)
+}
+
+func (c *stubStatusClient) Route(
+	ctx context.Context,
+	req valhalla.RouteRequest,
+) (*valhalla.RouteResponse, error) {
+	return c.routing.Route(ctx, req)
 }
 
 func TestHandle_consultsTheEgressCacheForTheMessagesCompileJob(t *testing.T) {
@@ -140,6 +179,86 @@ func TestHandle_consultsTheEgressCacheForTheMessagesCompileJob(t *testing.T) {
 		if k.Mode != "walk" {
 			t.Errorf("looked up mode %q, want the message's walk", k.Mode)
 		}
+	}
+}
+
+func TestHandle_refreshesTheTilesetStampForEachJob(t *testing.T) {
+	known := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	changed := known.Add(24 * time.Hour)
+
+	tests := []struct {
+		name         string
+		secondStatus valhalla.Status
+		secondErr    error
+		want         time.Time
+	}{
+		{
+			name:         "tileset changed",
+			secondStatus: valhalla.Status{Version: "3.5.1", TilesetAt: changed},
+			want:         changed,
+		},
+		{
+			name:         "status failed",
+			secondStatus: valhalla.Status{Version: "3.5.1", TilesetAt: changed},
+			secondErr:    errors.New("status unavailable"),
+			want:         known,
+		},
+		{
+			name:         "timestamp missing",
+			secondStatus: valhalla.Status{Version: "3.5.1"},
+			want:         known,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &fakeStore{}
+			cache := &recordingCache{}
+			client := &stubStatusClient{
+				StubClient: &valhalla.StubClient{
+					StatusResp: valhalla.Status{Version: "3.5.1", TilesetAt: known},
+				},
+				routing: valhalla.NewSyntheticClient(),
+			}
+			h := worker.NewHandler(s, client, valhalla.DefaultLimits(),
+				isochrone.EgressCache{Store: cache, Stamp: isochrone.NewTilesetStamp(time.Time{})},
+				logger.Discard(), nil)
+
+			first := mutateGolden(t, func(m map[string]any) { m["budget_mins"] = 90 })
+			if res := h.Handle(context.Background(), first); res.Outcome != worker.OutcomeSucceeded {
+				t.Fatalf("first Outcome = %v (err %v), want succeeded", res.Outcome, res.Err)
+			}
+			firstWrites := cache.written()
+			if len(firstWrites) == 0 {
+				t.Fatal("first job wrote no cache rows")
+			}
+			for _, entry := range firstWrites {
+				if !entry.TilesetAt.Equal(known) {
+					t.Fatalf("first stamp = %s, want %s", entry.TilesetAt, known)
+				}
+			}
+
+			client.StatusResp = tc.secondStatus
+			client.StatusErr = tc.secondErr
+			second := mutateGolden(t, func(m map[string]any) {
+				m["routing_job_id"] = "7a0620ff-8b86-d011-b42d-00c04fc964ff"
+				m["compile_job_id"] = "1a0620ff-8b86-d011-b42d-00c04fc964ff"
+				m["budget_mins"] = 90
+			})
+			if res := h.Handle(context.Background(), second); res.Outcome != worker.OutcomeSucceeded {
+				t.Fatalf("second Outcome = %v (err %v), want succeeded", res.Outcome, res.Err)
+			}
+
+			allWrites := cache.written()
+			if len(allWrites) == len(firstWrites) {
+				t.Fatal("second job wrote no cache rows")
+			}
+			for _, entry := range allWrites[len(firstWrites):] {
+				if !entry.TilesetAt.Equal(tc.want) {
+					t.Errorf("second stamp = %s, want %s", entry.TilesetAt, tc.want)
+				}
+			}
+		})
 	}
 }
 

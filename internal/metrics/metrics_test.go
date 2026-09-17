@@ -119,6 +119,24 @@ func TestObserveValhallaIgnoresUnclassifiedErrors(t *testing.T) {
 	}
 }
 
+func TestObserveValhallaDoesNotCountStatusErrors(t *testing.T) {
+	m := &Set{}
+	client := m.ObserveValhalla(&valhalla.StubClient{
+		IsochroneErr: valhalla.ErrUpstream,
+		StatusErr:    valhalla.ErrUpstream,
+	})
+
+	_, _ = client.Status(context.Background())
+	if got := m.ValhallaErrorCount(ClassUpstream); got != 0 {
+		t.Errorf("upstream count after Status = %d, want 0", got)
+	}
+
+	_, _ = client.Isochrone(context.Background(), valhalla.IsochroneRequest{})
+	if got := m.ValhallaErrorCount(ClassUpstream); got != 1 {
+		t.Errorf("upstream count after Isochrone = %d, want 1", got)
+	}
+}
+
 func TestServeListensUntilCancelled(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -199,12 +199,6 @@ func (c *valhallaClient) Route(ctx context.Context, req valhalla.RouteRequest) (
 	return resp, err
 }
 
-func (c *valhallaClient) Status(ctx context.Context) (valhalla.Status, error) {
-	resp, err := c.Client.Status(ctx)
-	c.metrics.observeValhalla(err)
-	return resp, err
-}
-
 func Serve(ctx context.Context, addr string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {

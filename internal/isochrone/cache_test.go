@@ -254,7 +254,8 @@ func TestChainer_cachedEntriesCarryTheTilesetStamp(t *testing.T) {
 	built := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 	cache := newFakeCache()
 	fc := twoReachableStations()
-	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache, TilesetAt: built})
+	chainer := newCachingChainer(fc, viaTransitGraph(),
+		isochrone.EgressCache{Store: cache, Stamp: isochrone.NewTilesetStamp(built)})
 
 	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("Chain: %v", err)

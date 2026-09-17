@@ -107,13 +107,15 @@ func run(cfg config.Config, log *logger.Logger) error {
 		return err
 	}
 
-	routingClient, tilesetAt, err := newRoutingClient(ctx, cfg, log)
+	routingClient, err := newRoutingClient(ctx, cfg, log)
 	if err != nil {
 		return err
 	}
 
 	routingClient = metrics.ObserveValhalla(routingClient)
-	cache := isochrone.EgressCache{Store: repo, TilesetAt: tilesetAt, Metrics: metrics.Process}
+	stamp := isochrone.NewTilesetStamp(time.Time{})
+	stamp.Refresh(ctx, routingClient, log)
+	cache := isochrone.EgressCache{Store: repo, Stamp: stamp, Metrics: metrics.Process}
 
 	handler := worker.NewHandler(repo, routingClient, cfg.Limits, cache, log, metrics.Process)
 	consumer := worker.NewConsumer(cfg.AMQPURL, cfg.RoutingQueue, cfg.DeadLetterQueue, cfg.MaxRetries, handler, log, metrics.Process)
@@ -131,14 +133,14 @@ func run(cfg config.Config, log *logger.Logger) error {
 	return g.Wait()
 }
 
-func newRoutingClient(ctx context.Context, cfg config.Config, log *logger.Logger) (valhalla.Client, time.Time, error) {
+func newRoutingClient(ctx context.Context, cfg config.Config, log *logger.Logger) (valhalla.Client, error) {
 	client, err := valhalla.NewClient(cfg.ValhallaClientConfig())
 	if err != nil {
-		return nil, time.Time{}, err
+		return nil, err
 	}
 	if cfg.ValhallaSynthetic {
 		log.Warn(ctx, "routing: VALHALLA_SYNTHETIC=true — serving SYNTHETIC isochrones, not real ones")
-		return client, time.Time{}, nil
+		return client, nil
 	}
 
 	log.Info(ctx, "routing: using Valhalla",
@@ -148,24 +150,5 @@ func newRoutingClient(ctx context.Context, cfg config.Config, log *logger.Logger
 		"max_concurrency", cfg.Limits.MaxConcurrency,
 
 		"service_area_zone", valhalla.ServiceAreaZone().String())
-	return client, reportTileset(ctx, client, log), nil
-}
-
-func reportTileset(ctx context.Context, client valhalla.Client, log *logger.Logger) time.Time {
-	statusCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	status, err := client.Status(statusCtx)
-	if err != nil {
-		log.Warn(ctx, "routing: could not read Valhalla /status", "err", err.Error())
-		return time.Time{}
-	}
-	if status.TilesetAt.IsZero() {
-		log.Warn(ctx, "routing: Valhalla reports no tileset timestamp", "valhalla_version", status.Version)
-		return time.Time{}
-	}
-	log.Info(ctx, "routing: Valhalla tileset",
-		"valhalla_version", status.Version,
-		"tileset_at", status.TilesetAt.Format(time.RFC3339))
-	return status.TilesetAt
+	return client, nil
 }

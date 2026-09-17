@@ -3,7 +3,6 @@ package isochrone
 import (
 	"context"
 	"encoding/json"
-	"time"
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
@@ -12,9 +11,9 @@ import (
 )
 
 type EgressCache struct {
-	Store     store.IsochroneCache
-	TilesetAt time.Time
-	Metrics   *metrics.Set
+	Store   store.IsochroneCache
+	Stamp   *TilesetStamp
+	Metrics *metrics.Set
 }
 
 func (e EgressCache) lookup(
@@ -73,6 +72,7 @@ func (e EgressCache) record(
 		return
 	}
 
+	tilesetAt := e.Stamp.Time()
 	entries := make([]store.CachedIsochrone, 0, len(misses))
 	for _, i := range misses {
 		if !usable(isos[i]) {
@@ -87,7 +87,7 @@ func (e EgressCache) record(
 		entries = append(entries, store.CachedIsochrone{
 			Key:       keys[i],
 			Geometry:  geometry,
-			TilesetAt: e.TilesetAt,
+			TilesetAt: tilesetAt,
 		})
 	}
 

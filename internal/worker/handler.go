@@ -97,6 +97,8 @@ func (h *Handler) handle(ctx context.Context, msg routing.Message, decodeErr err
 		return Result{Outcome: OutcomeTransient, JobID: msg.RoutingJobID, Err: err}
 	}
 
+	h.cache.Stamp.Refresh(ctx, h.routing, h.log)
+
 	graph := transit.CompiledGraph{Graph: msg.Graph}
 	chainer := isochrone.New(h.routing, graph, h.limits, h.cache, h.log)
 

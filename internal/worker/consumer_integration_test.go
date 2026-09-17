@@ -55,7 +55,9 @@ func (h *harness) run(t *testing.T, maxRetries int) (stop, kill func()) {
 	t.Helper()
 
 	h.metrics = &metrics.Set{}
-	cache := isochrone.EgressCache{Store: h.store, TilesetAt: h.tilesetAt, Metrics: h.metrics}
+	cache := isochrone.EgressCache{
+		Store: h.store, Stamp: isochrone.NewTilesetStamp(h.tilesetAt), Metrics: h.metrics,
+	}
 	handler := worker.NewHandler(h.store, h.client, valhalla.DefaultLimits(), cache, logger.Discard(), h.metrics)
 	consumer := worker.NewConsumer(h.url, testQueue, testDeadLetter, maxRetries, handler, logger.Discard(), h.metrics)
 
@@ -171,6 +173,8 @@ func TestEndToEnd_warmCacheReusesEgressPolygonsAcrossJobs(t *testing.T) {
 	if want := int(coldCalls) - 1; cached != want {
 		t.Errorf("cached %d polygons against %d isochrone calls, want %d (all but the origin)", cached, coldCalls, want)
 	}
+	// The harness seeds a non-zero stamp while SyntheticClient.Status returns
+	// ErrNoStatus, so Refresh must keep the last known stamp for this to pass.
 	for _, at := range h.api.IsochroneCacheStamps(goldenCompileID) {
 		if at.IsZero() || !at.Equal(h.tilesetAt) {
 			t.Errorf("cache row stamped %v, want the server's tileset %s", at, h.tilesetAt)

@@ -101,8 +101,10 @@ changing any compile job, and nothing here detects that. Rebuilds are rare and
 are already a deliberate operator ritual. To keep it diagnosable, each row
 records the server's tileset timestamp as *data only* — never part of the key,
 because keying on it would silently invalidate the entire cache on every rebuild.
-The stamp is read once at startup, so a rebuild under a running worker keeps
-stamping the old timestamp until the pod restarts.
+The stamp is refreshed from Valhalla `/status` at the start of each job. A failed
+status read keeps the last known stamp, or NULL if there has not been one, so a
+rebuild under a running worker does not require a restart to keep this diagnostic
+truthful.
 
 **Accepted risk, second one.** `departs_on` is a *date*, but since SPA-274 the
 egress request's departure also carries a time of day — the chain's departure
