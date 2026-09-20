@@ -189,9 +189,12 @@ func pickStarter(candidates []egressCandidate) *egressCandidate {
 		if ec.viaTransit {
 			continue
 		}
+		// Seconds, not accessMins: truncating to whole minutes made every
+		// station in the same minute a tie, and the slug tie-break then
+		// silently preferred one over another up to 59 seconds closer.
 		if starter == nil ||
-			ec.accessMins < starter.accessMins ||
-			(ec.accessMins == starter.accessMins && ec.node.Slug < starter.node.Slug) {
+			ec.accessSecs < starter.accessSecs ||
+			(ec.accessSecs == starter.accessSecs && ec.node.Slug < starter.node.Slug) {
 			starter = ec
 		}
 	}

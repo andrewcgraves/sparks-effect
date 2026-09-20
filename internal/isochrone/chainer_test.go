@@ -1219,41 +1219,54 @@ func TestChainer_starterIsTheShortestWalkThenTheSlug(t *testing.T) {
 			node("station-b", -122.41, 37.69),
 		},
 	}
-	fc := &valhalla.StubClient{
-		IsochroneResp: cannedIso(),
-		RouteResp:     cannedRoute(),
-		MatrixResp: &valhalla.MatrixResponse{
-			SourcesToTargets: [][]valhalla.MatrixCell{{
-				valhalla.Cell(612, tokenRoadKm),
-				valhalla.Cell(600, tokenRoadKm),
-			}},
+
+	cases := []struct {
+		name     string
+		accessA  int
+		accessB  int
+		wantSlug string
+	}{
+		{
+			name:     "seconds decide inside one whole minute",
+			accessA:  612,
+			accessB:  600,
+			wantSlug: "station-b",
+		},
+		{
+			name:     "shorter walk across a minute boundary",
+			accessA:  660,
+			accessB:  600,
+			wantSlug: "station-b",
+		},
+		{
+			name:     "equal seconds break on the slug",
+			accessA:  600,
+			accessB:  600,
+			wantSlug: "station-a",
 		},
 	}
 
-	resp, err := newChainer(fc, graph).Chain(context.Background(), req(90, transit.TravelModeWalk))
-	if err != nil {
-		t.Fatalf("Chain: %v", err)
-	}
-	if resp.Metadata.StarterWalk == nil || resp.Metadata.StarterWalk.StationSlug != "station-a" {
-		t.Errorf("StarterWalk = %+v, want station-a on the slug tie-break", resp.Metadata.StarterWalk)
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := &valhalla.StubClient{
+				IsochroneResp: cannedIso(),
+				RouteResp:     cannedRoute(),
+				MatrixResp: &valhalla.MatrixResponse{
+					SourcesToTargets: [][]valhalla.MatrixCell{{
+						valhalla.Cell(tc.accessA, tokenRoadKm),
+						valhalla.Cell(tc.accessB, tokenRoadKm),
+					}},
+				},
+			}
 
-	fc2 := &valhalla.StubClient{
-		IsochroneResp: cannedIso(),
-		RouteResp:     cannedRoute(),
-		MatrixResp: &valhalla.MatrixResponse{
-			SourcesToTargets: [][]valhalla.MatrixCell{{
-				valhalla.Cell(660, tokenRoadKm),
-				valhalla.Cell(600, tokenRoadKm),
-			}},
-		},
-	}
-	resp2, err := newChainer(fc2, graph).Chain(context.Background(), req(90, transit.TravelModeWalk))
-	if err != nil {
-		t.Fatalf("Chain: %v", err)
-	}
-	if resp2.Metadata.StarterWalk == nil || resp2.Metadata.StarterWalk.StationSlug != "station-b" {
-		t.Errorf("StarterWalk = %+v, want station-b as the shorter walk", resp2.Metadata.StarterWalk)
+			resp, err := newChainer(fc, graph).Chain(context.Background(), req(90, transit.TravelModeWalk))
+			if err != nil {
+				t.Fatalf("Chain: %v", err)
+			}
+			if resp.Metadata.StarterWalk == nil || resp.Metadata.StarterWalk.StationSlug != tc.wantSlug {
+				t.Errorf("StarterWalk = %+v, want %s", resp.Metadata.StarterWalk, tc.wantSlug)
+			}
+		})
 	}
 }
 
