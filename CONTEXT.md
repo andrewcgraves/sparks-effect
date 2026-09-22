@@ -34,7 +34,7 @@ origin ───────────────▶ station ─────�
 | **Origin isochrone** | The surface reachable from the origin without boarding anything. A station reached by walking alone needs no egress call: the origin polygon already covers its own reach |
 | **Journey** | The graph-side part: everything between stepping onto the first vehicle and stepping off the last, as one `transit.Reached` value. Access time in, ride and dwell and boarding wait accumulated, predecessor chain recorded |
 | **Leg** | One hop of that journey — a single `Edge` traversed, with its service, seconds and dwell. `Legs` on a reachable station is the whole ridden path, oldest first |
-| **Publication** | The act of the API publishing the queue message, and by extension the frozen inputs it carries. "The publication fixed the station positions" means: the graph in the message is immutable, so anything keyed on its compile job id can never go stale |
+| **Publication** | The act of the API publishing the queue message, and by extension the frozen inputs it carries. "The publication fixed the station positions" means: the graph in the message is immutable, so anything keyed on its compile job id can never go stale. Not to be confused with a **published** service in sparks-effect-api ([ADR-0005](https://github.com/andrewcgraves/sparks-effect-api/blob/main/docs/adr/0005-publishing-an-authored-service.md)): the same freezing one level up, pinning the compile job whose graph every message for that service then carries. This repository never sees that sense; here the word always means the queue message |
 
 ## Reached vs reachable
 
