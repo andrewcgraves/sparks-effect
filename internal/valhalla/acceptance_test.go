@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,6 +138,48 @@ func TestAcceptanceSunsetRouteBoardsAService(t *testing.T) {
 	}
 }
 
+var (
+	sanJoseState       = valhalla.LatLng{Lat: 37.3352, Lng: -121.8811}
+	santaTeresaStation = valhalla.LatLng{Lat: 37.2357, Lng: -121.7890}
+)
+
+func TestAcceptanceSanJoseRouteBoardsVTA(t *testing.T) {
+	// Every other boarding check here passes on free Mobility Database rows
+	// alone: LA Metro, Muni. VTA reaches the served graph through the 511
+	// ingest, so this is the one that fails when the token-gated Bay Area
+	// operators are missing (SPA-339). SJSU -> Diridon is the pair users
+	// report, but at the default walking speed it walks by three minutes on a
+	// healthy tileset (SPA-335), so it cannot tell broken from fine; Santa
+	// Teresa is 14 km down the Blue Line and rides whenever VTA is there.
+	client := acceptanceClient(t)
+	at := acceptanceDeparture(t)
+
+	route, err := client.Route(context.Background(), valhalla.RouteRequest{
+		Origin:      sanJoseState,
+		Destination: santaTeresaStation,
+		Costing:     valhalla.CostingMultimodal,
+		DepartAt:    at,
+	})
+	if err != nil {
+		t.Fatalf("Route(San Jose State to Santa Teresa) departing %s: %v", at.Format(time.RFC3339), err)
+	}
+	t.Logf("San Jose State to Santa Teresa: %d s, operators %q", route.Time, route.Operators)
+	if !route.RodeTransit {
+		t.Fatalf("San Jose State to Santa Teresa departing %s walked the whole way (%d s, %.1f km). "+
+			"This pair runs on VTA light rail, which only the 511 ingest supplies: check that "+
+			"/gtfs_work/manifest.csv has a usable 511- row and that the served generation was built after it.",
+			at.Format(time.RFC3339), route.Time, route.DistanceKm)
+	}
+	for _, op := range route.Operators {
+		name := strings.ToLower(op)
+		if name == "vta" || strings.Contains(name, "valley transportation authority") {
+			return
+		}
+	}
+	t.Errorf("San Jose State to Santa Teresa departing %s rode %q but not VTA; "+
+		"the 511 operator SC is missing from the served graph", at.Format(time.RFC3339), route.Operators)
+}
+
 func TestAcceptanceTransitIsochroneIsAtLeastAsLargeAsWalk(t *testing.T) {
 	client := acceptanceClient(t)
 	at := acceptanceDeparture(t)
@@ -149,6 +192,7 @@ func TestAcceptanceTransitIsochroneIsAtLeastAsLargeAsWalk(t *testing.T) {
 		{"SF Sunset (reported pin)", sunsetPin},
 		{"LA Koreatown (Wilshire/Western)", wilshireWestern},
 		{"Las Vegas Strip", lasVegasStrip},
+		{"San Jose State", sanJoseState},
 	}
 	for _, origin := range origins {
 		t.Run(origin.name, func(t *testing.T) {

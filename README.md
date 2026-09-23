@@ -387,6 +387,19 @@ make acceptance TEST_VALHALLA_URL=http://localhost:8002
 
 A 200 with a polygon is exactly what the broken state returns, so a check
 weaker than "a maneuver whose `travel_mode` is `transit`" proves nothing.
+Riding *something* is not enough either: LA Metro and Muni arrive on free
+Mobility Database rows, so a tileset built with no 511 token still boards
+them. `TestAcceptanceSanJoseRouteBoardsVTA` asserts on the operator
+(`RouteResponse.Operators`, from each transit maneuver's
+`transit_info.operator_name`) for San Jose State → Santa Teresa, a Blue Line
+pair that rides whenever VTA is in the graph. It is not SJSU → Diridon, the
+reported pair: that one walks by three minutes at Valhalla's default walking
+speed on a healthy tileset (SPA-335) and so cannot fail cleanly.
+
+This suite is part of the post-cycle procedure, not CI — it needs a real
+tileset. kustomize-config's `make verify-cycle` port-forwards the Valhalla
+Service and runs `make acceptance` from a checkout of this repository after
+its in-pod checks; a failure there is a failed cycle (SPA-339).
 `TEST_TRANSIT_DEPART_AT=YYYY-MM-DDTHH:MM` asks about a specific service date,
 which is how "do the feeds on the volume still cover next week?" gets answered
 before it turns into an undersized isochrone.

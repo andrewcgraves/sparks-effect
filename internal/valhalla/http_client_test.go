@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -844,6 +845,31 @@ func TestRoute_reportsWhetherItActuallyRodeTransit(t *testing.T) {
 				t.Errorf("RodeTransit = %v, want %v", resp.RodeTransit, tc.want)
 			}
 		})
+	}
+}
+
+func TestRoute_namesTheOperatorsItRode(t *testing.T) {
+	body := `{"trip":{"legs":[{"shape":"` + shapeThreePoints + `","maneuvers":[` +
+		`{"travel_mode":"pedestrian"},` +
+		`{"travel_mode":"transit","transit_info":{"operator_name":"VTA"}},` +
+		`{"travel_mode":"transit","transit_info":{"operator_name":"Caltrain"}},` +
+		`{"travel_mode":"transit","transit_info":{"operator_name":"VTA"}},` +
+		`{"travel_mode":"transit","transit_info":{}},` +
+		`{"travel_mode":"pedestrian"}` +
+		`]}],"summary":{"time":420,"length":0.5}}}`
+	srv := newCaptureServer(t, http.StatusOK, body)
+	resp, err := valhalla.NewHTTPClient(srv.URL).Route(context.Background(), valhalla.RouteRequest{
+		Origin:      valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+		Destination: valhalla.LatLng{Lat: 37.701, Lng: -122.4005},
+		Costing:     valhalla.CostingMultimodal,
+		DepartAt:    morningDeparture(t),
+	})
+	if err != nil {
+		t.Fatalf("Route: %v", err)
+	}
+	want := []string{"VTA", "Caltrain"}
+	if !slices.Equal(resp.Operators, want) {
+		t.Errorf("Operators = %q, want %q", resp.Operators, want)
 	}
 }
 

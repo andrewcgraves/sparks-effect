@@ -83,6 +83,7 @@ type RouteResponse struct {
 	Time        int
 	DistanceKm  float64
 	RodeTransit bool
+	Operators   []string
 }
 
 type Status struct {

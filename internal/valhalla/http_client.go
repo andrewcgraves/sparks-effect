@@ -157,7 +157,10 @@ type routeBody struct {
 		Legs []struct {
 			Shape     string `json:"shape"`
 			Maneuvers []struct {
-				TravelMode string `json:"travel_mode"`
+				TravelMode  string `json:"travel_mode"`
+				TransitInfo struct {
+					OperatorName string `json:"operator_name"`
+				} `json:"transit_info"`
 			} `json:"maneuvers"`
 		} `json:"legs"`
 		Summary struct {
@@ -178,6 +181,22 @@ func (b routeBody) rodeTransit() bool {
 		}
 	}
 	return false
+}
+
+func (b routeBody) operators() []string {
+	var names []string
+	seen := map[string]bool{}
+	for _, leg := range b.Trip.Legs {
+		for _, m := range leg.Maneuvers {
+			name := m.TransitInfo.OperatorName
+			if m.TravelMode != maneuverModeTransit || name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 const minDrawableShapePoints = 2
@@ -216,6 +235,7 @@ func (c *HTTPClient) Route(ctx context.Context, req RouteRequest) (*RouteRespons
 		Time:        int(math.Round(resp.Trip.Summary.Time)),
 		DistanceKm:  resp.Trip.Summary.Length,
 		RodeTransit: resp.rodeTransit(),
+		Operators:   resp.operators(),
 	}, nil
 }
 
