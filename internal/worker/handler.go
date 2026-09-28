@@ -100,7 +100,7 @@ func (h *Handler) handle(ctx context.Context, msg routing.Message, decodeErr err
 	h.cache.Stamp.Refresh(ctx, h.routing, h.log)
 
 	graph := transit.CompiledGraph{Graph: msg.Graph}
-	chainer := isochrone.New(h.routing, graph, h.limits, h.cache, h.log)
+	chainer := isochrone.New(h.routing, graph, h.limits, h.cache, h.log, h.metrics)
 
 	resp, err := chainer.Chain(ctx, isochrone.ChainRequest{
 		Lat:          msg.Lat,

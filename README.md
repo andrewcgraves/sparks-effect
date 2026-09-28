@@ -219,7 +219,7 @@ default, unset — stays at info level: a job's arrival, the decisions that
 shape its result (contour clamping, matrix truncation, cache hits/misses),
 and its outcome, but not the blow-by-blow.
 
-The worker also serves four Prometheus counters on `:9090/metrics` (override
+The worker also serves five Prometheus counters on `:9090/metrics` (override
 with `METRICS_ADDR`):
 
 | Metric | Labels | What it counts |
@@ -228,12 +228,19 @@ with `METRICS_ADDR`):
 | `isochrone_cache_total` | `result=hit\|miss` | Egress-polygon cache lookups |
 | `routing_dead_letters_total` | — | Jobs moved to the dead-letter queue after retries run out |
 | `valhalla_errors_total` | `class=bad_request\|rate_limit\|upstream` | Errors from the Valhalla client |
+| `transit_access_legs_total` | `rode=true\|false` | Pairwise transit access legs that Valhalla successfully routed, labelled by whether they actually rode |
 
-Label values are the same vocabulary the handler and client already use
-(`Outcome.String()`, `ErrBadRequest` / `ErrRateLimit` / `ErrUpstream`).
-Series are initialised at zero so a cold cache is `hit=0, miss>0` on a
-dashboard, not an empty panel. An unreadable cache entry and a failed Get
-count as misses; no cache configured is not a miss.
+Job, cache, and Valhalla labels are the handler and client vocabulary already
+in use (`Outcome.String()`, `ErrBadRequest` / `ErrRateLimit` / `ErrUpstream`).
+`transit_access_legs_total` uses `rode=true|false`. Series are initialised at
+zero so a cold cache is `hit=0, miss>0` on a dashboard, not an empty panel,
+and a 100% `rode="false"` rate is a real series rather than a missing one.
+The denominator is successfully routed access legs only: a bad-request drop
+or a failed fan-out is not a `false`. An unreadable cache entry and a failed
+Get count as misses; no cache configured is not a miss. A sustained
+`rode="false"` ratio near 1.0 with `true+false > 0` means Valhalla is answering
+200 and walking. `true=0,false=0` is the other no-service signature (no routed
+legs at all).
 
 Scraping is configured in `kustomize-config`: a `prometheus.io/scrape` /
 `prometheus.io/port` annotation on the worker Deployment, and pod-metrics

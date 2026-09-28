@@ -102,7 +102,7 @@ func twoReachableStations() *valhalla.StubClient {
 }
 
 func newCachingChainer(client valhalla.Client, graph transit.GraphData, cache isochrone.EgressCache) isochrone.Chainer {
-	return isochrone.New(client, graph, valhalla.DefaultLimits(), cache, logger.Discard())
+	return isochrone.New(client, graph, valhalla.DefaultLimits(), cache, logger.Discard(), nil)
 }
 
 func isochroneCallCount(t *testing.T, fc *valhalla.StubClient) int {
@@ -305,7 +305,7 @@ func TestChainer_cacheKeyUsesTheClampedContour(t *testing.T) {
 	egress := isochrone.EgressCache{Store: cache}
 
 	first := twoReachableStations()
-	if _, err := isochrone.New(first, viaTransitGraph(), limits, egress, logger.Discard()).
+	if _, err := isochrone.New(first, viaTransitGraph(), limits, egress, logger.Discard(), nil).
 		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("first Chain: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestChainer_cacheKeyUsesTheClampedContour(t *testing.T) {
 	}
 
 	larger := twoReachableStations()
-	if _, err := isochrone.New(larger, viaTransitGraph(), limits, egress, logger.Discard()).
+	if _, err := isochrone.New(larger, viaTransitGraph(), limits, egress, logger.Discard(), nil).
 		Chain(context.Background(), req(120, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("second Chain: %v", err)
 	}

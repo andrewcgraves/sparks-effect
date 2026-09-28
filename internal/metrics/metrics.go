@@ -23,18 +23,20 @@ const (
 )
 
 var (
-	jobOutcomes     = []string{"succeeded", "permanent", "transient"}
-	cacheResults    = []string{ResultHit, ResultMiss}
-	valhallaClasses = []string{ClassBadRequest, ClassRateLimit, ClassUpstream}
+	jobOutcomes       = []string{"succeeded", "permanent", "transient"}
+	cacheResults      = []string{ResultHit, ResultMiss}
+	valhallaClasses   = []string{ClassBadRequest, ClassRateLimit, ClassUpstream}
+	transitAccessRode = []string{"true", "false"}
 )
 
 var Process = &Set{}
 
 type Set struct {
-	jobs        [3]atomic.Uint64
-	cache       [2]atomic.Uint64
-	deadLetters atomic.Uint64
-	valhalla    [3]atomic.Uint64
+	jobs          [3]atomic.Uint64
+	cache         [2]atomic.Uint64
+	deadLetters   atomic.Uint64
+	valhalla      [3]atomic.Uint64
+	transitAccess [2]atomic.Uint64
 }
 
 func (m *Set) Job(outcome string) {
@@ -60,6 +62,15 @@ func (m *Set) DeadLetter() {
 		return
 	}
 	m.deadLetters.Add(1)
+}
+
+func (m *Set) TransitAccess(rode bool, n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	if i, ok := index(rodeLabel(rode), transitAccessRode); ok {
+		m.transitAccess[i].Add(uint64(n))
+	}
 }
 
 func (m *Set) JobCount(outcome string) uint64 {
@@ -100,6 +111,17 @@ func (m *Set) ValhallaErrorCount(class string) uint64 {
 		return 0
 	}
 	return m.valhalla[i].Load()
+}
+
+func (m *Set) TransitAccessCount(rode bool) uint64 {
+	if m == nil {
+		return 0
+	}
+	i, ok := index(rodeLabel(rode), transitAccessRode)
+	if !ok {
+		return 0
+	}
+	return m.transitAccess[i].Load()
 }
 
 func (m *Set) observeValhalla(err error) {
@@ -143,6 +165,7 @@ func (m *Set) writeMetrics(w http.ResponseWriter, _ *http.Request) {
 	write(w, "# TYPE routing_dead_letters_total counter\n")
 	write(w, "routing_dead_letters_total %d\n", m.deadLetters.Load())
 	writeFamily(w, "valhalla_errors_total", "Valhalla errors by class.", "class", valhallaClasses, m.valhalla[:])
+	writeFamily(w, "transit_access_legs_total", "Successfully routed transit-mode pairwise access legs by whether Valhalla actually rode transit (vs walked the whole way).", "rode", transitAccessRode, m.transitAccess[:])
 }
 
 func writeFamily(w io.Writer, name, help, label string, values []string, counters []atomic.Uint64) {
@@ -163,6 +186,13 @@ func index(value string, values []string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func rodeLabel(rode bool) string {
+	if rode {
+		return "true"
+	}
+	return "false"
 }
 
 type valhallaClient struct {

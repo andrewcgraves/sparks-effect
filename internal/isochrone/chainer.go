@@ -14,6 +14,7 @@ import (
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/geo"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/transit"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
@@ -64,10 +65,11 @@ type chainImpl struct {
 	limits  valhalla.Limits
 	cache   EgressCache
 	log     *logger.Logger
+	metrics *metrics.Set
 }
 
-func New(routingClient valhalla.Client, graph transit.GraphData, limits valhalla.Limits, cache EgressCache, log *logger.Logger) Chainer {
-	return &chainImpl{routing: routingClient, graph: graph, limits: limits, cache: cache, log: log}
+func New(routingClient valhalla.Client, graph transit.GraphData, limits valhalla.Limits, cache EgressCache, log *logger.Logger, metricSet *metrics.Set) Chainer {
+	return &chainImpl{routing: routingClient, graph: graph, limits: limits, cache: cache, log: log, metrics: metricSet}
 }
 
 func (c *chainImpl) approxAccessReachKm(mode transit.TravelMode, costing valhalla.Costing, budgetMins int) float64 {
@@ -388,6 +390,9 @@ func (c *chainImpl) pairwiseAccess(
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
+	nRode := rode.Load()
+	c.metrics.TransitAccess(true, int(nRode))
+	c.metrics.TransitAccess(false, int(routed.Load()-nRode))
 
 	c.log.Info(ctx, "chain: transit access legs routed",
 		"compile_job_id", req.CompileJobID,

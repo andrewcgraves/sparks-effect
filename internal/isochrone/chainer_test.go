@@ -15,6 +15,7 @@ import (
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/transit"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
@@ -118,7 +119,7 @@ func cannedIso() *valhalla.IsochroneResponse {
 }
 
 func newChainer(client valhalla.Client, graph transit.GraphData) isochrone.Chainer {
-	return isochrone.New(client, graph, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.Discard())
+	return isochrone.New(client, graph, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.Discard(), nil)
 }
 
 func req(budgetMins int, mode transit.TravelMode) isochrone.ChainRequest {
@@ -527,7 +528,7 @@ func TestChainer_egressFanOutIsBoundedByConfiguration(t *testing.T) {
 
 	limits := valhalla.DefaultLimits()
 	limits.MaxConcurrency = concurrency
-	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes, travelTimes: tt}, limits, isochrone.EgressCache{}, logger.Discard())
+	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes, travelTimes: tt}, limits, isochrone.EgressCache{}, logger.Discard(), nil)
 
 	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("Chain: %v", err)
@@ -660,7 +661,7 @@ func TestChainer_matrixPairCap_truncates(t *testing.T) {
 		IsochroneResp: cannedIso(),
 		MatrixResp:    &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{cells[:cap]}},
 	}
-	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes}, limits, isochrone.EgressCache{}, logger.Discard())
+	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes}, limits, isochrone.EgressCache{}, logger.Discard(), nil)
 
 	if _, err := chainer.Chain(context.Background(), req(9999, transit.TravelModeWalk)); err != nil {
 		t.Fatalf("Chain: %v", err)
@@ -1351,7 +1352,7 @@ func TestChainer_droppedMatrixPairsAreLoggedByName(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	chainer := isochrone.New(fc, graph, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.New(&buf, false))
+	chainer := isochrone.New(fc, graph, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.New(&buf, false), nil)
 	if _, err := chainer.Chain(context.Background(), req(240, transit.TravelModeDrive)); err != nil {
 		t.Fatalf("Chain: %v", err)
 	}
@@ -1684,7 +1685,7 @@ func TestChainer_transitPairwiseAccessIsBoundedByConfiguration(t *testing.T) {
 
 	limits := valhalla.DefaultLimits()
 	limits.MaxConcurrency = concurrency
-	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes}, limits, isochrone.EgressCache{}, logger.Discard())
+	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes}, limits, isochrone.EgressCache{}, logger.Discard(), nil)
 	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeTransit)); err != nil {
 		t.Fatalf("Chain: %v", err)
 	}
@@ -1693,5 +1694,162 @@ func TestChainer_transitPairwiseAccessIsBoundedByConfiguration(t *testing.T) {
 	}
 	if peak < 2 {
 		t.Errorf("peak concurrent /route calls = %d; pairwise access is not running concurrently", peak)
+	}
+}
+
+func TestChainer_countsTransitAccessLegsByWhetherTheyRode(t *testing.T) {
+	stationA := node("station-a", -122.39, 37.71)
+	stationB := node("station-b", -122.41, 37.69)
+	matrixWithStarterRoute := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		MatrixResp: &valhalla.MatrixResponse{
+			SourcesToTargets: [][]valhalla.MatrixCell{
+				{valhalla.Cell(600, tokenRoadKm), valhalla.Cell(600, tokenRoadKm)},
+			},
+		},
+		RouteFn: func(valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+			route := routedAccess(600)
+			route.RodeTransit = true
+			return route, nil
+		},
+	}
+
+	tests := []struct {
+		name      string
+		mode      transit.TravelMode
+		stub      *valhalla.StubClient
+		wantErr   bool
+		wantTrue  uint64
+		wantFalse uint64
+	}{
+		{
+			name: "rode and walked",
+			mode: transit.TravelModeTransit,
+			stub: &valhalla.StubClient{
+				IsochroneResp: cannedIso(),
+				RouteFn: func(r valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+					route := routedAccess(600)
+					if r.Destination.Lat == stationA.Lat && r.Destination.Lng == stationA.Lng {
+						route.RodeTransit = true
+					}
+					return route, nil
+				},
+			},
+			wantTrue:  1,
+			wantFalse: 1,
+		},
+		{
+			name:      "walked the whole way",
+			mode:      transit.TravelModeTransit,
+			stub:      transitAccessClient(600),
+			wantFalse: 2,
+		},
+		{
+			name: "rode every access leg",
+			mode: transit.TravelModeTransit,
+			stub: &valhalla.StubClient{
+				IsochroneResp: cannedIso(),
+				RouteFn: func(valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+					route := routedAccess(600)
+					route.RodeTransit = true
+					return route, nil
+				},
+			},
+			wantTrue: 2,
+		},
+		{
+			name: "walk uses matrix",
+			mode: transit.TravelModeWalk,
+			stub: matrixWithStarterRoute,
+		},
+		{
+			name: "bike uses matrix",
+			mode: transit.TravelModeBike,
+			stub: matrixWithStarterRoute,
+		},
+		{
+			name: "drive uses matrix",
+			mode: transit.TravelModeDrive,
+			stub: matrixWithStarterRoute,
+		},
+		{
+			name: "nil route is not counted",
+			mode: transit.TravelModeTransit,
+			stub: &valhalla.StubClient{
+				IsochroneResp: cannedIso(),
+				RouteFn: func(valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+					return nil, nil
+				},
+			},
+		},
+		{
+			name: "bad request drop is not counted",
+			mode: transit.TravelModeTransit,
+			stub: &valhalla.StubClient{
+				IsochroneResp: cannedIso(),
+				RouteFn: func(r valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+					if r.Destination.Lat == stationB.Lat && r.Destination.Lng == stationB.Lng {
+						return nil, fmt.Errorf("%w: no matching transit service near this location (error_code 171)", valhalla.ErrBadRequest)
+					}
+					route := routedAccess(600)
+					route.RodeTransit = true
+					return route, nil
+				},
+			},
+			wantTrue: 1,
+		},
+		{
+			name: "nil sibling is not counted",
+			mode: transit.TravelModeTransit,
+			stub: &valhalla.StubClient{
+				IsochroneResp: cannedIso(),
+				RouteFn: func(r valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+					if r.Destination.Lat == stationB.Lat && r.Destination.Lng == stationB.Lng {
+						return nil, nil
+					}
+					route := routedAccess(600)
+					route.RodeTransit = true
+					return route, nil
+				},
+			},
+			wantTrue: 1,
+		},
+		{
+			name: "sibling upstream is not counted",
+			mode: transit.TravelModeTransit,
+			stub: &valhalla.StubClient{
+				IsochroneResp: cannedIso(),
+				RouteFn: func(r valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+					if r.Destination.Lat == stationB.Lat && r.Destination.Lng == stationB.Lng {
+						return nil, valhalla.ErrUpstream
+					}
+					route := routedAccess(600)
+					route.RodeTransit = true
+					return route, nil
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &metrics.Set{}
+			chainer := isochrone.New(tc.stub, newTestGraph(), valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.Discard(), m)
+			_, err := chainer.Chain(context.Background(), req(90, tc.mode))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("Chain succeeded, want error")
+				}
+			} else if err != nil {
+				t.Fatalf("Chain: %v", err)
+			}
+			if got := m.TransitAccessCount(true); got != tc.wantTrue {
+				t.Errorf("TransitAccessCount(true) = %d, want %d", got, tc.wantTrue)
+			}
+			if got := m.TransitAccessCount(false); got != tc.wantFalse {
+				t.Errorf("TransitAccessCount(false) = %d, want %d", got, tc.wantFalse)
+			}
+		})
 	}
 }

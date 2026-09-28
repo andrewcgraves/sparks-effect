@@ -23,6 +23,7 @@ func TestHandlerExposesZeroSeries(t *testing.T) {
 		"isochrone_cache_total",
 		"routing_dead_letters_total",
 		"valhalla_errors_total",
+		"transit_access_legs_total",
 	} {
 		if !strings.Contains(body, name) {
 			t.Errorf("/metrics is missing %s:\n%s", name, body)
@@ -39,6 +40,8 @@ func TestHandlerExposesZeroSeries(t *testing.T) {
 		`valhalla_errors_total{class="rate_limit"} 0`,
 		`valhalla_errors_total{class="upstream"} 0`,
 		`routing_dead_letters_total 0`,
+		`transit_access_legs_total{rode="true"} 0`,
+		`transit_access_legs_total{rode="false"} 0`,
 	} {
 		if !strings.Contains(body, sample) {
 			t.Errorf("/metrics is missing zero series %s:\n%s", sample, body)
@@ -51,6 +54,8 @@ func TestCountersIncrement(t *testing.T) {
 	m.Job("succeeded")
 	m.Cache(ResultHit, 3)
 	m.DeadLetter()
+	m.TransitAccess(true, 2)
+	m.TransitAccess(false, 1)
 
 	body := scrape(t, m)
 	for _, want := range []string{
@@ -59,6 +64,8 @@ func TestCountersIncrement(t *testing.T) {
 		`isochrone_cache_total{result="hit"} 3`,
 		`isochrone_cache_total{result="miss"} 0`,
 		`routing_dead_letters_total 1`,
+		`transit_access_legs_total{rode="true"} 2`,
+		`transit_access_legs_total{rode="false"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics response missing %q:\n%s", want, body)
@@ -168,9 +175,12 @@ func TestServeListensUntilCancelled(t *testing.T) {
 		cancel()
 		t.Fatalf("reading /metrics: %v", readErr)
 	}
-	if !strings.Contains(string(raw), "routing_dead_letters_total") {
-		cancel()
-		t.Fatalf("/metrics missing routing_dead_letters_total:\n%s", raw)
+	body := string(raw)
+	for _, name := range []string{"routing_dead_letters_total", "transit_access_legs_total"} {
+		if !strings.Contains(body, name) {
+			cancel()
+			t.Fatalf("/metrics missing %s:\n%s", name, raw)
+		}
 	}
 
 	cancel()
