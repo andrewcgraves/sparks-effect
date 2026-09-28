@@ -101,6 +101,18 @@ func twoReachableStations() *valhalla.StubClient {
 	}
 }
 
+func twoStationsByTransit(iso *valhalla.IsochroneResponse) *valhalla.StubClient {
+	return &valhalla.StubClient{
+		IsochroneResp: iso,
+		RouteFn: func(r valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+			if r.Destination.Lat == 37.70 && r.Destination.Lng == -122.40 {
+				return routedAccess(600), nil
+			}
+			return nil, valhalla.ErrBadRequest
+		},
+	}
+}
+
 func newCachingChainer(client valhalla.Client, graph transit.GraphData, cache isochrone.EgressCache) isochrone.Chainer {
 	return isochrone.New(client, graph, valhalla.DefaultLimits(), cache, logger.Discard(), nil)
 }
@@ -220,15 +232,7 @@ func TestChainer_cacheKeyIsCompileStationModeAndContour(t *testing.T) {
 
 func TestChainer_cacheKeyTransitIsTheDomainWordNotMultimodal(t *testing.T) {
 	cache := newFakeCache()
-	fc := &valhalla.StubClient{
-		IsochroneResp: cannedIso(),
-		RouteFn: func(r valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
-			if r.Destination.Lat == 37.70 && r.Destination.Lng == -122.40 {
-				return routedAccess(600), nil
-			}
-			return nil, valhalla.ErrBadRequest
-		},
-	}
+	fc := twoStationsByTransit(transitShapedIso())
 	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache})
 
 	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeTransit)); err != nil {
@@ -585,5 +589,161 @@ func TestChainer_corruptEntryCountsAsAMiss(t *testing.T) {
 	}
 	if got := m.CacheCount(metrics.ResultMiss); got != 1 {
 		t.Errorf("misses = %d, want 1 (the corrupt station)", got)
+	}
+}
+
+func TestChainer_walkShapedTransitPolygonIsNotCached(t *testing.T) {
+	for name, iso := range map[string]*valhalla.IsochroneResponse{
+		"walk-sized circle": walkShapedIso(),
+		"empty coordinates": cannedIso(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			cache := newFakeCache()
+			fc := twoStationsByTransit(iso)
+			chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache})
+
+			resp, err := chainer.Chain(context.Background(), req(90, transit.TravelModeTransit))
+			if err != nil {
+				t.Fatalf("Chain: %v", err)
+			}
+			if len(resp.Metadata.ReachableStations) == 0 {
+				t.Fatal("reachable stations empty; the chain must still report the stations")
+			}
+			if len(resp.Features) < 2 {
+				t.Fatal("features < 2; a rejected cache write must still return the egress polygon, not just the origin")
+			}
+			var hasStationSlug bool
+			for _, f := range resp.Features {
+				var feat map[string]any
+				if err := json.Unmarshal(f, &feat); err != nil {
+					t.Fatalf("unmarshal feature: %v", err)
+				}
+				props, _ := feat["properties"].(map[string]any)
+				if _, ok := props["station_slug"]; ok {
+					hasStationSlug = true
+					break
+				}
+			}
+			if !hasStationSlug {
+				t.Error("no feature has properties.station_slug; a rejected write must still return the injected egress polygon")
+			}
+			if got := len(cache.written()); got != 0 {
+				t.Errorf("cached %d polygons, want 0 — a walk-shaped transit surface must not be stored", got)
+			}
+		})
+	}
+}
+
+func TestChainer_genuineTransitPolygonIsCached(t *testing.T) {
+	cache := newFakeCache()
+	fc := twoStationsByTransit(transitShapedIso())
+	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache})
+
+	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeTransit)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	written := cache.written()
+	if len(written) != 2 {
+		t.Fatalf("cached %d polygons, want 2", len(written))
+	}
+	for _, e := range written {
+		if e.Key.Mode != string(transit.TravelModeTransit) {
+			t.Errorf("%s: mode = %q, want transit", e.Key.StationSlug, e.Key.Mode)
+		}
+	}
+}
+
+func TestChainer_walkModeSmallPolygonStillCaches(t *testing.T) {
+	cache := newFakeCache()
+	fc := twoReachableStations()
+	fc.IsochroneResp = walkShapedIso()
+	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache})
+
+	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	if got := len(cache.written()); got != 2 {
+		t.Errorf("cached %d polygons, want 2 — the area guard is transit-only", got)
+	}
+}
+
+func TestChainer_poisonedWalkShapedTransitIsDiscardedOnLookup(t *testing.T) {
+	at := departure(t)
+	walkGeom, err := json.Marshal(walkShapedIso())
+	if err != nil {
+		t.Fatalf("marshalling walk fixture: %v", err)
+	}
+	transitGeom, err := json.Marshal(transitShapedIso())
+	if err != nil {
+		t.Fatalf("marshalling transit fixture: %v", err)
+	}
+
+	cache := newFakeCache()
+	cache.seed(store.IsochroneKey{
+		CompileJobID: "compile-1", StationSlug: "station-a", Mode: "transit", ContourMins: 79, DepartsOn: "2026-09-02",
+	}, walkGeom)
+	cache.seed(store.IsochroneKey{
+		CompileJobID: "compile-1", StationSlug: "station-b", Mode: "transit", ContourMins: 75, DepartsOn: "2026-09-02",
+	}, transitGeom)
+
+	cold := twoStationsByTransit(walkShapedIso())
+	if _, err := newCachingChainer(cold, viaTransitGraph(), isochrone.EgressCache{Store: cache}).
+		Chain(context.Background(), departingAt(90, transit.TravelModeTransit, at)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	if got := isochroneCallCount(t, cold); got != 2 {
+		t.Errorf("made %d isochrone calls, want 2 (origin + station-a) — station-b is a genuine hit", got)
+	}
+	for _, e := range cache.written() {
+		if e.Key.StationSlug == "station-a" {
+			t.Error("wrote station-a after recomputing a walk-shaped answer")
+		}
+	}
+
+	warm := twoStationsByTransit(walkShapedIso())
+	if _, err := newCachingChainer(warm, viaTransitGraph(), isochrone.EgressCache{Store: cache}).
+		Chain(context.Background(), departingAt(90, transit.TravelModeTransit, at)); err != nil {
+		t.Fatalf("second Chain: %v", err)
+	}
+	if got := isochroneCallCount(t, warm); got != 2 {
+		t.Errorf("second chain made %d isochrone calls, want 2 — walk-shaped transit must not stick", got)
+	}
+	for _, e := range cache.written() {
+		if e.Key.StationSlug == "station-a" {
+			t.Error("second chain wrote station-a")
+		}
+	}
+}
+
+func TestChainer_genuineTransitRoundTripsThroughCache(t *testing.T) {
+	cache := newFakeCache()
+	egress := isochrone.EgressCache{Store: cache}
+
+	cold := twoStationsByTransit(transitShapedIso())
+	if _, err := newCachingChainer(cold, viaTransitGraph(), egress).
+		Chain(context.Background(), req(90, transit.TravelModeTransit)); err != nil {
+		t.Fatalf("cold Chain: %v", err)
+	}
+	coldCalls := isochroneCallCount(t, cold)
+	if coldCalls != 3 {
+		t.Fatalf("cold chain made %d isochrone calls, want 3 (origin + 2 stations)", coldCalls)
+	}
+	if got := len(cache.written()); got != 2 {
+		t.Fatalf("cached %d polygons, want 2", got)
+	}
+
+	warm := twoStationsByTransit(transitShapedIso())
+	if _, err := newCachingChainer(warm, viaTransitGraph(), egress).
+		Chain(context.Background(), req(90, transit.TravelModeTransit)); err != nil {
+		t.Fatalf("warm Chain: %v", err)
+	}
+	if got := isochroneCallCount(t, warm); got != 1 {
+		t.Errorf("warm chain made %d isochrone calls, want 1 (the origin)", got)
+	}
+	if got := len(cache.written()); got != 2 {
+		t.Errorf("warm chain wrote further entries; cache holds %d writes, want 2", got)
 	}
 }

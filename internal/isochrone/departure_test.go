@@ -29,7 +29,7 @@ func departingAt(budgetMins int, mode transit.TravelMode, at time.Time) isochron
 func hubOnlyAccess(accessSecs int) *valhalla.StubClient {
 	hub := viaTransitGraph().nodes[0]
 	return &valhalla.StubClient{
-		IsochroneResp: cannedIso(),
+		IsochroneResp: transitShapedIso(),
 		RouteFn: func(r valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
 			if r.Destination.Lat != hub.Lat || r.Destination.Lng != hub.Lng {
 				return nil, fmt.Errorf("%w: no matching transit service near this location", valhalla.ErrBadRequest)

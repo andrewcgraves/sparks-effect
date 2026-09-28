@@ -411,6 +411,12 @@ its in-pod checks; a failure there is a failed cycle (SPA-339).
 which is how "do the feeds on the volume still cover next week?" gets answered
 before it turns into an undersized isochrone.
 
+Isochrones expose no maneuvers, so a transit egress polygon that does not beat
+a walk-speed circle of the same contour is not cached under a transit key
+(SPA-338): first-write-wins would otherwise freeze a walked answer for the rest
+of the service day. The computed polygon is still returned. The circle's radius
+is Valhalla's pedestrian default (5.1 km/h), not the domain walk speed of 5.0.
+
 Error 140 is a 400 and already maps to `ErrBadRequest` / permanent. It
 should not appear if Matrix is skipped. Other transit-costing 400s (no
 service near a location, no path) are the same bucket; the pairwise

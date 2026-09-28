@@ -10,6 +10,7 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/geo"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
@@ -375,5 +376,101 @@ func TestEndToEnd_messageForAMissingJobIsDiscarded(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if got := testsupport.QueueDepth(t, h.ch, testQueue); got != 0 {
 		t.Errorf("queue depth = %d, want 0 — a job with no row must not be retried forever", got)
+	}
+}
+
+func transitAccessClient(speedKmH float64) *countingClient {
+	synth := &valhalla.SyntheticClient{SpeedKmH: map[valhalla.Costing]float64{
+		valhalla.CostingMultimodal: speedKmH,
+	}}
+	return &countingClient{Client: &valhalla.StubClient{
+		IsochroneFn: func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
+			return synth.Isochrone(context.Background(), r)
+		},
+		RouteFn: func(r valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+			if r.Destination.Lat < 36 {
+				return nil, valhalla.ErrBadRequest
+			}
+			return &valhalla.RouteResponse{
+				Shape:      []valhalla.LatLng{r.Origin, r.Destination},
+				Time:       600,
+				DistanceKm: 10,
+			}, nil
+		},
+	}}
+}
+
+func transitJobBody(t *testing.T, mut func(m map[string]any)) []byte {
+	t.Helper()
+	return mutateGolden(t, func(m map[string]any) {
+		m["mode"] = "transit"
+		m["budget_mins"] = 90
+		if mut != nil {
+			mut(m)
+		}
+	})
+}
+
+func TestEndToEnd_walkShapedTransitIsochroneIsNotCached(t *testing.T) {
+	client := transitAccessClient(geo.WalkSpeedKmH)
+	h := newHarness(t, client)
+	h.api.SeedRoutingJob(goldenJobID)
+
+	stop, _ := h.run(t, 3)
+	defer stop()
+
+	testsupport.Publish(t, h.ch, testQueue, transitJobBody(t, nil))
+	h.waitForStatus(t, goldenJobID, store.StatusSucceeded)
+
+	_, errMsg, result := h.api.JobStatus(t, goldenJobID)
+	if errMsg != "" {
+		t.Errorf("error = %q, want empty — a walk-shaped transit surface must still complete the job", errMsg)
+	}
+	if len(features(t, result)) == 0 {
+		t.Error("succeeded with no features")
+	}
+	if got := h.api.IsochroneCacheCount(goldenCompileID); got != 0 {
+		t.Errorf("cache holds %d rows, want 0 transit-keyed writes for a walk-shaped polygon", got)
+	}
+}
+
+func TestEndToEnd_genuineTransitIsochroneCachesAndReuses(t *testing.T) {
+	const secondJobID = "8b1731ff-8b86-d011-b42d-00c04fc964ff"
+
+	client := transitAccessClient(geo.TransitSpeedKmH)
+	h := newHarness(t, client)
+	h.api.SeedRoutingJob(goldenJobID)
+
+	stop, _ := h.run(t, 3)
+	defer stop()
+
+	testsupport.Publish(t, h.ch, testQueue, transitJobBody(t, nil))
+	h.waitForStatus(t, goldenJobID, store.StatusSucceeded)
+	coldCalls := client.isochroneCalls.Load()
+
+	cached := h.api.IsochroneCacheCount(goldenCompileID)
+	if cached == 0 {
+		t.Fatal("the completed transit job cached no egress polygons")
+	}
+	if want := int(coldCalls) - 1; cached != want {
+		t.Errorf("cached %d polygons against %d isochrone calls, want %d (all but the origin)", cached, coldCalls, want)
+	}
+
+	h.api.SeedRoutingJob(secondJobID)
+	client.isochroneCalls.Store(0)
+	testsupport.Publish(t, h.ch, testQueue, transitJobBody(t, func(m map[string]any) {
+		m["routing_job_id"] = secondJobID
+	}))
+	h.waitForStatus(t, secondJobID, store.StatusSucceeded)
+	warmCalls := client.isochroneCalls.Load()
+
+	if warmCalls >= coldCalls {
+		t.Errorf("warm job made %d isochrone calls against a cold %d; the cache saved nothing", warmCalls, coldCalls)
+	}
+	if warmCalls != 1 {
+		t.Errorf("warm job made %d isochrone calls, want 1 (the origin)", warmCalls)
+	}
+	if got := h.api.IsochroneCacheCount(goldenCompileID); got != cached {
+		t.Errorf("cache holds %d rows after the warm job, want the %d the cold one left", got, cached)
 	}
 }

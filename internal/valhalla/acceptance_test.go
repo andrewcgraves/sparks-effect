@@ -3,7 +3,6 @@ package valhalla_test
 import (
 	"context"
 	"encoding/json"
-	"math"
 	"os"
 	"strings"
 	"testing"
@@ -213,11 +212,11 @@ func TestAcceptanceTransitIsochroneIsAtLeastAsLargeAsWalk(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Isochrone(pedestrian): %v", err)
 			}
-			transitKm2, err := isochroneAreaKm2(transit)
+			transitKm2, err := transit.AreaKm2()
 			if err != nil {
 				t.Fatalf("transit area: %v", err)
 			}
-			walkKm2, err := isochroneAreaKm2(walk)
+			walkKm2, err := walk.AreaKm2()
 			if err != nil {
 				t.Fatalf("walk area: %v", err)
 			}
@@ -255,11 +254,11 @@ func TestAcceptanceSunsetIsochroneGrowsWithBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Isochrone(240): %v", err)
 	}
-	km180, err := isochroneAreaKm2(at180)
+	km180, err := at180.AreaKm2()
 	if err != nil {
 		t.Fatalf("180 min area: %v", err)
 	}
-	km240, err := isochroneAreaKm2(at240)
+	km240, err := at240.AreaKm2()
 	if err != nil {
 		t.Fatalf("240 min area: %v", err)
 	}
@@ -272,70 +271,6 @@ func TestAcceptanceSunsetIsochroneGrowsWithBudget(t *testing.T) {
 		t.Errorf("240 min multimodal isochrone is %.1f km², not larger than 180 min's %.1f km²; "+
 			"a surface that has stopped expanding is still clipped on distance, not time", km240, km180)
 	}
-}
-
-const earthRadiusKm = 6371.0
-
-func isochroneAreaKm2(iso *valhalla.IsochroneResponse) (float64, error) {
-	var total float64
-	for _, raw := range iso.Features {
-		var f struct {
-			Geometry struct {
-				Type        string          `json:"type"`
-				Coordinates json.RawMessage `json:"coordinates"`
-			} `json:"geometry"`
-		}
-		if err := json.Unmarshal(raw, &f); err != nil {
-			return 0, err
-		}
-		switch f.Geometry.Type {
-		case "Polygon":
-			var coords [][][]float64
-			if err := json.Unmarshal(f.Geometry.Coordinates, &coords); err != nil {
-				return 0, err
-			}
-			total += polygonAreaKm2(coords)
-		case "MultiPolygon":
-			var coords [][][][]float64
-			if err := json.Unmarshal(f.Geometry.Coordinates, &coords); err != nil {
-				return 0, err
-			}
-			for _, poly := range coords {
-				total += polygonAreaKm2(poly)
-			}
-		}
-	}
-	return total, nil
-}
-
-func polygonAreaKm2(rings [][][]float64) float64 {
-	if len(rings) == 0 {
-		return 0
-	}
-	area := math.Abs(ringAreaKm2(rings[0]))
-	for _, hole := range rings[1:] {
-		area -= math.Abs(ringAreaKm2(hole))
-	}
-	if area < 0 {
-		return 0
-	}
-	return area
-}
-
-func ringAreaKm2(ring [][]float64) float64 {
-	if len(ring) < 4 {
-		return 0
-	}
-	var area float64
-	n := len(ring) - 1
-	for i := 0; i < n; i++ {
-		lon1 := ring[i][0] * math.Pi / 180
-		lon2 := ring[i+1][0] * math.Pi / 180
-		lat1 := ring[i][1] * math.Pi / 180
-		lat2 := ring[i+1][1] * math.Pi / 180
-		area += (lon2 - lon1) * (2 + math.Sin(lat1) + math.Sin(lat2))
-	}
-	return area * earthRadiusKm * earthRadiusKm / 2
 }
 
 func TestIsochroneAreaOfAKnownSquare(t *testing.T) {
@@ -351,7 +286,7 @@ func TestIsochroneAreaOfAKnownSquare(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := isochroneAreaKm2(&valhalla.IsochroneResponse{Features: []json.RawMessage{feature}})
+	got, err := (&valhalla.IsochroneResponse{Features: []json.RawMessage{feature}}).AreaKm2()
 	if err != nil {
 		t.Fatal(err)
 	}

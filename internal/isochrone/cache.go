@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/geo"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/transit"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
 
@@ -40,9 +42,16 @@ func (e EgressCache) lookup(
 				"compile_job_id", k.CompileJobID, "station_slug", k.StationSlug, "err", err.Error())
 			continue
 		}
-		if !usable(&iso) {
-			log.Warn(ctx, "isochrone: discarding empty cache entry",
-				"compile_job_id", k.CompileJobID, "station_slug", k.StationSlug)
+		ok, area, areaErr := usable(&iso, k)
+		if !ok {
+			if k.Mode == string(transit.TravelModeTransit) && len(iso.Features) > 0 {
+				logRejectedTransit(ctx, log, k, area, areaErr,
+					"isochrone: discarding unreadable transit cache entry",
+					"isochrone: discarding walk-shaped transit cache entry")
+			} else {
+				log.Warn(ctx, "isochrone: discarding empty cache entry",
+					"compile_job_id", k.CompileJobID, "station_slug", k.StationSlug)
+			}
 			continue
 		}
 		hits[k] = &iso
@@ -75,7 +84,13 @@ func (e EgressCache) record(
 	tilesetAt := e.Stamp.Time()
 	entries := make([]store.CachedIsochrone, 0, len(misses))
 	for _, i := range misses {
-		if !usable(isos[i]) {
+		ok, area, areaErr := usable(isos[i], keys[i])
+		if !ok {
+			if keys[i].Mode == string(transit.TravelModeTransit) && isos[i] != nil && len(isos[i].Features) > 0 {
+				logRejectedTransit(ctx, log, keys[i], area, areaErr,
+					"isochrone: not caching unreadable transit polygon",
+					"isochrone: not caching walk-shaped transit polygon")
+			}
 			continue
 		}
 
@@ -99,6 +114,36 @@ func (e EgressCache) record(
 	}
 }
 
-func usable(iso *valhalla.IsochroneResponse) bool {
-	return iso != nil && len(iso.Features) > 0
+func usable(iso *valhalla.IsochroneResponse, key store.IsochroneKey) (bool, float64, error) {
+	if iso == nil || len(iso.Features) == 0 {
+		return false, 0, nil
+	}
+	if key.Mode != string(transit.TravelModeTransit) {
+		return true, 0, nil
+	}
+	// A transit polygon that does not beat a walk-speed circle of the same
+	// contour is either a walking answer or worthless as one. First-write-wins
+	// would freeze that shape under the transit key for the rest of the service
+	// day, so reject it here on both write and read.
+	area, err := iso.AreaKm2()
+	if err != nil {
+		return false, 0, err
+	}
+	return area > geo.WalkCircleKm2(key.ContourMins), area, nil
+}
+
+func logRejectedTransit(ctx context.Context, log *logger.Logger, key store.IsochroneKey, area float64, areaErr error, unreadable, walkShaped string) {
+	if areaErr != nil {
+		log.Warn(ctx, unreadable,
+			"compile_job_id", key.CompileJobID,
+			"station_slug", key.StationSlug,
+			"err", areaErr.Error())
+		return
+	}
+	log.Warn(ctx, walkShaped,
+		"compile_job_id", key.CompileJobID,
+		"station_slug", key.StationSlug,
+		"contour_mins", key.ContourMins,
+		"walk_bound_km2", geo.WalkCircleKm2(key.ContourMins),
+		"area_km2", area)
 }

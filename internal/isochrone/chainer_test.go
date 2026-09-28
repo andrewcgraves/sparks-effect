@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/geo"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
@@ -116,6 +118,70 @@ func cannedIso() *valhalla.IsochroneResponse {
 			json.RawMessage(`{"type":"Feature","geometry":{"type":"Polygon","coordinates":[]},"properties":{}}`),
 		},
 	}
+}
+
+func isoFromRings(rings [][][]float64) *valhalla.IsochroneResponse {
+	feature, err := json.Marshal(map[string]any{
+		"type": "Feature",
+		"geometry": map[string]any{
+			"type":        "Polygon",
+			"coordinates": rings,
+		},
+		"properties": map[string]any{},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return &valhalla.IsochroneResponse{
+		Type:     "FeatureCollection",
+		Features: []json.RawMessage{feature},
+	}
+}
+
+func squareAround(lng, lat, halfSideDeg float64) [][][]float64 {
+	return [][][]float64{{
+		{lng - halfSideDeg, lat - halfSideDeg},
+		{lng + halfSideDeg, lat - halfSideDeg},
+		{lng + halfSideDeg, lat + halfSideDeg},
+		{lng - halfSideDeg, lat + halfSideDeg},
+		{lng - halfSideDeg, lat - halfSideDeg},
+	}}
+}
+
+func circleRing(origin valhalla.LatLng, radiusKm float64) [][]float64 {
+	const kmPerDegreeLat = 110.574
+	const n = 36
+
+	latDelta := radiusKm / kmPerDegreeLat
+	cosLat := math.Cos(origin.Lat * math.Pi / 180)
+	if cosLat < 1e-6 {
+		cosLat = 1e-6
+	}
+	lngDelta := latDelta / cosLat
+
+	ring := make([][]float64, 0, n+1)
+	for i := 0; i < n; i++ {
+		theta := 2 * math.Pi * float64(i) / n
+		ring = append(ring, []float64{
+			origin.Lng + lngDelta*math.Cos(theta),
+			origin.Lat + latDelta*math.Sin(theta),
+		})
+	}
+	ring = append(ring, []float64{ring[0][0], ring[0][1]})
+	return ring
+}
+
+func walkShapedIso() *valhalla.IsochroneResponse {
+	// Clearly under a 60-minute walk circle. A 36-gon of radius WalkSpeedKmH
+	// overshoots that bound because circleRing and PolygonAreaKm2 disagree
+	// on how to convert degrees to kilometres.
+	return isoFromRings([][][]float64{circleRing(valhalla.LatLng{Lat: 37.7, Lng: -122.4}, geo.WalkSpeedKmH*0.9)})
+}
+
+func transitShapedIso() *valhalla.IsochroneResponse {
+	// 1° square is thousands of km², above the walk-circle bound even at the
+	// 320-minute contour ceiling.
+	return isoFromRings(squareAround(-122.4, 37.7, 0.5))
 }
 
 func newChainer(client valhalla.Client, graph transit.GraphData) isochrone.Chainer {
