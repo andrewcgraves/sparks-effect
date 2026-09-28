@@ -490,7 +490,7 @@ func TestChainer_fullyWarmChainWritesNothing(t *testing.T) {
 	}
 }
 
-func TestChainer_fanOutFailureStillFailsTheChain(t *testing.T) {
+func TestChainer_fanOutDropDoesNotCacheTheFailedStation(t *testing.T) {
 	cache := newFakeCache()
 	fc := twoReachableStations()
 	fc.IsochroneFn = func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
@@ -501,11 +501,57 @@ func TestChainer_fanOutFailureStillFailsTheChain(t *testing.T) {
 	}
 	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache})
 
-	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk)); err == nil {
-		t.Fatal("Chain succeeded despite a rejected egress request")
+	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
+		t.Fatalf("Chain: %v, want the chain to survive a per-station egress 400", err)
 	}
-	if got := len(cache.written()); got != 0 {
-		t.Errorf("a failed chain wrote %d cache entries, want 0", got)
+
+	var cachedA, cachedB bool
+	for _, e := range cache.written() {
+		switch e.Key.StationSlug {
+		case "station-a":
+			cachedA = true
+		case "station-b":
+			cachedB = true
+		}
+	}
+	if cachedA {
+		t.Error("station-a was cached after its egress call failed")
+	}
+	if !cachedB {
+		t.Error("station-b's polygon was not cached")
+	}
+}
+
+func TestChainer_rateLimitAbortStillCachesTheSuccessfulStation(t *testing.T) {
+	cache := newFakeCache()
+	fc := twoReachableStations()
+	fc.IsochroneFn = func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
+		if r.Origin.Lat == 37.69 {
+			return nil, valhalla.ErrRateLimit
+		}
+		return cannedIso(), nil
+	}
+	chainer := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache})
+
+	_, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk))
+	if !errors.Is(err, isochrone.ErrRoutingRateLimit) {
+		t.Errorf("err = %v, want ErrRoutingRateLimit", err)
+	}
+
+	var cachedA, cachedB bool
+	for _, e := range cache.written() {
+		switch e.Key.StationSlug {
+		case "station-a":
+			cachedA = true
+		case "station-b":
+			cachedB = true
+		}
+	}
+	if !cachedA {
+		t.Error("station-a's polygon was not cached; a rate-limit retry should not re-hit Valhalla for a station that already drew")
+	}
+	if cachedB {
+		t.Error("station-b was cached after its egress call was rate-limited")
 	}
 }
 

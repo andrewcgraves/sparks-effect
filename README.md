@@ -157,6 +157,10 @@ spinner forever, so it is explicit:
 | API unreachable | **Transient** — requeue, bounded |
 | Retries exhausted | Mark failed, then dead-letter |
 
+A per-station egress 400 or timeout drops that polygon; the job succeeds if
+any other egress (or a cache hit) remains. If every egress miss fails with a
+transient error, the job is still transient. A rate limit still fails the job.
+
 Unrecognised errors are treated as transient. Retrying one a bounded number of
 times costs seconds; abandoning one that would have succeeded throws work away.
 
@@ -421,3 +425,7 @@ Error 140 is a 400 and already maps to `ErrBadRequest` / permanent. It
 should not appear if Matrix is skipped. Other transit-costing 400s (no
 service near a location, no path) are the same bucket; the pairwise
 access path treats them as an unrouted station rather than a failed job.
+Egress is the same: a per-station 400 or timeout drops that polygon
+rather than failing the job, as long as another egress (or a cache hit)
+remains. If every egress miss fails transiently, the job is still
+transient. A rate limit still fails the job.

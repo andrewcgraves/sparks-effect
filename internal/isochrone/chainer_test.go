@@ -932,31 +932,215 @@ func TestChainer_routingErrorsPropagateByCause(t *testing.T) {
 	}
 }
 
-func TestChainer_egressFailureFailsTheChain(t *testing.T) {
-	graph := &fakeGraph{
-		nodes: []transit.Node{
-			node("station-a", -122.39, 37.71),
-			node("station-b", -122.41, 37.69),
-		},
-		travelTimes: map[[2]string]int{{"station-a", "station-b"}: 1800},
+func TestChainer_egressFailureDropsThatStation(t *testing.T) {
+	fc := twoReachableStations()
+	fc.IsochroneFn = func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
+		if r.Origin.Lat == 37.69 {
+			return nil, valhalla.ErrUpstream
+		}
+		return cannedIso(), nil
 	}
-	fc := &valhalla.StubClient{
-		MatrixResp: &valhalla.MatrixResponse{
-			SourcesToTargets: [][]valhalla.MatrixCell{
-				{valhalla.Cell(600, tokenRoadKm), {}},
-			},
-		},
-		IsochroneFn: func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
-			if r.Origin.Lat == 37.69 {
-				return nil, valhalla.ErrUpstream
+
+	var buf bytes.Buffer
+	chainer := isochrone.New(fc, viaTransitGraph(), valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.New(&buf, false), nil)
+
+	resp, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk))
+	if err != nil {
+		t.Fatalf("Chain: %v, want the chain to survive a per-station egress failure", err)
+	}
+
+	stations := stationsBySlug(t, resp)
+	if _, ok := stations["station-a"]; !ok {
+		t.Error("station-a missing from reachable_stations")
+	}
+	if _, ok := stations["station-b"]; !ok {
+		t.Error("station-b missing from reachable_stations — a dropped egress polygon is not a dropped station")
+	}
+
+	var origin, egressA, egressB bool
+	for _, f := range resp.Features {
+		var feat map[string]any
+		if err := json.Unmarshal(f, &feat); err != nil {
+			t.Fatalf("unmarshal feature: %v", err)
+		}
+		props, _ := feat["properties"].(map[string]any)
+		switch props["source"] {
+		case "origin":
+			origin = true
+		case "egress":
+			switch props["station_slug"] {
+			case "station-a":
+				egressA = true
+			case "station-b":
+				egressB = true
+			}
+		}
+	}
+	if !origin {
+		t.Error("origin feature missing")
+	}
+	if !egressA {
+		t.Error("station-a should still have an egress feature")
+	}
+	if egressB {
+		t.Error("station-b contributed an egress feature after its Isochrone failed")
+	}
+
+	if got := resp.Metadata.DroppedEgress; len(got) != 1 || got[0] != "station-b" {
+		t.Errorf("DroppedEgress = %v, want [station-b]", got)
+	}
+
+	if logged := buf.String(); !strings.Contains(logged, "station-b") {
+		t.Errorf("station-b was dropped without being named in the log:\n%s", logged)
+	}
+}
+
+func TestChainer_egressRateLimitStillFailsTheChain(t *testing.T) {
+	fc := twoReachableStations()
+	fc.IsochroneFn = func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
+		if r.Origin.Lat == 37.69 {
+			return nil, valhalla.ErrRateLimit
+		}
+		return cannedIso(), nil
+	}
+
+	_, err := newChainer(fc, viaTransitGraph()).Chain(context.Background(), req(90, transit.TravelModeWalk))
+	if !errors.Is(err, isochrone.ErrRoutingRateLimit) {
+		t.Errorf("err = %v, want ErrRoutingRateLimit", err)
+	}
+}
+
+func TestChainer_allEgressUpstreamFailsTheChain(t *testing.T) {
+	fc := twoReachableStations()
+	fc.IsochroneFn = func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
+		if r.Origin.Lat == 37.7 {
+			return cannedIso(), nil
+		}
+		return nil, valhalla.ErrUpstream
+	}
+
+	_, err := newChainer(fc, viaTransitGraph()).Chain(context.Background(), req(90, transit.TravelModeWalk))
+	if !errors.Is(err, isochrone.ErrRoutingUnavailable) {
+		t.Errorf("err = %v, want ErrRoutingUnavailable", err)
+	}
+}
+
+func TestChainer_walkShapedTransitSurvivorDoesNotRescueTransientEgressLoss(t *testing.T) {
+	for name, tc := range map[string]struct {
+		survivor *valhalla.IsochroneResponse
+		wantErr  bool
+	}{
+		"walk-shaped survivor": {survivor: walkShapedIso(), wantErr: true},
+		"transit survivor":     {survivor: transitShapedIso(), wantErr: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fc := twoStationsByTransit(nil)
+			fc.IsochroneFn = func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
+				switch r.Origin.Lat {
+				case 37.7:
+					return transitShapedIso(), nil
+				case 37.69:
+					return nil, valhalla.ErrUpstream
+				}
+				return tc.survivor, nil
+			}
+
+			_, err := newChainer(fc, viaTransitGraph()).Chain(context.Background(), req(90, transit.TravelModeTransit))
+			if tc.wantErr && !errors.Is(err, isochrone.ErrRoutingUnavailable) {
+				t.Errorf("err = %v, want ErrRoutingUnavailable — a polygon the cache would reject is not a usable egress surface", err)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("Chain: %v, want the chain to survive a transient loss beside a genuine transit polygon", err)
+			}
+		})
+	}
+}
+
+func TestChainer_allEgressBadRequestLeavesTheChainIntact(t *testing.T) {
+	fc := twoReachableStations()
+	fc.IsochroneFn = func(r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
+		if r.Origin.Lat == 37.7 {
+			return cannedIso(), nil
+		}
+		return nil, valhalla.ErrBadRequest
+	}
+
+	resp, err := newChainer(fc, viaTransitGraph()).Chain(context.Background(), req(90, transit.TravelModeWalk))
+	if err != nil {
+		t.Fatalf("Chain: %v, want the chain to survive unroutable egress stations", err)
+	}
+
+	stations := stationsBySlug(t, resp)
+	if _, ok := stations["station-a"]; !ok {
+		t.Error("station-a missing from reachable_stations")
+	}
+	if _, ok := stations["station-b"]; !ok {
+		t.Error("station-b missing from reachable_stations")
+	}
+
+	got := append([]string(nil), resp.Metadata.DroppedEgress...)
+	sort.Strings(got)
+	if len(got) != 2 || got[0] != "station-a" || got[1] != "station-b" {
+		t.Errorf("DroppedEgress = %v, want [station-a station-b]", resp.Metadata.DroppedEgress)
+	}
+
+	for _, f := range resp.Features {
+		var feat map[string]any
+		if err := json.Unmarshal(f, &feat); err != nil {
+			t.Fatalf("unmarshal feature: %v", err)
+		}
+		props, _ := feat["properties"].(map[string]any)
+		if props["source"] == "egress" {
+			t.Errorf("found an egress feature after every station Isochrone 400: %v", props)
+		}
+	}
+}
+
+func TestChainer_egressCancelFailsUnavailable(t *testing.T) {
+	originDone := make(chan struct{})
+	fc := twoReachableStations()
+	fc.IsochroneCtxFn = func(ctx context.Context, r valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
+		if r.Origin.Lat == 37.7 {
+			select {
+			case <-originDone:
+			default:
+				close(originDone)
 			}
 			return cannedIso(), nil
-		},
+		}
+		<-ctx.Done()
+		return nil, fmt.Errorf("%w: %v", valhalla.ErrUpstream, ctx.Err())
 	}
-	chainer := newChainer(fc, graph)
 
-	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeWalk)); !errors.Is(err, isochrone.ErrRoutingUnavailable) {
-		t.Errorf("want ErrRoutingUnavailable, got %v", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := newChainer(fc, viaTransitGraph()).Chain(ctx, req(90, transit.TravelModeWalk))
+		errCh <- err
+	}()
+
+	select {
+	case <-originDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("origin isochrone never ran")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("Chain succeeded after cancel, want ErrRoutingUnavailable")
+		}
+		if errors.Is(err, isochrone.ErrRoutingRejected) {
+			t.Errorf("err = %v, cancel must not be ErrRoutingRejected", err)
+		}
+		if !errors.Is(err, isochrone.ErrRoutingUnavailable) {
+			t.Errorf("err = %v, want ErrRoutingUnavailable", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Chain did not return after cancel")
 	}
 }
 

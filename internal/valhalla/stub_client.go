@@ -16,6 +16,7 @@ type StubClient struct {
 	StatusResp     Status
 	StatusErr      error
 	IsochroneFn    func(req IsochroneRequest) (*IsochroneResponse, error)
+	IsochroneCtxFn func(ctx context.Context, req IsochroneRequest) (*IsochroneResponse, error)
 	RouteFn        func(req RouteRequest) (*RouteResponse, error)
 	isochroneCalls []IsochroneRequest
 	matrixCalls    []MatrixRequest
@@ -24,11 +25,15 @@ type StubClient struct {
 
 var _ Client = (*StubClient)(nil)
 
-func (s *StubClient) Isochrone(_ context.Context, req IsochroneRequest) (*IsochroneResponse, error) {
+func (s *StubClient) Isochrone(ctx context.Context, req IsochroneRequest) (*IsochroneResponse, error) {
 	s.mu.Lock()
 	s.isochroneCalls = append(s.isochroneCalls, req)
+	ctxFn := s.IsochroneCtxFn
 	fn := s.IsochroneFn
 	s.mu.Unlock()
+	if ctxFn != nil {
+		return ctxFn(ctx, req)
+	}
 	if fn != nil {
 		return fn(req)
 	}

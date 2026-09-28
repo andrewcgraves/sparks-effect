@@ -50,6 +50,9 @@ Not synonyms, and the distinction matters when reading `chainer.go`:
 
 So every reachable station is reached; the reached set is deliberately larger.
 
+A reachable station may have no egress polygon when that station's Valhalla
+call failed. It stays in `reachable_stations` and is named in `dropped_egress`.
+
 ## Starter
 
 - **Starter station** — of the stations the rider can get to *without* riding

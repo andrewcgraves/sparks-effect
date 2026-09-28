@@ -141,12 +141,12 @@ func (c *chainImpl) Chain(ctx context.Context, req ChainRequest) (*ChainResponse
 			"omitted_legs", omittedProgress)
 	}
 
-	egressIsos, starterWalk, err := c.egressAndStarterWalk(ctx, req, costing, egressCandidates)
+	egressIsos, starterWalk, droppedEgress, err := c.egressAndStarterWalk(ctx, req, costing, egressCandidates)
 	if err != nil {
 		return nil, err
 	}
 
-	return c.assemble(ctx, req, originIso, originIsoClamped, egressCandidates, egressIsos, starterWalk, progress)
+	return c.assemble(ctx, req, originIso, originIsoClamped, egressCandidates, egressIsos, starterWalk, progress, droppedEgress)
 }
 
 func (c *chainImpl) egressAndStarterWalk(
@@ -154,20 +154,22 @@ func (c *chainImpl) egressAndStarterWalk(
 	req ChainRequest,
 	costing valhalla.Costing,
 	candidates []egressCandidate,
-) ([]*valhalla.IsochroneResponse, *StarterWalk, error) {
+) ([]*valhalla.IsochroneResponse, *StarterWalk, []string, error) {
 	var (
-		egressIsos  []*valhalla.IsochroneResponse
-		starterWalk *StarterWalk
+		egressIsos    []*valhalla.IsochroneResponse
+		starterWalk   *StarterWalk
+		droppedEgress []string
 	)
 
 	g, gctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		isos, err := c.egressIsochrones(gctx, req, costing, candidates)
+		isos, dropped, err := c.egressIsochrones(gctx, req, costing, candidates)
 		if err != nil {
 			return err
 		}
 		egressIsos = isos
+		droppedEgress = dropped
 		return nil
 	})
 
@@ -179,9 +181,9 @@ func (c *chainImpl) egressAndStarterWalk(
 	}
 
 	if err := g.Wait(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return egressIsos, starterWalk, nil
+	return egressIsos, starterWalk, droppedEgress, nil
 }
 
 func pickStarter(candidates []egressCandidate) *egressCandidate {
@@ -551,10 +553,10 @@ func (c *chainImpl) egressIsochrones(
 	req ChainRequest,
 	costing valhalla.Costing,
 	candidates []egressCandidate,
-) ([]*valhalla.IsochroneResponse, error) {
+) ([]*valhalla.IsochroneResponse, []string, error) {
 	isos := make([]*valhalla.IsochroneResponse, len(candidates))
 	if len(candidates) == 0 {
-		return isos, nil
+		return isos, nil, nil
 	}
 
 	var served []int
@@ -564,7 +566,7 @@ func (c *chainImpl) egressIsochrones(
 		}
 	}
 	if len(served) == 0 {
-		return isos, nil
+		return isos, nil, nil
 	}
 
 	keys := make([]store.IsochroneKey, len(served))
@@ -599,7 +601,7 @@ func (c *chainImpl) egressIsochrones(
 	}
 	c.log.Debug(ctx, "chain: egress cache lookup", "hits", len(served)-len(misses), "misses", len(misses))
 	if len(misses) == 0 {
-		return isos, nil
+		return isos, nil, nil
 	}
 
 	concurrency := c.limits.MaxConcurrency
@@ -610,6 +612,8 @@ func (c *chainImpl) egressIsochrones(
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(concurrency)
 
+	droppedAt := make([]string, len(served))
+	dropErrs := make([]error, len(served))
 	for _, j := range misses {
 		i := served[j]
 		g.Go(func() error {
@@ -620,20 +624,65 @@ func (c *chainImpl) egressIsochrones(
 				DepartAt:   departs[j],
 			})
 			if isoErr != nil {
-				return wrapRoutingErr(isoErr)
+				// 400 and timeout/5xx drop that polygon; rate limit and
+				// cancel fail the chain; if every egress miss failed
+				// transiently and nothing was cached, fail the chain.
+				// Rate limit first: wrapping isoErr keeps ErrRoutingRateLimit.
+				// Then gctx.Err(), not isoErr — a sibling/parent cancel plus
+				// an in-flight 400 would otherwise become ErrRoutingRejected
+				// (permanent). wrapRoutingErr(context.Canceled) is
+				// ErrRoutingUnavailable (transient).
+				if errors.Is(isoErr, valhalla.ErrRateLimit) {
+					return wrapRoutingErr(isoErr)
+				}
+				if gctx.Err() != nil {
+					return wrapRoutingErr(gctx.Err())
+				}
+				slug := candidates[i].node.Slug
+				c.log.Warn(gctx, "chain: egress isochrone failed, dropping station polygon",
+					"station_slug", slug, "err", isoErr.Error())
+				droppedAt[j] = slug
+				dropErrs[j] = isoErr
+				return nil
 			}
 			subIsos[j] = iso
 			return nil
 		})
 	}
 
-	if err := g.Wait(); err != nil {
-		return nil, err
+	err := g.Wait()
+	c.cache.record(ctx, keys, subIsos, misses, c.log)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	c.cache.record(ctx, keys, subIsos, misses, c.log)
+	var dropped []string
+	var transient error
+	for j, slug := range droppedAt {
+		if slug == "" {
+			continue
+		}
+		dropped = append(dropped, slug)
+		if transient == nil && !errors.Is(dropErrs[j], valhalla.ErrBadRequest) {
+			transient = dropErrs[j]
+		}
+	}
+	sort.Strings(dropped)
+	c.logDropped(ctx, req, "chain: egress isochrone failed, dropping those stations' polygons", dropped)
 
-	return isos, nil
+	if transient != nil {
+		ok := false
+		for j, iso := range subIsos {
+			if ok, _, _ = usable(iso, keys[j]); ok {
+				break
+			}
+		}
+		if !ok {
+			return nil, nil, wrapRoutingErr(transient)
+		}
+	}
+
+	return isos, dropped, nil
 }
 
 func (c *chainImpl) assemble(
@@ -645,6 +694,7 @@ func (c *chainImpl) assemble(
 	egressIsos []*valhalla.IsochroneResponse,
 	starterWalk *StarterWalk,
 	progress []TripProgress,
+	droppedEgress []string,
 ) (*ChainResponse, error) {
 	features := make([]json.RawMessage, 0)
 	if originIso != nil {
@@ -689,7 +739,8 @@ func (c *chainImpl) assemble(
 	c.log.Info(ctx, "chain: complete",
 		"compile_job_id", req.CompileJobID,
 		"features", len(features),
-		"reachable_stations", len(reachableStations))
+		"reachable_stations", len(reachableStations),
+		"dropped_egress", len(droppedEgress))
 
 	return &ChainResponse{
 		Type:     "FeatureCollection",
@@ -705,6 +756,7 @@ func (c *chainImpl) assemble(
 			OriginIsoAvailable: originIso != nil,
 			StarterWalk:        starterWalk,
 			TripProgress:       progress,
+			DroppedEgress:      droppedEgress,
 		},
 	}, nil
 }

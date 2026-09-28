@@ -73,6 +73,7 @@ type ChainMetadata struct {
 	OriginIsoAvailable bool               `json:"origin_iso_available"`
 	StarterWalk        *StarterWalk       `json:"starter_walk,omitempty"`
 	TripProgress       []TripProgress     `json:"trip_progress,omitempty"`
+	DroppedEgress      []string           `json:"dropped_egress,omitempty"`
 }
 
 type ChainResponse struct {
