@@ -95,4 +95,6 @@ sized from the budget — so the whole publish → consume → record loop runs 
 seconds with no tileset. Every synthetic feature carries `"synthetic": true`, and
 a NULL `tileset_at` on a cache row is the tell that it was drawn this way.
 Synthetic and real polygons share one cache keyspace: nothing in the key says
-which backend drew the shape.
+which backend drew the shape. They do not share rows in practice. A synthetic
+worker has no tileset stamp, so it reads nothing, and a real worker treats an
+unstamped row as a miss (SPA-325).

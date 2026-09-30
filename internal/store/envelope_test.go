@@ -52,7 +52,7 @@ func goldenEnvelope() workerStoreEnvelope {
 	return workerStoreEnvelope{
 		CacheLookupRequest: cacheLookupRequest{Keys: []IsochroneKey{key}},
 		CacheLookupResponse: cacheLookupResponse{
-			Entries: []cacheLookupEntry{{Key: key, Geometry: geom}},
+			Entries: []cacheLookupEntry{{Key: key, Geometry: geom, TilesetAt: goldenTilesetAt()}},
 		},
 		CachePutRequest: cachePutRequest{
 			Entries: []CachedIsochrone{{
@@ -89,6 +89,9 @@ func TestWorkerStoreEnvelope_roundTripsThroughTheFixture(t *testing.T) {
 	}
 	if got.CacheLookupResponse.Entries[0].Key != want.CacheLookupResponse.Entries[0].Key {
 		t.Errorf("lookup entry key = %+v, want %+v", got.CacheLookupResponse.Entries[0].Key, want.CacheLookupResponse.Entries[0].Key)
+	}
+	if !got.CacheLookupResponse.Entries[0].TilesetAt.Equal(want.CacheLookupResponse.Entries[0].TilesetAt) {
+		t.Errorf("lookup tileset_at = %v, want %v", got.CacheLookupResponse.Entries[0].TilesetAt, want.CacheLookupResponse.Entries[0].TilesetAt)
 	}
 	if got.CachePutRequest.Entries[0].Key != want.CachePutRequest.Entries[0].Key {
 		t.Errorf("put key = %+v, want %+v", got.CachePutRequest.Entries[0].Key, want.CachePutRequest.Entries[0].Key)

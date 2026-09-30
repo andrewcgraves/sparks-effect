@@ -104,7 +104,7 @@ type recordingCache struct {
 
 var _ store.IsochroneCache = (*recordingCache)(nil)
 
-func (r *recordingCache) Get(_ context.Context, keys []store.IsochroneKey) (map[store.IsochroneKey]json.RawMessage, error) {
+func (r *recordingCache) Get(_ context.Context, keys []store.IsochroneKey) (map[store.IsochroneKey]store.CachedIsochrone, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.gets = append(r.gets, keys...)
@@ -159,8 +159,11 @@ func (c *stubStatusClient) Route(
 func TestHandle_consultsTheEgressCacheForTheMessagesCompileJob(t *testing.T) {
 	s := &fakeStore{}
 	cache := &recordingCache{}
+	// A worker with no tileset stamp reads nothing (SPA-325), and the synthetic
+	// client never supplies one, so the test does.
+	stamp := isochrone.NewTilesetStamp(time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC))
 	h := worker.NewHandler(s, valhalla.NewSyntheticClient(), valhalla.DefaultLimits(),
-		isochrone.EgressCache{Store: cache}, logger.Discard(), nil)
+		isochrone.EgressCache{Store: cache, Stamp: stamp}, logger.Discard(), nil)
 
 	msg := mutateGolden(t, func(m map[string]any) { m["budget_mins"] = 90 })
 

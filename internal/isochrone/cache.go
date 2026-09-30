@@ -3,6 +3,7 @@ package isochrone
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/geo"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
@@ -27,6 +28,17 @@ func (e EgressCache) lookup(
 		return nil
 	}
 
+	// A row is served only when it was cut from the tileset Valhalla is
+	// serving now (SPA-325): a map cycle changes every polygon without
+	// changing any compile job, so nothing else in the key would notice. A
+	// worker that cannot name its tileset (synthetic, or /status has not
+	// answered since boot) can verify no row, so it does not ask.
+	current := e.Stamp.Time()
+	if current.IsZero() {
+		e.Metrics.Cache(metrics.ResultMiss, len(keys))
+		return nil
+	}
+
 	rows, err := e.Store.Get(ctx, keys)
 	if err != nil {
 		log.Warn(ctx, "isochrone: egress cache unavailable, computing instead", "err", err.Error())
@@ -35,9 +47,18 @@ func (e EgressCache) lookup(
 	}
 
 	hits := make(map[store.IsochroneKey]*valhalla.IsochroneResponse, len(rows))
-	for k, geometry := range rows {
+	stale := 0
+	for k, row := range rows {
+		// A NULL stamp is a miss too: a synthetic circle, or a row written before
+		// /status first answered. The recompute carries a stamp, and the API's write
+		// guard lets a stamped row replace an unstamped or older one, so each
+		// stale row costs one recompute rather than one per request.
+		if !row.TilesetAt.Equal(current) {
+			stale++
+			continue
+		}
 		var iso valhalla.IsochroneResponse
-		if err := json.Unmarshal(geometry, &iso); err != nil {
+		if err := json.Unmarshal(row.Geometry, &iso); err != nil {
 			log.Warn(ctx, "isochrone: discarding unreadable cache entry",
 				"compile_job_id", k.CompileJobID, "station_slug", k.StationSlug, "err", err.Error())
 			continue
@@ -55,6 +76,10 @@ func (e EgressCache) lookup(
 			continue
 		}
 		hits[k] = &iso
+	}
+	if stale > 0 {
+		log.Info(ctx, "isochrone: recomputing cache entries cut from another tileset",
+			"count", stale, "tileset_at", current.Format(time.RFC3339))
 	}
 
 	nHit, nMiss := 0, 0

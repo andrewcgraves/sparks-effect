@@ -203,7 +203,7 @@ func TestIsochroneCache_roundTrip(t *testing.T) {
 		t.Fatalf("Get returned %d entries, want 1 (the other key was never stored)", len(got))
 	}
 	var round map[string]any
-	if err := json.Unmarshal(got[stored], &round); err != nil {
+	if err := json.Unmarshal(got[stored].Geometry, &round); err != nil {
 		t.Fatalf("cached geometry is not valid JSON: %v", err)
 	}
 	if round["type"] != "FeatureCollection" {
@@ -372,7 +372,30 @@ func TestIsochroneCache_tilesetIsRecordedButNotKeyed(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 	if len(got) != 1 {
-		t.Errorf("Get found %d entries, want 1 — the tileset must not narrow the lookup", len(got))
+		t.Fatalf("Get found %d entries, want 1 — the tileset must not narrow the lookup", len(got))
+	}
+	// SPA-325: the stamp comes back so the worker can refuse a row cut from
+	// tiles it is no longer serving.
+	if !got[k].TilesetAt.Equal(built) {
+		t.Errorf("served tileset_at = %s, want %s", got[k].TilesetAt, built)
+	}
+}
+
+func TestIsochroneCache_unstampedRowIsServedWithoutAStamp(t *testing.T) {
+	api := testsupport.StartFakeAPI(t)
+	client := connect(t, api)
+	ctx := context.Background()
+
+	k := key(firstCompileID, "station-a", 30)
+	if err := client.Put(ctx, []store.CachedIsochrone{{Key: k, Geometry: polygon("a")}}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	got, err := client.Get(ctx, []store.IsochroneKey{k})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if at := got[k].TilesetAt; !at.IsZero() {
+		t.Errorf("served tileset_at = %s for a row written without one, want zero", at)
 	}
 }
 
@@ -398,7 +421,7 @@ func TestIsochroneCache_repeatedPutIsNotAnError(t *testing.T) {
 		t.Fatalf("Get: %v", err)
 	}
 	var round map[string]any
-	if err := json.Unmarshal(got[entry.Key], &round); err != nil {
+	if err := json.Unmarshal(got[entry.Key].Geometry, &round); err != nil {
 		t.Fatalf("cached geometry is not valid JSON: %v", err)
 	}
 	if round["features"].([]any)[0].(map[string]any)["slug"] != "first" {

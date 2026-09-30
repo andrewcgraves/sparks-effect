@@ -97,15 +97,37 @@ station and contour. The date on the key is the date the egress request itself
 was stamped with — see "the departure clock" below — never one recomputed
 beside it.
 
-**Accepted risk.** A Valhalla tile rebuild changes every polygon without
-changing any compile job, and nothing here detects that. Rebuilds are rare and
-are already a deliberate operator ritual. To keep it diagnosable, each row
-records the server's tileset timestamp as *data only* — never part of the key,
-because keying on it would silently invalidate the entire cache on every rebuild.
-The stamp is refreshed from Valhalla `/status` at the start of each job. A failed
-status read keeps the last known stamp, or NULL if there has not been one, so a
-rebuild under a running worker does not require a restart to keep this diagnostic
-truthful.
+**A row from another tileset is a miss (SPA-325).** A Valhalla tile rebuild
+changes every polygon without changing any compile job, so nothing in the key
+notices a map cycle. Each row instead carries the tileset timestamp Valhalla
+reported when it was drawn (`tileset_at`), and a lookup serves a row only when
+that stamp equals the one the worker holds now. Anything else, older or newer,
+is a miss on the same path a corrupt row takes: counted as a miss, recomputed,
+and written back with the current stamp. The stamp stays off the key on
+purpose. Keying on it would mint a new row per rebuild; comparing on read
+reuses the key, and the API's write guard (SPA-328) lets the stamped recompute
+replace the stale row. A cycle therefore costs each row one recompute and needs
+no purge. The stamp is refreshed from Valhalla `/status` at the start of each
+job, and a failed read keeps the last known stamp, so a cycle under a running
+worker is noticed without a restart.
+
+The NULL case was decided deliberately:
+
+- **A row with no stamp is a miss.** That is a synthetic circle, or a row
+  written while `/status` had not answered since boot. The API lets a stamped
+  row replace an unstamped one, so this costs one recompute per row, not one
+  per request.
+- **A worker with no stamp reads nothing.** In synthetic mode, or when
+  `/status` has not answered since boot, the worker has nothing to compare a row
+  against, so it skips the lookup and counts every key as a miss. It still
+  writes, unstamped, and those rows lose to the first stamped recompute. The
+  per-job `/status` warning says why the hit rate is zero.
+- **Rolling back to an older tileset does not heal.** After
+  `make rollback-tiles`, rows drawn from the newer tiles mismatch, but the
+  recompute carries the older stamp, and the API never lets an older stamp
+  replace a newer one. Those keys are recomputed on every request until the map
+  moves forward past them. Every answer is correct, just uncached, and each
+  chain that hits them logs `recomputing cache entries cut from another tileset`.
 
 `budget_mins` is the chain's budget, and like `departs_on` it is NULL for every
 mode but transit. Since SPA-274 the egress request's departure carries a time
@@ -151,13 +173,12 @@ nothing about it can fail a job: a miss, an entry that will not parse, or an
 API that cannot be reached all mean the same thing — compute the polygon,
 and log that the cache is not working.
 
-**Synthetic and real polygons share one keyspace.** Nothing in the key says
-which backend drew the shape, so a worker started with `VALHALLA_SYNTHETIC=true`
-against a cache another worker warmed will serve real polygons, and one
-started against Valhalla with a cache warmed synthetically will serve circles.
-Locally that is what a throwaway API (or the in-process fake the tests use)
-is for; anywhere shared, treat switching backends as needing the cache
-cleared. A NULL `tileset_at` is the tell — synthetic rows have never seen a
+**Synthetic and real polygons share one keyspace, but not one another's
+rows.** Nothing in the key says which backend drew the shape, but a synthetic
+worker has no tileset stamp, so it never reads the cache, and every row it
+writes is unstamped, which a real worker treats as a miss and replaces
+(SPA-325). Switching backends against a shared cache no longer needs the cache
+cleared. A NULL `tileset_at` is still the tell that a row has never seen a
 tile.
 
 ## Failure handling

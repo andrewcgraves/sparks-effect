@@ -38,6 +38,6 @@ type CachedIsochrone struct {
 }
 
 type IsochroneCache interface {
-	Get(ctx context.Context, keys []IsochroneKey) (map[IsochroneKey]json.RawMessage, error)
+	Get(ctx context.Context, keys []IsochroneKey) (map[IsochroneKey]CachedIsochrone, error)
 	Put(ctx context.Context, entries []CachedIsochrone) error
 }

@@ -188,8 +188,9 @@ func (f *FakeAPI) cacheLookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type entry struct {
-		Key      store.IsochroneKey `json:"key"`
-		Geometry json.RawMessage    `json:"geometry"`
+		Key       store.IsochroneKey `json:"key"`
+		Geometry  json.RawMessage    `json:"geometry"`
+		TilesetAt time.Time          `json:"tileset_at,omitzero"`
 	}
 	out := struct {
 		Entries []entry `json:"entries"`
@@ -199,7 +200,7 @@ func (f *FakeAPI) cacheLookup(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	for _, k := range body.Keys {
 		if row, ok := f.cache[k]; ok {
-			out.Entries = append(out.Entries, entry{Key: k, Geometry: row.geometry})
+			out.Entries = append(out.Entries, entry{Key: k, Geometry: row.geometry, TilesetAt: row.tilesetAt})
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -216,9 +217,14 @@ func (f *FakeAPI) cachePut(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// The tileset half of the API's write guard (SPA-328): a conflicting row
+	// is replaced only by a stamped one newer than it, so a recompute after a
+	// map cycle lands and a stale or synthetic worker cannot overwrite.
 	for _, e := range body.Entries {
-		if _, exists := f.cache[e.Key]; exists {
-			continue
+		if stored, exists := f.cache[e.Key]; exists {
+			if e.TilesetAt.IsZero() || (!stored.tilesetAt.IsZero() && !e.TilesetAt.After(stored.tilesetAt)) {
+				continue
+			}
 		}
 		f.cache[e.Key] = fakeCacheRow{geometry: append(json.RawMessage(nil), e.Geometry...), tilesetAt: e.TilesetAt}
 	}

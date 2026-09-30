@@ -157,7 +157,7 @@ func nodeBySlug(t *testing.T, graph transit.GraphData, slug string) transit.Node
 func TestChainer_transitCacheKeysCarryTheServiceDate(t *testing.T) {
 	at := departure(t)
 	cache := newFakeCache()
-	chainer := newCachingChainer(hubOnlyAccess(600), viaTransitGraph(), isochrone.EgressCache{Store: cache})
+	chainer := newCachingChainer(hubOnlyAccess(600), viaTransitGraph(), stamped(cache))
 
 	if _, err := chainer.Chain(context.Background(), departingAt(90, transit.TravelModeTransit, at)); err != nil {
 		t.Fatalf("Chain: %v", err)
@@ -199,7 +199,7 @@ func TestChainer_transitCacheKeysCarryTheBudget(t *testing.T) {
 
 func TestChainer_nonTransitCacheKeysCarryNoServiceDateOrBudget(t *testing.T) {
 	cache := newFakeCache()
-	chainer := newCachingChainer(twoReachableStations(), viaTransitGraph(), isochrone.EgressCache{Store: cache})
+	chainer := newCachingChainer(twoReachableStations(), viaTransitGraph(), stamped(cache))
 
 	if _, err := chainer.Chain(context.Background(), departingAt(90, transit.TravelModeWalk, departure(t))); err != nil {
 		t.Fatalf("Chain: %v", err)
@@ -221,7 +221,7 @@ func TestChainer_nonTransitCacheKeysCarryNoServiceDateOrBudget(t *testing.T) {
 
 func TestChainer_twoServiceDatesAreTwoRows(t *testing.T) {
 	cache := newFakeCache()
-	egress := isochrone.EgressCache{Store: cache}
+	egress := stamped(cache)
 	graph := viaTransitGraph()
 	wednesday := departure(t)
 	thursday := wednesday.AddDate(0, 0, 1)
@@ -263,7 +263,7 @@ func TestChainer_cachedDateMatchesTheRequestItDescribes(t *testing.T) {
 	cache := newFakeCache()
 	fc := hubOnlyAccess(600)
 
-	if _, err := newCachingChainer(fc, viaTransitGraph(), isochrone.EgressCache{Store: cache}).Chain(
+	if _, err := newCachingChainer(fc, viaTransitGraph(), stamped(cache)).Chain(
 		context.Background(), departingAt(90, transit.TravelModeTransit, at)); err != nil {
 		t.Fatalf("Chain: %v", err)
 	}

@@ -133,16 +133,17 @@ type cacheLookupResponse struct {
 }
 
 type cacheLookupEntry struct {
-	Key      IsochroneKey    `json:"key"`
-	Geometry json.RawMessage `json:"geometry"`
+	Key       IsochroneKey    `json:"key"`
+	Geometry  json.RawMessage `json:"geometry"`
+	TilesetAt time.Time       `json:"tileset_at,omitzero"`
 }
 
 type cachePutRequest struct {
 	Entries []CachedIsochrone `json:"entries"`
 }
 
-func (c *Client) Get(ctx context.Context, keys []IsochroneKey) (map[IsochroneKey]json.RawMessage, error) {
-	found := make(map[IsochroneKey]json.RawMessage, len(keys))
+func (c *Client) Get(ctx context.Context, keys []IsochroneKey) (map[IsochroneKey]CachedIsochrone, error) {
+	found := make(map[IsochroneKey]CachedIsochrone, len(keys))
 	if len(keys) == 0 {
 		return found, nil
 	}
@@ -161,7 +162,7 @@ func (c *Client) Get(ctx context.Context, keys []IsochroneKey) (map[IsochroneKey
 		return nil, fmt.Errorf("store: reading isochrone cache: %w", err)
 	}
 	for _, e := range out.Entries {
-		found[e.Key] = e.Geometry
+		found[e.Key] = CachedIsochrone(e)
 	}
 	return found, nil
 }
