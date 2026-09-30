@@ -729,9 +729,11 @@ func TestChainer_poisonedWalkShapedTransitIsDiscardedOnLookup(t *testing.T) {
 	cache := newFakeCache()
 	cache.seed(store.IsochroneKey{
 		CompileJobID: "compile-1", StationSlug: "station-a", Mode: "transit", ContourMins: 79, DepartsOn: "2026-09-02",
+		BudgetMins: 90,
 	}, walkGeom)
 	cache.seed(store.IsochroneKey{
 		CompileJobID: "compile-1", StationSlug: "station-b", Mode: "transit", ContourMins: 75, DepartsOn: "2026-09-02",
+		BudgetMins: 90,
 	}, transitGeom)
 
 	cold := twoStationsByTransit(walkShapedIso())

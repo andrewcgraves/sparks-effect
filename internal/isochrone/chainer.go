@@ -548,6 +548,20 @@ func serviceDate(costing valhalla.Costing, departAt time.Time) string {
 	return valhalla.ServiceDate(departAt)
 }
 
+func departureBudget(costing valhalla.Costing, budgetMins int) int {
+	// Below the contour ceiling, budget and contour together fix the egress
+	// departure to the minute: the journey to the station is budget minus
+	// contour, and the chain always departs at the same clock. Without it two
+	// budgets whose journeys differ by their difference in budget shared a
+	// row cut for a departure that far apart (SPA-326). Only a timetable
+	// makes the departure matter, so every other mode keys on zero — NULL —
+	// and keeps one row per contour, exactly as serviceDate does.
+	if costing != valhalla.CostingMultimodal {
+		return 0
+	}
+	return budgetMins
+}
+
 func (c *chainImpl) egressIsochrones(
 	ctx context.Context,
 	req ChainRequest,
@@ -579,6 +593,7 @@ func (c *chainImpl) egressIsochrones(
 			Mode:         string(req.Mode),
 			ContourMins:  c.clampToContourCeilingSecs(candidates[i].remainingMins*60) / 60,
 			DepartsOn:    serviceDate(costing, departs[j]),
+			BudgetMins:   departureBudget(costing, req.BudgetMins),
 		}
 	}
 

@@ -306,6 +306,10 @@ func TestIsochroneCache_everyKeyFieldDiscriminates(t *testing.T) {
 			CompileJobID: firstCompileID, StationSlug: "station-a",
 			Mode: "walk", ContourMins: 30, DepartsOn: "2026-09-02",
 		},
+		"budget": {
+			CompileJobID: firstCompileID, StationSlug: "station-a",
+			Mode: "walk", ContourMins: 30, BudgetMins: 90,
+		},
 	}
 
 	for field, k := range differsBy {

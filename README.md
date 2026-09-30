@@ -65,7 +65,7 @@ the work, one call per station reached by riding transit against two for
 everything else. A station reached by walking alone gets no egress call, and
 nothing to cache: its own reach is already covered by the origin polygon.
 
-The key is `(compile_job_id, station_slug, mode, contour_mins, departs_on)`.
+The key is `(compile_job_id, station_slug, mode, contour_mins, departs_on, budget_mins)`.
 
 Keying on the publication is what makes this correct with no invalidation
 machinery at all. A published scenario is frozen and its stations cannot move,
@@ -76,7 +76,8 @@ step for anyone to forget to fire. Rows disappear with their compile job, by
 foreign key.
 
 `contour_mins` is the contour actually asked of Valhalla, after clamping to the
-server's ceiling, so every budget that clamps to the same contour shares one row.
+server's ceiling, so for walk / bike / drive every budget that clamps to the same
+contour shares one row; transit rows are split by budget as well (below).
 `mode` is the domain's vocabulary — walk / bike / drive / transit — matching
 the column; Valhalla's "costing" stays at the client boundary (`transit` →
 `multimodal`, never Valhalla's own `transit` costing, which is stop-to-stop
@@ -106,28 +107,44 @@ status read keeps the last known stamp, or NULL if there has not been one, so a
 rebuild under a running worker does not require a restart to keep this diagnostic
 truthful.
 
-**Accepted risk, second one.** `departs_on` is a *date*, but since SPA-274 the
-egress request's departure also carries a time of day — the chain's departure
-plus the journey to that station. So the key is coarser than the request it
-describes, and two chains can share a row whose polygons were computed at
-different hours of the same day.
+`budget_mins` is the chain's budget, and like `departs_on` it is NULL for every
+mode but transit. Since SPA-274 the egress request's departure carries a time
+of day — the chain's departure plus the journey to that station — and the
+contour is the budget minus that same journey. The two are exactly
+complementary: two chains land on the same contour precisely when their journey
+times differ by the difference in their budgets, and then their polygons were
+asked for that far apart in the timetable. Budget 90 riding from a 10-minute
+access leg and budget 120 riding from a 40-minute one both reach a station with
+79 minutes left, 30 minutes apart on the platform. Before SPA-326 they shared a
+row; with six UI presets from 45 to 240 the worst such gap was 195 minutes, and
+through the API it was unbounded.
 
-Reaching it takes a coincidence: the same graph, the same station, the same
-clamped contour and the same date, but different journey durations — which
-needs different origins and budgets that differ by exactly the difference in
-journey time. Two cases are worth knowing about. Below the contour ceiling the
-gap is bounded by the minute-truncation of `remaining_mins`, so at worst 59
-seconds, which no timetable notices. Above the ceiling every budget clamps to
-the same contour, so the gap is unbounded: budget 400 min arriving 10 minutes
-in and budget 500 min arriving 100 minutes in both key on contour 320 and share
-one row, 90 minutes of timetable apart.
+With the budget in the key, and the chain always departing on the departure
+clock, a transit row below the contour ceiling pins its egress departure to
+the minute truncation of `remaining_mins` — under a minute apart, which no
+timetable notices. Walk / bike / drive send Valhalla no departure at all, so
+the budget stays out of their key rather than fragmenting it for nothing.
 
-It is accepted rather than fixed because closing it means putting the departure
-itself in the key, and the column the API owns is a `date` — so the fix is a
-migration in sparks-effect-api (a `departs_at`, or a minute-of-day beside the
-date), not something this repository can do alone. Until then the reuse is
-wrong only in the clamped regime, where the polygon is a ceiling-sized answer
-to an over-ceiling ask in the first place.
+The price is hit rate. The collision was also what compressed the keyspace:
+contour alone spans 1–240 from the UI, and contour × budget is roughly three
+times as many reachable rows per station. The whole transit corpus also goes
+cold when this ships — every existing row carries a NULL budget, which under
+`NULLS NOT DISTINCT` no transit lookup matches. SPA-327 buys the hit rate back
+by bucketing `contour_mins` to five minutes, which deliberately reintroduces a
+bounded version of the same collision at bucket scale.
+
+**Accepted risk, second one.** Above the contour ceiling the key is still
+coarser than the request. `contour_mins` is clamped, so at the ceiling the
+remaining time — and with it the departure — is no longer recoverable from the
+key: budget 400 min arriving 10 minutes in and budget 400 min arriving 100
+minutes in both key on contour 320 and budget 400, and share one row 90 minutes
+of timetable apart. No UI preset reaches the ceiling (the largest is 240, the
+ceiling 320), so it takes a budget sent to the API directly; bounding
+`budget_mins` there (SPA-332) is what makes it reachable only in theory.
+Closing it outright means putting the departure itself in the key — a
+`departs_at` rather than a date — which is a migration in sparks-effect-api.
+Until then the reuse is wrong only in the clamped regime, where the polygon is
+a ceiling-sized answer to an over-ceiling ask in the first place.
 
 The cache is an optimisation over work the worker can always do itself, so
 nothing about it can fail a job: a miss, an entry that will not parse, or an

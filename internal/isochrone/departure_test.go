@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/transit"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
@@ -177,7 +178,26 @@ func TestChainer_transitCacheKeysCarryTheServiceDate(t *testing.T) {
 	}
 }
 
-func TestChainer_nonTransitCacheKeysCarryNoServiceDate(t *testing.T) {
+func TestChainer_transitCacheKeysCarryTheBudget(t *testing.T) {
+	cache := newFakeCache()
+	chainer := newCachingChainer(hubOnlyAccess(600), viaTransitGraph(), isochrone.EgressCache{Store: cache})
+
+	if _, err := chainer.Chain(context.Background(), departingAt(90, transit.TravelModeTransit, departure(t))); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	written := cache.written()
+	if len(written) == 0 {
+		t.Fatal("nothing cached")
+	}
+	for _, e := range written {
+		if e.Key.BudgetMins != 90 {
+			t.Errorf("%s BudgetMins = %d, want 90", e.Key.StationSlug, e.Key.BudgetMins)
+		}
+	}
+}
+
+func TestChainer_nonTransitCacheKeysCarryNoServiceDateOrBudget(t *testing.T) {
 	cache := newFakeCache()
 	chainer := newCachingChainer(twoReachableStations(), viaTransitGraph(), isochrone.EgressCache{Store: cache})
 
@@ -192,6 +212,9 @@ func TestChainer_nonTransitCacheKeysCarryNoServiceDate(t *testing.T) {
 	for _, e := range written {
 		if e.Key.DepartsOn != "" {
 			t.Errorf("%s walk row keyed by service date %q", e.Key.StationSlug, e.Key.DepartsOn)
+		}
+		if e.Key.BudgetMins != 0 {
+			t.Errorf("%s walk row keyed by budget %d; walk polygons take no departure", e.Key.StationSlug, e.Key.BudgetMins)
 		}
 	}
 }
@@ -261,5 +284,92 @@ func TestChainer_cachedDateMatchesTheRequestItDescribes(t *testing.T) {
 		if e.Key.DepartsOn != want {
 			t.Errorf("%s keyed on %q but requested for %q", e.Key.StationSlug, e.Key.DepartsOn, want)
 		}
+	}
+}
+
+func TestChainer_twoBudgetsAtOneContourAreTwoRows(t *testing.T) {
+	// SPA-326's repro. Budget 90 riding from a 10-minute access leg and budget
+	// 120 riding from a 40-minute one both reach station-a with 79 minutes
+	// left, so they share a contour, a station and a date — but the second
+	// rider is on the platform 30 minutes later. Budget in the key is what
+	// stops the second chain being served the first one's timetable.
+	at := departure(t)
+	cache := newFakeCache()
+	egress := isochrone.EgressCache{Store: cache}
+	graph := viaTransitGraph()
+	stationA := nodeBySlug(t, graph, "station-a")
+	egressDepartureAtA := func(fc *valhalla.StubClient) (time.Time, bool) {
+		iso, _ := fc.Calls()
+		for _, call := range iso[1:] {
+			if call.Origin == (valhalla.LatLng{Lat: stationA.Lat, Lng: stationA.Lng}) {
+				return call.DepartAt, true
+			}
+		}
+		return time.Time{}, false
+	}
+
+	cold := hubOnlyAccess(600)
+	if _, err := newCachingChainer(cold, graph, egress).Chain(
+		context.Background(), departingAt(90, transit.TravelModeTransit, at)); err != nil {
+		t.Fatalf("cold Chain: %v", err)
+	}
+	coldDepart, ok := egressDepartureAtA(cold)
+	if !ok {
+		t.Fatal("the cold chain never asked for station-a's egress")
+	}
+
+	warm := hubOnlyAccess(2400)
+	if _, err := newCachingChainer(warm, graph, egress).Chain(
+		context.Background(), departingAt(120, transit.TravelModeTransit, at)); err != nil {
+		t.Fatalf("warm Chain: %v", err)
+	}
+	warmDepart, ok := egressDepartureAtA(warm)
+	if !ok {
+		t.Fatal("budget 120 was served budget 90's station-a polygon; it never asked Valhalla for its own departure")
+	}
+	if got := warmDepart.Sub(coldDepart); got != 30*time.Minute {
+		t.Errorf("the two egress departures are %s apart, want 30m — the repro no longer exercises the collision", got)
+	}
+
+	var rows []store.IsochroneKey
+	for _, e := range cache.written() {
+		if e.Key.StationSlug == "station-a" {
+			rows = append(rows, e.Key)
+		}
+	}
+	if len(rows) != 2 {
+		t.Fatalf("station-a rows = %+v, want one per budget", rows)
+	}
+	if rows[0].ContourMins != rows[1].ContourMins || rows[0].DepartsOn != rows[1].DepartsOn {
+		t.Errorf("rows %+v and %+v differ by more than budget; the repro needs one contour and one date", rows[0], rows[1])
+	}
+	if rows[0].BudgetMins == rows[1].BudgetMins {
+		t.Errorf("both rows keyed on budget %d", rows[0].BudgetMins)
+	}
+}
+
+func TestChainer_twoBudgetsShareWalkRows(t *testing.T) {
+	// The other half of SPA-326: walk takes no departure, so a different
+	// budget reaching the same contour must still hit the row it left.
+	cache := newFakeCache()
+	egress := isochrone.EgressCache{Store: cache}
+
+	if _, err := newCachingChainer(twoReachableStations(), viaTransitGraph(), egress).
+		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {
+		t.Fatalf("cold Chain: %v", err)
+	}
+
+	warm := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		MatrixResp: &valhalla.MatrixResponse{
+			SourcesToTargets: [][]valhalla.MatrixCell{{valhalla.Cell(2400, tokenRoadKm), {}, {}}},
+		},
+	}
+	if _, err := newCachingChainer(warm, viaTransitGraph(), egress).
+		Chain(context.Background(), req(120, transit.TravelModeWalk)); err != nil {
+		t.Fatalf("warm Chain: %v", err)
+	}
+	if got := isochroneCallCount(t, warm); got != 1 {
+		t.Errorf("warm chain made %d isochrone calls, want 1 (the origin) — walk rows must not fragment by budget", got)
 	}
 }

@@ -79,10 +79,14 @@ on the platform.
 - **Service date** (`departs_on`) — the GTFS calendar day a transit polygon was
   computed against, and part of the egress cache key. Empty for the modes with no
   timetable.
+- **Budget** (`budget_mins`) — the chain's budget, and part of a transit egress
+  cache key: below the ceiling, budget and contour together fix when the rider is
+  on the platform. Empty for the modes with no timetable, as the service date is.
 - **Contour** / **clamping** — the minutes actually asked of Valhalla, after
-  capping at `VALHALLA_MAX_ISO_CONTOUR_MINS`. Every budget that clamps to the
-  same contour shares one cache row, which is why the cache is coarser than the
-  request above the ceiling.
+  capping at `VALHALLA_MAX_ISO_CONTOUR_MINS`. At the ceiling the contour no
+  longer says how much of the budget the journey spent, so two transit chains
+  with one budget share a row whatever their departures, which is why the cache
+  is coarser than the request above the ceiling.
 
 ## Synthetic
 
