@@ -95,10 +95,13 @@ on the platform.
 
 ## Synthetic
 
-With `VALHALLA_URL` unset the worker draws **synthetic** isochrones — circles
-sized from the budget — so the whole publish → consume → record loop runs in
-seconds with no tileset. Every synthetic feature carries `"synthetic": true`, and
-a NULL `tileset_at` on a cache row is the tell that it was drawn this way.
+With `VALHALLA_SYNTHETIC=true` the worker draws **synthetic** isochrones —
+circles sized from the budget — so the whole publish → consume → record loop
+runs in seconds with no tileset. It is an explicit opt-in, never a fallback:
+`VALHALLA_SYNTHETIC=true` and `VALHALLA_URL` are mutually exclusive, and a
+worker with neither set refuses to start. Every synthetic feature carries
+`"synthetic": true`, and a NULL `tileset_at` on a cache row is the tell that it
+was drawn this way.
 Synthetic and real polygons share one cache keyspace: nothing in the key says
 which backend drew the shape. They do not share rows in practice. A synthetic
 worker has no tileset stamp, so it reads nothing, and a real worker treats an
