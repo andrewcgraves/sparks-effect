@@ -567,6 +567,47 @@ func TestWeekdayDepartAt_resolvesOnTheRidersCalendarNotUTC(t *testing.T) {
 	}
 }
 
+func TestDepartureRollsOver_atTheMidnightEndingTheServiceDate(t *testing.T) {
+	loc := pacific(t)
+	tests := []struct {
+		name string
+		now  string
+		want string
+	}{
+		{"a weekday rolls over at its own midnight", "2026-09-02T11:30:00-07:00", "2026-09-03T00:00:00-07:00"},
+		{"friday rolls over into the weekend", "2026-09-04T18:00:00-07:00", "2026-09-05T00:00:00-07:00"},
+		{"a weekend keeps monday until monday ends", "2026-09-05T18:00:00-07:00", "2026-09-08T00:00:00-07:00"},
+		{"across the autumn clock change", "2026-10-30T09:00:00-07:00", "2026-10-31T00:00:00-07:00"},
+		{"onto the day the clocks go back", "2026-11-01T09:00:00-08:00", "2026-11-03T00:00:00-08:00"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			now, err := time.Parse(time.RFC3339, tc.now)
+			if err != nil {
+				t.Fatalf("parse now: %v", err)
+			}
+			departAt := valhalla.WeekdayDepartAt(now, loc)
+			got := valhalla.DepartureRollsOver(departAt)
+			want, err := time.Parse(time.RFC3339, tc.want)
+			if err != nil {
+				t.Fatalf("parse want: %v", err)
+			}
+			if !got.Equal(want) {
+				t.Errorf("DepartureRollsOver(%s) = %s, want %s", departAt, got.Format(time.RFC3339), tc.want)
+			}
+
+			// The contract, checked against the clock itself: the same departure
+			// until the instant before, a different one from it.
+			if before := valhalla.WeekdayDepartAt(got.Add(-time.Nanosecond), loc); !before.Equal(departAt) {
+				t.Errorf("just before rollover the clock chose %s, want %s", before, departAt)
+			}
+			if after := valhalla.WeekdayDepartAt(got, loc); after.Equal(departAt) {
+				t.Errorf("at rollover the clock still chose %s", after)
+			}
+		})
+	}
+}
+
 func TestServiceAreaZoneIsTheCorridorsZone(t *testing.T) {
 	loc := valhalla.ServiceAreaZone()
 	if loc == nil {

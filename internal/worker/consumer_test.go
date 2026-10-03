@@ -15,6 +15,7 @@ import (
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/store"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/valhalla"
 )
 
@@ -65,7 +66,7 @@ func TestRedactDialErrNoCredentials(t *testing.T) {
 type nullStore struct{}
 
 func (nullStore) MarkRunning(context.Context, string) error                    { return nil }
-func (nullStore) MarkSucceeded(context.Context, string, json.RawMessage) error { return nil }
+func (nullStore) MarkSucceeded(context.Context, string, store.Succeeded) error { return nil }
 func (nullStore) MarkFailed(context.Context, string, string) error             { return nil }
 
 func TestConsumerHandle_settlementLoggingAdoptsTheMessagesTrace(t *testing.T) {

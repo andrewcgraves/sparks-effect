@@ -57,6 +57,14 @@ func WeekdayDepartAt(now time.Time, loc *time.Location) time.Time {
 	return t
 }
 
+func DepartureRollsOver(departAt time.Time) time.Time {
+	// WeekdayDepartAt keeps choosing departAt's date until the midnight that
+	// ends it: through the date itself, and through a weekend leading up to a
+	// Monday. The API reuses a transit result only until then (SPA-331), so
+	// the rule lives beside the clock rather than being re-derived there.
+	return time.Date(departAt.Year(), departAt.Month(), departAt.Day()+1, 0, 0, 0, 0, departAt.Location())
+}
+
 func ServiceDate(departAt time.Time) string {
 	return departAt.Format(dateLayout)
 }

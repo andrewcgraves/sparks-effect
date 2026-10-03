@@ -46,6 +46,10 @@ func goldenTilesetAt() time.Time {
 	return time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 }
 
+func goldenReusableUntil() time.Time {
+	return time.Date(2026, 9, 3, 7, 0, 0, 0, time.UTC)
+}
+
 func goldenEnvelope() workerStoreEnvelope {
 	key := goldenIsochroneKey()
 	geom := goldenGeometry()
@@ -61,8 +65,12 @@ func goldenEnvelope() workerStoreEnvelope {
 				TilesetAt: goldenTilesetAt(),
 			}},
 		},
-		JobSucceeded: jobSucceededBody{Result: geom},
-		JobFailed:    jobFailedBody{Error: "valhalla unreachable"},
+		// tileset_at and reusable_until are omitzero; a zero here would leave
+		// SPA-331's reuse fields out of the fixture and unguarded.
+		JobSucceeded: jobSucceededBody{
+			Result: geom, TilesetAt: goldenTilesetAt(), ReusableUntil: goldenReusableUntil(),
+		},
+		JobFailed: jobFailedBody{Error: "valhalla unreachable"},
 	}
 }
 
@@ -98,6 +106,12 @@ func TestWorkerStoreEnvelope_roundTripsThroughTheFixture(t *testing.T) {
 	}
 	if !got.CachePutRequest.Entries[0].TilesetAt.Equal(want.CachePutRequest.Entries[0].TilesetAt) {
 		t.Errorf("tileset_at = %v, want %v", got.CachePutRequest.Entries[0].TilesetAt, want.CachePutRequest.Entries[0].TilesetAt)
+	}
+	if !got.JobSucceeded.TilesetAt.Equal(want.JobSucceeded.TilesetAt) ||
+		!got.JobSucceeded.ReusableUntil.Equal(want.JobSucceeded.ReusableUntil) {
+		t.Errorf("succeeded tileset_at/reusable_until = %v/%v, want %v/%v",
+			got.JobSucceeded.TilesetAt, got.JobSucceeded.ReusableUntil,
+			want.JobSucceeded.TilesetAt, want.JobSucceeded.ReusableUntil)
 	}
 	if got.JobFailed.Error != want.JobFailed.Error {
 		t.Errorf("error = %q, want %q", got.JobFailed.Error, want.JobFailed.Error)

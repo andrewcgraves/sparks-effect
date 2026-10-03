@@ -92,8 +92,8 @@ func (c *Client) MarkRunning(ctx context.Context, jobID string) error {
 	return c.transition(ctx, fmt.Sprintf(pathJobRunning, url.PathEscape(jobID)), jobID, nil)
 }
 
-func (c *Client) MarkSucceeded(ctx context.Context, jobID string, result json.RawMessage) error {
-	return c.transition(ctx, fmt.Sprintf(pathJobSucceeded, url.PathEscape(jobID)), jobID, jobSucceededBody{Result: result})
+func (c *Client) MarkSucceeded(ctx context.Context, jobID string, done Succeeded) error {
+	return c.transition(ctx, fmt.Sprintf(pathJobSucceeded, url.PathEscape(jobID)), jobID, jobSucceededBody(done))
 }
 
 func (c *Client) MarkFailed(ctx context.Context, jobID, message string) error {
@@ -101,7 +101,9 @@ func (c *Client) MarkFailed(ctx context.Context, jobID, message string) error {
 }
 
 type jobSucceededBody struct {
-	Result json.RawMessage `json:"result"`
+	Result        json.RawMessage `json:"result"`
+	TilesetAt     time.Time       `json:"tileset_at,omitzero"`
+	ReusableUntil time.Time       `json:"reusable_until,omitzero"`
 }
 
 type jobFailedBody struct {

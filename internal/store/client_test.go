@@ -47,7 +47,7 @@ func TestRoutingJobLifecycle(t *testing.T) {
 	}
 
 	want := json.RawMessage(`{"type":"FeatureCollection","features":[]}`)
-	if err := client.MarkSucceeded(ctx, testJobID, want); err != nil {
+	if err := client.MarkSucceeded(ctx, testJobID, store.Succeeded{Result: want}); err != nil {
 		t.Fatalf("MarkSucceeded: %v", err)
 	}
 
@@ -64,6 +64,25 @@ func TestRoutingJobLifecycle(t *testing.T) {
 	}
 	if got["type"] != "FeatureCollection" {
 		t.Errorf("result type = %v, want FeatureCollection", got["type"])
+	}
+}
+
+func TestMarkSucceededCarriesWhatReuseNeeds(t *testing.T) {
+	api := testsupport.StartFakeAPI(t)
+	api.SeedRoutingJob(testJobID)
+	client := connect(t, api)
+
+	tileset := time.Date(2026, 9, 1, 3, 0, 0, 0, time.UTC)
+	until := time.Date(2026, 9, 2, 7, 0, 0, 0, time.UTC)
+	if err := client.MarkSucceeded(context.Background(), testJobID, store.Succeeded{
+		Result: json.RawMessage(`{}`), TilesetAt: tileset, ReusableUntil: until,
+	}); err != nil {
+		t.Fatalf("MarkSucceeded: %v", err)
+	}
+
+	gotTileset, gotUntil := api.JobReuseClocks(t, testJobID)
+	if !gotTileset.Equal(tileset) || !gotUntil.Equal(until) {
+		t.Errorf("API received tileset_at %v, reusable_until %v; want %v, %v", gotTileset, gotUntil, tileset, until)
 	}
 }
 
@@ -91,7 +110,9 @@ func TestMarkRunningWillNotReopenATerminalJob(t *testing.T) {
 		close func(string) error
 		want  string
 	}{
-		{"succeeded", func(id string) error { return client.MarkSucceeded(ctx, id, json.RawMessage(`{}`)) }, store.StatusSucceeded},
+		{"succeeded", func(id string) error {
+			return client.MarkSucceeded(ctx, id, store.Succeeded{Result: json.RawMessage(`{}`)})
+		}, store.StatusSucceeded},
 		{"failed", func(id string) error { return client.MarkFailed(ctx, id, "gave up") }, store.StatusFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -116,10 +137,10 @@ func TestMarkSucceededOverwrites(t *testing.T) {
 	client := connect(t, api)
 	ctx := context.Background()
 
-	if err := client.MarkSucceeded(ctx, testJobID, json.RawMessage(`{"attempt":1}`)); err != nil {
+	if err := client.MarkSucceeded(ctx, testJobID, store.Succeeded{Result: json.RawMessage(`{"attempt":1}`)}); err != nil {
 		t.Fatalf("first MarkSucceeded: %v", err)
 	}
-	if err := client.MarkSucceeded(ctx, testJobID, json.RawMessage(`{"attempt":2}`)); err != nil {
+	if err := client.MarkSucceeded(ctx, testJobID, store.Succeeded{Result: json.RawMessage(`{"attempt":2}`)}); err != nil {
 		t.Fatalf("second MarkSucceeded: %v", err)
 	}
 
@@ -160,7 +181,7 @@ func TestUpdatesOnAMissingRowReportNotFound(t *testing.T) {
 	if err := client.MarkRunning(ctx, otherJobID); !errors.Is(err, store.ErrJobNotFound) {
 		t.Errorf("MarkRunning = %v, want ErrJobNotFound", err)
 	}
-	if err := client.MarkSucceeded(ctx, otherJobID, json.RawMessage(`{}`)); !errors.Is(err, store.ErrJobNotFound) {
+	if err := client.MarkSucceeded(ctx, otherJobID, store.Succeeded{Result: json.RawMessage(`{}`)}); !errors.Is(err, store.ErrJobNotFound) {
 		t.Errorf("MarkSucceeded = %v, want ErrJobNotFound", err)
 	}
 	if err := client.MarkFailed(ctx, otherJobID, "boom"); !errors.Is(err, store.ErrJobNotFound) {

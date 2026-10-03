@@ -66,10 +66,10 @@ call failed. It stays in `reachable_stations` and is named in `dropped_egress`.
 
 ## The departure clock
 
-One chain resolves **one departure**, at the top of `Chain`, and every Valhalla
-call it makes carries it. It defaults to 08:00 on the next weekday — today, if
-today is one — resolved on `America/Los_Angeles`, because every scenario served
-is in California or Nevada.
+One job resolves **one departure**, in the handler before `Chain` runs, and
+every Valhalla call the chain makes carries it. It defaults to 08:00 on the next
+weekday — today, if today is one — resolved on `America/Los_Angeles`, because
+every scenario served is in California or Nevada.
 
 **Egress is the one leg that does not depart when the rider does.** It is stamped
 at the chain's departure plus the whole journey to that station: access leg,
@@ -79,6 +79,11 @@ on the platform.
 - **Service date** (`departs_on`) — the GTFS calendar day a transit polygon was
   computed against, and part of the egress cache key. Empty for the modes with no
   timetable.
+- **Rollover** (`reusable_until`) — the midnight that ends a transit job's
+  service date, when the clock first chooses a different one
+  (`DepartureRollsOver`). Reported on success with the job's tileset stamp, so
+  the API can answer a repeat request from this job until then and no later
+  (SPA-331). Not reported for the modes with no timetable.
 - **Budget** (`budget_mins`) — the chain's budget, and part of a transit egress
   cache key: below the ceiling, budget and contour together fix when the rider is
   on the platform. Empty for the modes with no timetable, as the service date is.

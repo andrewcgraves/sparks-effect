@@ -18,8 +18,16 @@ var ErrJobNotFound = errors.New("store: routing job not found")
 
 type RoutingJobStore interface {
 	MarkRunning(ctx context.Context, jobID string) error
-	MarkSucceeded(ctx context.Context, jobID string, result json.RawMessage) error
+	MarkSucceeded(ctx context.Context, jobID string, done Succeeded) error
 	MarkFailed(ctx context.Context, jobID, message string) error
+}
+
+type Succeeded struct {
+	Result json.RawMessage
+	// Both are what lets the API answer a repeat request with this job
+	// (SPA-331). Zero means unknown, and the API then never reuses it.
+	TilesetAt     time.Time
+	ReusableUntil time.Time
 }
 
 type IsochroneKey struct {

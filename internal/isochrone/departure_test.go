@@ -351,8 +351,10 @@ func TestChainer_twoBudgetsAtOneContourAreTwoRows(t *testing.T) {
 func TestChainer_twoBudgetsShareWalkRows(t *testing.T) {
 	// The other half of SPA-326: walk takes no departure, so a different
 	// budget reaching the same contour must still hit the row it left.
+	// Stamped: since SPA-325 a stampless worker never reads the cache, which
+	// would make this a miss for a reason that has nothing to do with budget.
 	cache := newFakeCache()
-	egress := isochrone.EgressCache{Store: cache}
+	egress := stamped(cache)
 
 	if _, err := newCachingChainer(twoReachableStations(), viaTransitGraph(), egress).
 		Chain(context.Background(), req(90, transit.TravelModeWalk)); err != nil {

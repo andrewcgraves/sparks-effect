@@ -30,9 +30,11 @@ type FakeAPI struct {
 }
 
 type fakeJob struct {
-	status string
-	errMsg string
-	result []byte
+	status        string
+	errMsg        string
+	result        []byte
+	tilesetAt     time.Time
+	reusableUntil time.Time
 }
 
 type fakeCacheRow struct {
@@ -76,6 +78,17 @@ func (f *FakeAPI) JobStatus(t *testing.T, jobID string) (status, errMessage stri
 		t.Fatalf("reading routing job %s: not found", jobID)
 	}
 	return j.status, j.errMsg, append([]byte(nil), j.result...)
+}
+
+func (f *FakeAPI) JobReuseClocks(t *testing.T, jobID string) (tilesetAt, reusableUntil time.Time) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	j, ok := f.jobs[jobID]
+	if !ok {
+		t.Fatalf("reading routing job %s: not found", jobID)
+	}
+	return j.tilesetAt, j.reusableUntil
 }
 
 func (f *FakeAPI) IsochroneCacheCount(compileJobID string) int {
@@ -139,7 +152,9 @@ func (f *FakeAPI) markRunning(w http.ResponseWriter, r *http.Request) {
 func (f *FakeAPI) markSucceeded(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var body struct {
-		Result json.RawMessage `json:"result"`
+		Result        json.RawMessage `json:"result"`
+		TilesetAt     time.Time       `json:"tileset_at"`
+		ReusableUntil time.Time       `json:"reusable_until"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
@@ -154,6 +169,7 @@ func (f *FakeAPI) markSucceeded(w http.ResponseWriter, r *http.Request) {
 	}
 	j.status = statusSucceeded
 	j.result = append([]byte(nil), body.Result...)
+	j.tilesetAt, j.reusableUntil = body.TilesetAt, body.ReusableUntil
 	j.errMsg = ""
 	w.WriteHeader(http.StatusNoContent)
 }

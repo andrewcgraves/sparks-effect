@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
@@ -98,6 +99,11 @@ func (h *Handler) handle(ctx context.Context, msg routing.Message, decodeErr err
 	}
 
 	h.cache.Stamp.Refresh(ctx, h.routing, h.log)
+	tilesetAt := h.cache.Stamp.Time()
+
+	// Resolved here rather than defaulted inside Chain so the departure the
+	// chain ran on is the one reported back for reuse below.
+	departAt := valhalla.WeekdayDepartAt(time.Now(), valhalla.ServiceAreaZone())
 
 	graph := transit.CompiledGraph{Graph: msg.Graph}
 	chainer := isochrone.New(h.routing, graph, h.limits, h.cache, h.log, h.metrics)
@@ -108,6 +114,7 @@ func (h *Handler) handle(ctx context.Context, msg routing.Message, decodeErr err
 		BudgetMins:   msg.BudgetMins,
 		Mode:         msg.Mode,
 		CompileJobID: msg.CompileJobID,
+		DepartAt:     departAt,
 	})
 	if err != nil {
 		if isPermanent(err) {
@@ -123,7 +130,17 @@ func (h *Handler) handle(ctx context.Context, msg routing.Message, decodeErr err
 		return h.fail(ctx, msg.RoutingJobID, fmt.Errorf("routing: marshal result: %w", err))
 	}
 
-	if err := h.store.MarkSucceeded(ctx, msg.RoutingJobID, result); err != nil {
+	// What lets the API answer a repeat with this job (SPA-331): the tileset
+	// its polygons were cut from, and for transit the moment the departure
+	// clock leaves this job's service date. Walk/bike/drive send Valhalla no
+	// departure, so no date bounds them. A zero stamp — synthetic, or /status
+	// never answered — is never reused by the API.
+	done := store.Succeeded{Result: result, TilesetAt: tilesetAt}
+	if msg.Mode == transit.TravelModeTransit {
+		done.ReusableUntil = valhalla.DepartureRollsOver(departAt)
+	}
+
+	if err := h.store.MarkSucceeded(ctx, msg.RoutingJobID, done); err != nil {
 		if errors.Is(err, store.ErrJobNotFound) {
 			h.log.Warn(ctx, "routing: job has no row to complete; discarding", "job_id", msg.RoutingJobID)
 			return Result{Outcome: OutcomePermanent, JobID: msg.RoutingJobID, Err: err}

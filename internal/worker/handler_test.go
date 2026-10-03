@@ -25,6 +25,7 @@ type fakeStore struct {
 	mu           sync.Mutex
 	states       []string
 	result       json.RawMessage
+	succeeded    store.Succeeded
 	errMsg       string
 	runningErr   error
 	succeededErr error
@@ -41,14 +42,15 @@ func (f *fakeStore) MarkRunning(_ context.Context, _ string) error {
 	return nil
 }
 
-func (f *fakeStore) MarkSucceeded(_ context.Context, _ string, result json.RawMessage) error {
+func (f *fakeStore) MarkSucceeded(_ context.Context, _ string, done store.Succeeded) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.succeededErr != nil {
 		return f.succeededErr
 	}
 	f.states = append(f.states, store.StatusSucceeded)
-	f.result = result
+	f.result = done.Result
+	f.succeeded = done
 	return nil
 }
 
@@ -263,6 +265,61 @@ func TestHandle_refreshesTheTilesetStampForEachJob(t *testing.T) {
 			}
 		})
 	}
+}
+
+func (f *fakeStore) lastSucceeded() store.Succeeded {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.succeeded
+}
+
+func TestHandle_reportsWhatTheAPINeedsToReuseTheResult(t *testing.T) {
+	tileset := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	stamped := func(s store.RoutingJobStore) *worker.Handler {
+		return worker.NewHandler(s, valhalla.NewSyntheticClient(), valhalla.DefaultLimits(),
+			isochrone.EgressCache{Stamp: isochrone.NewTilesetStamp(tileset)}, logger.Discard(), nil)
+	}
+
+	t.Run("transit is reusable until its service date rolls over", func(t *testing.T) {
+		s := &fakeStore{}
+		msg := mutateGolden(t, func(m map[string]any) { m["mode"] = "transit" })
+		if res := stamped(s).Handle(context.Background(), msg); res.Outcome != worker.OutcomeSucceeded {
+			t.Fatalf("Outcome = %v (err %v), want succeeded", res.Outcome, res.Err)
+		}
+
+		got := s.lastSucceeded()
+		if !got.TilesetAt.Equal(tileset) {
+			t.Errorf("tileset_at = %v, want the stamp the job ran under, %v", got.TilesetAt, tileset)
+		}
+		departAt := valhalla.WeekdayDepartAt(time.Now(), valhalla.ServiceAreaZone())
+		if want := valhalla.DepartureRollsOver(departAt); !got.ReusableUntil.Equal(want) {
+			t.Errorf("reusable_until = %v, want %v, when the departure %v rolls over", got.ReusableUntil, want, departAt)
+		}
+	})
+
+	t.Run("walk takes no departure, so no service date bounds it", func(t *testing.T) {
+		s := &fakeStore{}
+		if res := stamped(s).Handle(context.Background(), goldenMessage(t)); res.Outcome != worker.OutcomeSucceeded {
+			t.Fatalf("Outcome = %v (err %v), want succeeded", res.Outcome, res.Err)
+		}
+		got := s.lastSucceeded()
+		if !got.TilesetAt.Equal(tileset) {
+			t.Errorf("tileset_at = %v, want %v", got.TilesetAt, tileset)
+		}
+		if !got.ReusableUntil.IsZero() {
+			t.Errorf("reusable_until = %v, want none for walk", got.ReusableUntil)
+		}
+	})
+
+	t.Run("a worker with no stamp reports none, so the API never reuses it", func(t *testing.T) {
+		s := &fakeStore{}
+		if res := newHandler(s, valhalla.NewSyntheticClient()).Handle(context.Background(), goldenMessage(t)); res.Outcome != worker.OutcomeSucceeded {
+			t.Fatalf("Outcome = %v (err %v), want succeeded", res.Outcome, res.Err)
+		}
+		if got := s.lastSucceeded(); !got.TilesetAt.IsZero() {
+			t.Errorf("tileset_at = %v, want none", got.TilesetAt)
+		}
+	})
 }
 
 func TestHandle_drivesJobToSucceeded(t *testing.T) {
