@@ -3,6 +3,9 @@ package worker_test
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +14,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/geo"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/health"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
@@ -35,6 +39,9 @@ type harness struct {
 	url       string
 	tilesetAt time.Time
 	metrics   *metrics.Set
+
+	stuckAfter time.Duration
+	health     *health.Monitor
 }
 
 func newHarness(t *testing.T, client valhalla.Client) *harness {
@@ -61,6 +68,10 @@ func (h *harness) run(t *testing.T, maxRetries int) (stop, kill func()) {
 	}
 	handler := worker.NewHandler(h.store, h.client, valhalla.DefaultLimits(), cache, logger.Discard(), h.metrics)
 	consumer := worker.NewConsumer(h.url, testQueue, testDeadLetter, maxRetries, handler, logger.Discard(), h.metrics)
+	if h.stuckAfter > 0 {
+		h.health = health.New(consumer, h.stuckAfter, time.Now)
+		consumer.TrackJobs(h.health)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -360,6 +371,64 @@ func TestEndToEnd_workerKilledMidChainRedelivers(t *testing.T) {
 	if got := testsupport.QueueDepth(t, h.ch, testDeadLetter); got != 0 {
 		t.Errorf("dead-letter depth = %d, want 0 — a crash is not a job failure", got)
 	}
+}
+
+func probeHealth(t *testing.T, m *health.Monitor) (int, string) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	m.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	return w.Code, w.Body.String()
+}
+
+func TestEndToEnd_hungHandlerFailsTheLivenessProbeAndItsMessageIsRedelivered(t *testing.T) {
+	h := newHarness(t, nil)
+	h.api.SeedRoutingJob(goldenJobID)
+	h.stuckAfter = 200 * time.Millisecond
+
+	blocked := make(chan struct{})
+	defer close(blocked)
+	entered := make(chan struct{}, 1)
+	h.client = &valhalla.StubClient{
+		IsochroneFn: func(valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-blocked
+			return nil, valhalla.ErrUpstream
+		},
+	}
+
+	_, kill := h.run(t, 3)
+	defer kill()
+
+	testsupport.WaitFor(t, 15*time.Second, "an idle, connected consumer to pass the probe", func() bool {
+		code, _ := probeHealth(t, h.health)
+		return code == http.StatusOK
+	})
+
+	testsupport.Publish(t, h.ch, testQueue, goldenMessage(t))
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the worker never started a routing call")
+	}
+
+	testsupport.WaitFor(t, 5*time.Second, "the hung job to fail the probe", func() bool {
+		code, body := probeHealth(t, h.health)
+		return code == http.StatusServiceUnavailable && strings.Contains(body, "in progress")
+	})
+
+	// What the kubelet's restart does to the pod: the connection goes away
+	// with the message still unacked.
+	kill()
+
+	if code, body := probeHealth(t, h.health); code != http.StatusServiceUnavailable || !strings.Contains(body, "broker") {
+		t.Errorf("after the connection closed: %d %q, want 503 naming the broker", code, body)
+	}
+	testsupport.WaitFor(t, 15*time.Second, "the unacked message to be redelivered to the queue", func() bool {
+		return testsupport.QueueDepth(t, h.ch, testQueue) == 1
+	})
 }
 
 func TestEndToEnd_messageForAMissingJobIsDiscarded(t *testing.T) {

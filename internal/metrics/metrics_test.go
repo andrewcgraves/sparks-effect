@@ -24,6 +24,7 @@ func TestHandlerExposesZeroSeries(t *testing.T) {
 		"routing_dead_letters_total",
 		"valhalla_errors_total",
 		"transit_access_legs_total",
+		"routing_job_in_progress_seconds",
 	} {
 		if !strings.Contains(body, name) {
 			t.Errorf("/metrics is missing %s:\n%s", name, body)
@@ -42,6 +43,7 @@ func TestHandlerExposesZeroSeries(t *testing.T) {
 		`routing_dead_letters_total 0`,
 		`transit_access_legs_total{rode="true"} 0`,
 		`transit_access_legs_total{rode="false"} 0`,
+		`routing_job_in_progress_seconds 0`,
 	} {
 		if !strings.Contains(body, sample) {
 			t.Errorf("/metrics is missing zero series %s:\n%s", sample, body)
@@ -66,6 +68,21 @@ func TestCountersIncrement(t *testing.T) {
 		`routing_dead_letters_total 1`,
 		`transit_access_legs_total{rode="true"} 2`,
 		`transit_access_legs_total{rode="false"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics response missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestJobInProgressGaugeReadsTheObservedDuration(t *testing.T) {
+	m := &Set{}
+	m.ObserveJobInProgress(func() time.Duration { return 90*time.Second + 500*time.Millisecond })
+
+	body := scrape(t, m)
+	for _, want := range []string{
+		"# TYPE routing_job_in_progress_seconds gauge",
+		"routing_job_in_progress_seconds 90.5\n",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics response missing %q:\n%s", want, body)
@@ -153,7 +170,7 @@ func TestServeListensUntilCancelled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- serve(ctx, ln) }()
+	go func() { errCh <- serve(ctx, ln, Handler()) }()
 
 	var resp *http.Response
 	deadline := time.Now().Add(2 * time.Second)

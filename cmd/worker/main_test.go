@@ -1,6 +1,8 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,5 +80,24 @@ func TestLoadDotenvFile(t *testing.T) {
 	}
 	if got := os.Getenv("VALHALLA_SYNTHETIC"); got != "true" {
 		t.Fatalf("VALHALLA_SYNTHETIC = %q after loading %s, want true", got, path)
+	}
+}
+
+func TestServerMuxServesMetricsAndHealthOnOneListener(t *testing.T) {
+	healthz := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	mux := serverMux(healthz)
+
+	for path, want := range map[string]int{
+		"/metrics": http.StatusOK,
+		"/healthz": http.StatusServiceUnavailable,
+		"/":        http.StatusNotFound,
+	} {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != want {
+			t.Errorf("GET %s = %d, want %d", path, w.Code, want)
+		}
 	}
 }

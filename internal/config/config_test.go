@@ -24,6 +24,9 @@ func TestDefaultsMatchTheDeployedContainer(t *testing.T) {
 	if cfg.MetricsAddr != ":9090" {
 		t.Errorf("MetricsAddr = %q, want :9090", cfg.MetricsAddr)
 	}
+	if cfg.StuckAfter != 10*time.Minute {
+		t.Errorf("StuckAfter = %v, want 10m", cfg.StuckAfter)
+	}
 
 	if cfg.Limits.MaxIsoContourMins != 320 {
 		t.Errorf("MaxIsoContourMins = %d, want 320 (the patched ceiling)", cfg.Limits.MaxIsoContourMins)
@@ -87,6 +90,28 @@ func TestNonsenseLimitsFallBackToDefaults(t *testing.T) {
 	}
 	if got.MaxIsoContourMins != def.MaxIsoContourMins {
 		t.Errorf("MaxIsoContourMins = %d, want the default %d", got.MaxIsoContourMins, def.MaxIsoContourMins)
+	}
+}
+
+func TestStuckAfterIsOverridable(t *testing.T) {
+	t.Setenv("WORKER_STUCK_AFTER", "25m")
+
+	if got := config.Load().StuckAfter; got != 25*time.Minute {
+		t.Errorf("StuckAfter = %v, want 25m", got)
+	}
+	for _, name := range config.UnrecognizedEnv() {
+		if name == "WORKER_STUCK_AFTER" {
+			t.Error("WORKER_STUCK_AFTER is reported as unrecognised")
+		}
+	}
+}
+
+func TestNonsenseStuckAfterFallsBackToDefault(t *testing.T) {
+	for _, v := range []string{"600", "-5m", "0s", "soon"} {
+		t.Setenv("WORKER_STUCK_AFTER", v)
+		if got := config.Load().StuckAfter; got != 10*time.Minute {
+			t.Errorf("WORKER_STUCK_AFTER=%q: StuckAfter = %v, want the 10m default", v, got)
+		}
 	}
 }
 

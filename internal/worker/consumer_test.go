@@ -137,3 +137,39 @@ func TestTraceIDFromDelivery(t *testing.T) {
 		})
 	}
 }
+
+type recordingTracker struct{ events []string }
+
+func (r *recordingTracker) JobStarted()  { r.events = append(r.events, "started") }
+func (r *recordingTracker) JobFinished() { r.events = append(r.events, "finished") }
+
+func TestConsumerHandle_bracketsTheJobForTheLivenessProbe(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "routing", "testdata", "message.golden.json"))
+	if err != nil {
+		t.Fatalf("reading golden fixture: %v", err)
+	}
+
+	tracker := &recordingTracker{}
+	client := &valhalla.StubClient{
+		IsochroneFn: func(valhalla.IsochroneRequest) (*valhalla.IsochroneResponse, error) {
+			tracker.events = append(tracker.events, "routing")
+			return nil, valhalla.ErrBadRequest
+		},
+	}
+	handler := NewHandler(nullStore{}, client, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.Discard(), nil)
+
+	consumer := NewConsumer("amqp://unused", "q", "q.dead", 3, handler, logger.Discard(), nil)
+	consumer.TrackJobs(tracker)
+	consumer.handle(context.Background(), amqp.Delivery{Body: body})
+
+	if len(tracker.events) < 3 || tracker.events[0] != "started" || tracker.events[len(tracker.events)-1] != "finished" {
+		t.Errorf("events = %v, want started … routing … finished", tracker.events)
+	}
+}
+
+func TestConsumerIsNotConnectedBeforeRun(t *testing.T) {
+	c := NewConsumer("amqp://unused", "q", "q.dead", 3, nil, logger.Discard(), nil)
+	if c.Connected() {
+		t.Error("a consumer that has never dialled reports Connected")
+	}
+}

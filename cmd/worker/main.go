@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,6 +14,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/config"
+	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/health"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/isochrone"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/logger"
 	"github.com/andrewcgraves/sparks-effect-routing-worker/internal/metrics"
@@ -70,7 +72,8 @@ func main() {
 		log.Info(ctx, "config: ok",
 			"valhalla_synthetic", cfg.ValhallaSynthetic,
 			"routing_queue", cfg.RoutingQueue,
-			"metrics_addr", cfg.MetricsAddr)
+			"metrics_addr", cfg.MetricsAddr,
+			"stuck_after", cfg.StuckAfter.String())
 		return
 	}
 
@@ -121,16 +124,27 @@ func run(cfg config.Config, log *logger.Logger) error {
 	consumer := worker.NewConsumer(cfg.AMQPURL, cfg.RoutingQueue, cfg.DeadLetterQueue, cfg.MaxRetries, handler, log, metrics.Process)
 	defer consumer.Close()
 
-	log.Info(ctx, "routing: serving metrics", "addr", cfg.MetricsAddr)
+	monitor := health.New(consumer, cfg.StuckAfter, time.Now)
+	consumer.TrackJobs(monitor)
+	metrics.Process.ObserveJobInProgress(monitor.InProgress)
+
+	log.Info(ctx, "routing: serving metrics and health", "addr", cfg.MetricsAddr, "stuck_after", cfg.StuckAfter.String())
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		return metrics.Serve(ctx, cfg.MetricsAddr)
+		return metrics.Serve(ctx, cfg.MetricsAddr, serverMux(monitor))
 	})
 	g.Go(func() error {
 		return consumer.Run(ctx)
 	})
 	return g.Wait()
+}
+
+func serverMux(healthz http.Handler) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metrics.Handler())
+	mux.Handle("/healthz", healthz)
+	return mux
 }
 
 func newRoutingClient(ctx context.Context, cfg config.Config, log *logger.Logger) (valhalla.Client, error) {

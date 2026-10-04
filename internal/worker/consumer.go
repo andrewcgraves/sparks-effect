@@ -20,6 +20,11 @@ const retryHeader = "x-routing-attempts"
 
 const deadLetterReason = "x-routing-dead-letter-reason"
 
+type JobTracker interface {
+	JobStarted()
+	JobFinished()
+}
+
 type Consumer struct {
 	url        string
 	queue      string
@@ -28,6 +33,7 @@ type Consumer struct {
 	handler    *Handler
 	log        *logger.Logger
 	metrics    *metrics.Set
+	jobs       JobTracker
 	mu         sync.Mutex
 	conn       *amqp.Connection
 	ch         *amqp.Channel
@@ -43,6 +49,17 @@ func NewConsumer(url, queue, deadLetter string, maxRetries int, handler *Handler
 		log:        log,
 		metrics:    metricSet,
 	}
+}
+
+// TrackJobs must be called before Run.
+func (c *Consumer) TrackJobs(jobs JobTracker) {
+	c.jobs = jobs
+}
+
+func (c *Consumer) Connected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn != nil && !c.conn.IsClosed() && c.ch != nil && !c.ch.IsClosed()
 }
 
 func (c *Consumer) Run(ctx context.Context) error {
@@ -78,6 +95,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 }
 
 func (c *Consumer) handle(ctx context.Context, d amqp.Delivery) {
+	if c.jobs != nil {
+		// Settling (ack, requeue, dead-letter) is part of the job: a publish
+		// that hangs leaves the message unacked just as a hung handler does.
+		c.jobs.JobStarted()
+		defer c.jobs.JobFinished()
+	}
 	ctx = logger.WithTraceID(ctx, traceIDFromDelivery(d))
 
 	res := c.handler.Handle(ctx, d.Body)

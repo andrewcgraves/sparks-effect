@@ -261,8 +261,8 @@ default, unset — stays at info level: a job's arrival, the decisions that
 shape its result (contour clamping, matrix truncation, cache hits/misses),
 and its outcome, but not the blow-by-blow.
 
-The worker also serves five Prometheus counters on `:9090/metrics` (override
-with `METRICS_ADDR`):
+The worker also serves five Prometheus counters and one gauge on
+`:9090/metrics` (override with `METRICS_ADDR`):
 
 | Metric | Labels | What it counts |
 |---|---|---|
@@ -271,6 +271,7 @@ with `METRICS_ADDR`):
 | `routing_dead_letters_total` | — | Jobs moved to the dead-letter queue after retries run out |
 | `valhalla_errors_total` | `class=bad_request\|rate_limit\|upstream` | Errors from the Valhalla client |
 | `transit_access_legs_total` | `rode=true\|false` | Pairwise transit access legs that Valhalla successfully routed, labelled by whether they actually rode |
+| `routing_job_in_progress_seconds` (gauge) | — | How long the job in hand has been running; 0 when idle |
 
 Job, cache, and Valhalla labels are the handler and client vocabulary already
 in use (`Outcome.String()`, `ErrBadRequest` / `ErrRateLimit` / `ErrUpstream`).
@@ -288,6 +289,22 @@ Scraping is configured in `kustomize-config`: a `prometheus.io/scrape` /
 `prometheus.io/port` annotation on the worker Deployment, and pod-metrics
 discovery in `config.alloy`. Without those, `/metrics` is served but never
 collected.
+
+### Liveness
+
+`GET /healthz` on the same listener answers 200 when the AMQP connection and
+channel are open and either no job is in progress or the current one started
+less than `WORKER_STUCK_AFTER` ago (a Go duration, default `10m`). Otherwise it
+answers 503 with the reason as plain text. The Deployment's liveness probe
+points at it, so a consumer that is connected but stuck gets restarted, and the
+message it had prefetched is redelivered because it was never acked.
+
+The clock runs from delivery to settlement (ack, requeue, or dead-letter). An
+idle worker is never stuck, however long the queue stays empty. The threshold
+has to exceed the longest real chain (SPA-436 measures it), or the probe kills
+healthy work. API reachability is deliberately not part of the check: an API
+outage already surfaces as transient job failures, and restarting every worker
+because the API is down would not bring it back.
 
 A `trace_id` field is attached to every log line written while a job is being
 processed, so one isochrone can be followed across both services on one value.

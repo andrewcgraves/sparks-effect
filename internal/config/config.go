@@ -25,6 +25,7 @@ type Config struct {
 	Limits            valhalla.Limits
 	Debug             bool
 	MetricsAddr       string
+	StuckAfter        time.Duration
 }
 
 const defaultRoutingQueue = "routing.jobs"
@@ -32,6 +33,8 @@ const defaultRoutingQueue = "routing.jobs"
 const defaultDeadLetterQueue = "routing.jobs.dead"
 
 const defaultMaxRetries = 3
+
+const defaultStuckAfter = 10 * time.Minute
 
 const (
 	envAMQPURL           = "AMQP_URL"
@@ -53,6 +56,7 @@ const (
 	envLogLevel          = "LOG_LEVEL"
 	envVerbose           = "VERBOSE"
 	envMetricsAddr       = "METRICS_ADDR"
+	envStuckAfter        = "WORKER_STUCK_AFTER"
 )
 
 var knownEnv = map[string]struct{}{
@@ -75,6 +79,7 @@ var knownEnv = map[string]struct{}{
 	envLogLevel:          {},
 	envVerbose:           {},
 	envMetricsAddr:       {},
+	envStuckAfter:        {},
 }
 
 var watchedPrefixes = []string{
@@ -110,6 +115,7 @@ func Load() Config {
 		Limits:            limits,
 		Debug:             os.Getenv(envLogLevel) == "debug" || os.Getenv(envVerbose) == "true",
 		MetricsAddr:       getEnv(envMetricsAddr, ":9090"),
+		StuckAfter:        envDuration(envStuckAfter, defaultStuckAfter),
 	}
 }
 
@@ -205,6 +211,15 @@ func envIntAllowingZero(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			return n
+		}
+	}
+	return fallback
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
 		}
 	}
 	return fallback
