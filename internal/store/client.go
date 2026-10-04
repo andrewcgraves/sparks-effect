@@ -88,6 +88,28 @@ func (c *Client) ping(ctx context.Context) error {
 	}
 }
 
+func (c *Client) Heartbeat(ctx context.Context, every time.Duration, failed func(error)) error {
+	// The beat is how the API tells an idle worker from a dead one (SPA-442).
+	// A failed beat is reported and the next one tried: the API being away is
+	// what its routing status reports, not a reason for the worker to exit.
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+		}
+		// A beat that hangs must not hold up the next one.
+		beatCtx, cancel := context.WithTimeout(ctx, every)
+		err := c.ping(beatCtx)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			failed(err)
+		}
+	}
+}
+
 func (c *Client) MarkRunning(ctx context.Context, jobID string) error {
 	return c.transition(ctx, fmt.Sprintf(pathJobRunning, url.PathEscape(jobID)), jobID, nil)
 }

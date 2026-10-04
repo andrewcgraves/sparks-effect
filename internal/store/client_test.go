@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -535,5 +536,76 @@ func TestClientSendsBearerToken(t *testing.T) {
 	_ = client.MarkRunning(context.Background(), testJobID)
 	if gotAuth != "Bearer "+token {
 		t.Errorf("MarkRunning Authorization = %q, want Bearer %s", gotAuth, token)
+	}
+}
+
+func TestHeartbeatPingsUntilCancelled(t *testing.T) {
+	api := testsupport.StartFakeAPI(t)
+	client := connect(t, api)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Heartbeat(ctx, 5*time.Millisecond, func(err error) {
+			t.Errorf("heartbeat against a healthy API failed: %v", err)
+		})
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for api.Pings() < 4 {
+		if time.Now().After(deadline) {
+			t.Fatalf("pings = %d after 5s, want the startup ping and at least 3 beats", api.Pings())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Heartbeat returned %v on cancel, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Heartbeat did not return after its context was cancelled")
+	}
+}
+
+// The API going away for a while is exactly what the heartbeat's absence is
+// meant to show; the worker keeps beating rather than exiting.
+func TestHeartbeatReportsAFailedBeatAndKeepsGoing(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(srv.Close)
+	client, err := store.Connect(context.Background(), srv.URL, "any", 0)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	failures := make(chan error, 16)
+	go func() {
+		_ = client.Heartbeat(ctx, 5*time.Millisecond, func(err error) {
+			select {
+			case failures <- err:
+			default:
+			}
+		})
+	}()
+
+	for i := range 2 {
+		select {
+		case err := <-failures:
+			if err == nil {
+				t.Fatalf("failure %d reported a nil error", i+1)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("saw %d failed beats, want 2: a failure must not stop the heartbeat", i)
+		}
 	}
 }

@@ -356,7 +356,7 @@ The paths this client speaks:
 
 | Method | Path | Success | 404 |
 |---|---|---|---|
-| GET | `/api/internal/worker` | 204 (startup ping) | — |
+| GET | `/api/internal/worker` | 204 (startup ping, then a heartbeat every 30 s) | — |
 | POST | `/api/internal/routing-jobs/{id}/running` | 204 | missing or already terminal |
 | POST | `/api/internal/routing-jobs/{id}/succeeded` | 204 | missing |
 | POST | `/api/internal/routing-jobs/{id}/failed` | 204 | missing |
@@ -365,6 +365,11 @@ The paths this client speaks:
 
 Authorization is `Bearer $WORKER_TOKEN`. A 404 on a job write is
 `ErrJobNotFound` (permanent); anything else is retried.
+
+The heartbeat is what lets the API's public `GET /api/routing/status` tell an
+idle worker from a dead one (SPA-442): the API calls the worker gone after two
+minutes without any authenticated request from it. A failed beat is logged at
+warn and the next one tried. It never stops the worker.
 
 ## Routing limits
 

@@ -98,6 +98,10 @@ func inspectConfig(cfg config.Config, log *logger.Logger) error {
 	return nil
 }
 
+// The API reads two minutes without contact as a worker gone, so a 30 s beat
+// survives three misses before a live worker is reported offline.
+const heartbeatEvery = 30 * time.Second
+
 func run(cfg config.Config, log *logger.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -136,6 +140,11 @@ func run(cfg config.Config, log *logger.Logger) error {
 	})
 	g.Go(func() error {
 		return consumer.Run(ctx)
+	})
+	g.Go(func() error {
+		return repo.Heartbeat(ctx, heartbeatEvery, func(err error) {
+			log.Warn(ctx, "store: heartbeat failed", "err", err.Error())
+		})
 	})
 	return g.Wait()
 }

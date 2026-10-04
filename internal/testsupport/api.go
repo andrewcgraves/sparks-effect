@@ -27,6 +27,7 @@ type FakeAPI struct {
 	mu     sync.Mutex
 	jobs   map[string]*fakeJob
 	cache  map[store.IsochroneKey]fakeCacheRow
+	pings  int
 }
 
 type fakeJob struct {
@@ -133,7 +134,16 @@ func (f *FakeAPI) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (f *FakeAPI) ready(w http.ResponseWriter, _ *http.Request) {
+	f.mu.Lock()
+	f.pings++
+	f.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (f *FakeAPI) Pings() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pings
 }
 
 func (f *FakeAPI) markRunning(w http.ResponseWriter, r *http.Request) {
