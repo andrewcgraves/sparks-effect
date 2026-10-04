@@ -261,17 +261,32 @@ func (c *chainImpl) nearbyNodes(ctx context.Context, req ChainRequest, costing v
 
 	if costing.SupportsMatrix() {
 		if max := c.limits.MaxMatrixPairs; max > 0 && len(nearby) > max {
-			sort.Slice(nearby, func(i, j int) bool {
-				di := geo.HaversineKm(req.Lat, req.Lng, nearby[i].Lat, nearby[i].Lng)
-				dj := geo.HaversineKm(req.Lat, req.Lng, nearby[j].Lat, nearby[j].Lng)
-				return di < dj
-			})
-			nearby = nearby[:max]
+			nearby = nearestN(req, nearby, max)
 			c.log.Info(ctx, "chain: nodes truncated to matrix pair cap",
 				"compile_job_id", req.CompileJobID, "cap", max)
 		}
+		return nearby
+	}
+
+	// Pairwise access is one uncached /route per node, so without a ceiling
+	// it grows with every station inside the reach. A node cut here can no
+	// longer be a boarding station — the same outcome as a declined route.
+	if max := c.limits.MaxAccessRoutes; max > 0 && len(nearby) > max {
+		withinReach := len(nearby)
+		nearby = nearestN(req, nearby, max)
+		c.log.Info(ctx, "chain: nodes truncated to access route cap",
+			"compile_job_id", req.CompileJobID, "cap", max, "within_reach", withinReach)
 	}
 	return nearby
+}
+
+func nearestN(req ChainRequest, nodes []transit.Node, n int) []transit.Node {
+	sort.Slice(nodes, func(i, j int) bool {
+		di := geo.HaversineKm(req.Lat, req.Lng, nodes[i].Lat, nodes[i].Lng)
+		dj := geo.HaversineKm(req.Lat, req.Lng, nodes[j].Lat, nodes[j].Lng)
+		return di < dj
+	})
+	return nodes[:n]
 }
 
 func (c *chainImpl) originAndAccess(

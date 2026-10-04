@@ -49,6 +49,7 @@ const (
 	envMatrixBLineAutoKm = "VALHALLA_MATRIX_BLINE_AUTO_KM"
 	envMatrixBLineOther  = "VALHALLA_MATRIX_BLINE_OTHER_KM"
 	envMaxConcurrency    = "VALHALLA_MAX_CONCURRENCY"
+	envMaxAccessRoutes   = "VALHALLA_MAX_ACCESS_ROUTES"
 	envLogLevel          = "LOG_LEVEL"
 	envVerbose           = "VERBOSE"
 	envMetricsAddr       = "METRICS_ADDR"
@@ -70,6 +71,7 @@ var knownEnv = map[string]struct{}{
 	envMatrixBLineAutoKm: {},
 	envMatrixBLineOther:  {},
 	envMaxConcurrency:    {},
+	envMaxAccessRoutes:   {},
 	envLogLevel:          {},
 	envVerbose:           {},
 	envMetricsAddr:       {},
@@ -92,6 +94,7 @@ func Load() Config {
 	limits.MatrixBLineAutoKm = envFloat(envMatrixBLineAutoKm, limits.MatrixBLineAutoKm)
 	limits.MatrixBLineOtherKm = envFloat(envMatrixBLineOther, limits.MatrixBLineOtherKm)
 	limits.MaxConcurrency = envInt(envMaxConcurrency, limits.MaxConcurrency)
+	limits.MaxAccessRoutes = envInt(envMaxAccessRoutes, limits.MaxAccessRoutes)
 
 	return Config{
 		AMQPURL:           os.Getenv(envAMQPURL),

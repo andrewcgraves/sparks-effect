@@ -1947,6 +1947,105 @@ func TestChainer_transitPairwiseAccessIsBoundedByConfiguration(t *testing.T) {
 	}
 }
 
+func TestChainer_transitAccessRoutesOnlyTheNearestStationsUpToTheCap(t *testing.T) {
+	const cap = 5
+	const nodeCount = 12
+
+	// Listed farthest first, so keeping the first cap would keep the wrong ones.
+	nodes := make([]transit.Node, nodeCount)
+	for i := range nodeCount {
+		d := nodeCount - i
+		nodes[i] = node(fmt.Sprintf("station-%02d", d), -122.40+0.001*float64(d), 37.70)
+	}
+
+	limits := valhalla.DefaultLimits()
+	limits.MaxAccessRoutes = cap
+	fc := transitAccessClient(600)
+	var buf bytes.Buffer
+	chainer := isochrone.New(fc, &fakeGraph{nodes: nodes}, limits, isochrone.EgressCache{}, logger.New(&buf, false), nil)
+	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeTransit)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	routedTo := map[float64]bool{}
+	for _, r := range fc.RouteCalls() {
+		routedTo[r.Destination.Lng] = true
+	}
+	if len(routedTo) != cap {
+		t.Errorf("access /route destinations = %d, want the cap %d", len(routedTo), cap)
+	}
+	for d := 1; d <= cap; d++ {
+		if lng := -122.40 + 0.001*float64(d); !routedTo[lng] {
+			t.Errorf("station-%02d is among the %d nearest but was not routed to", d, cap)
+		}
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "access route cap") || !strings.Contains(logged, `"cap":5`) {
+		t.Errorf("truncation was not logged with its cap:\n%s", logged)
+	}
+}
+
+func TestChainer_transitAccessIsBoundedByDefault(t *testing.T) {
+	const nodeCount = 300
+
+	nodes := make([]transit.Node, nodeCount)
+	for i := range nodeCount {
+		nodes[i] = node(
+			fmt.Sprintf("station-%d", i),
+			-122.40+0.001*float64(i%30),
+			37.70+0.001*float64(i/30),
+		)
+	}
+
+	fc := transitAccessClient(600)
+	if _, err := newChainer(fc, &fakeGraph{nodes: nodes}).Chain(context.Background(), req(90, transit.TravelModeTransit)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	// Distinct destinations: the starter walk repeats one access leg's.
+	routedTo := map[valhalla.LatLng]bool{}
+	for _, r := range fc.RouteCalls() {
+		routedTo[r.Destination] = true
+	}
+	if got := len(routedTo); got != valhalla.DefaultMaxAccessRoutes {
+		t.Errorf("access /route destinations = %d for %d nearby stations, want the default cap %d", got, nodeCount, valhalla.DefaultMaxAccessRoutes)
+	}
+}
+
+func TestChainer_matrixAccessIgnoresTheAccessRouteCap(t *testing.T) {
+	const nodeCount = 20
+
+	nodes := make([]transit.Node, nodeCount)
+	cells := make([]valhalla.MatrixCell, nodeCount)
+	for i := range nodeCount {
+		nodes[i] = node(fmt.Sprintf("station-%d", i), -122.40+0.001*float64(i), 37.70)
+		cells[i] = valhalla.MatrixCell{}
+	}
+
+	limits := valhalla.DefaultLimits()
+	limits.MaxAccessRoutes = 3
+	for _, mode := range []transit.TravelMode{transit.TravelModeWalk, transit.TravelModeBike, transit.TravelModeDrive} {
+		t.Run(string(mode), func(t *testing.T) {
+			fc := &valhalla.StubClient{
+				IsochroneResp: cannedIso(),
+				MatrixResp:    &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{cells}},
+			}
+			chainer := isochrone.New(fc, &fakeGraph{nodes: nodes}, limits, isochrone.EgressCache{}, logger.Discard(), nil)
+			if _, err := chainer.Chain(context.Background(), req(90, mode)); err != nil {
+				t.Fatalf("Chain: %v", err)
+			}
+			_, matrix := fc.Calls()
+			if len(matrix) != 1 {
+				t.Fatalf("Matrix calls = %d, want 1", len(matrix))
+			}
+			if got := len(matrix[0].Destinations); got != nodeCount {
+				t.Errorf("Matrix destinations = %d, want all %d — the access route cap is transit's alone", got, nodeCount)
+			}
+		})
+	}
+}
+
 func TestChainer_countsTransitAccessLegsByWhetherTheyRode(t *testing.T) {
 	stationA := node("station-a", -122.39, 37.71)
 	stationB := node("station-b", -122.41, 37.69)

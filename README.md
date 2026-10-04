@@ -361,6 +361,7 @@ enforces (see `kustomize-config`):
 | `VALHALLA_MATRIX_BLINE_AUTO_KM` | 400 | Not patched — Valhalla's `auto.max_matrix_distance` |
 | `VALHALLA_MATRIX_BLINE_OTHER_KM` | 200 | Not patched — Valhalla's `pedestrian`/`bicycle.max_matrix_distance` |
 | `VALHALLA_MAX_CONCURRENCY` | 8 | Not a Valhalla limit — a bound on the egress fan-out |
+| `VALHALLA_MAX_ACCESS_ROUTES` | 50 | Not a Valhalla limit — a bound on how many transit access `/route` calls one chain makes |
 
 The values inherited from the API were Stadia plan allowances, and two of them
 were wrong for this deployment in opposite directions: the contour ceiling was
@@ -372,6 +373,25 @@ imposes. Note that `valhalla.env` currently sets `server_threads=2`; a
 deployment keeping that should lower this to match. The same bound covers the
 egress fan-out and, for transit mode, the pairwise `/route` access-leg
 workaround.
+
+`VALHALLA_MAX_ACCESS_ROUTES` bounds how *many* of those pairwise access calls a
+transit chain makes; the 80 km transit reach bounds only how *far*. When more
+nodes fall inside the reach than the cap, the chain keeps the nearest by
+straight-line distance — the same nearest-N rule as the matrix pair cap — and
+logs `chain: nodes truncated to access route cap` at info with the cap and how
+many nodes were within reach. A station cut this way cannot be an access
+station for that chain. Walk, bike and drive access goes through Matrix and is
+bounded by `VALHALLA_MAX_MATRIX_PAIRS` instead; this setting does not touch it.
+
+The default of 50 is chosen against the call budget, not a station count: the
+seeded `ca-hsr` corridor has 15 stations in total, so it never reaches the cap,
+and the cap only matters for a dense authored network. Fifty access legs is
+seven waves at the default concurrency of 8 and 25 waves at staging's 2 —
+bounded latency per click, and still far more access stations than a click
+has useful nearby ones. These calls are never cached (the access leg starts
+wherever the user clicked), so this is the half of a transit chain that a warm
+cache does not shrink. It is not yet a `worker-env` literal in
+`kustomize-config`, so the cluster runs the default until one is added.
 
 ## Transit costing
 
@@ -386,8 +406,9 @@ chainer therefore:
 1. Pre-filters stations by haversine at 40 km/h (blended local-transit),
    capped at 80 km — not the 200 km pedestrian matrix b-line, which would
    be a target list pairwise `/route` cannot afford.
-2. Issues one `/route` `costing=multimodal` per survivor, bounded by
-   `VALHALLA_MAX_CONCURRENCY`, and reads `trip.summary.time` as access
+2. Keeps the nearest `VALHALLA_MAX_ACCESS_ROUTES` survivors, then issues one
+   `/route` `costing=multimodal` per station kept, at most
+   `VALHALLA_MAX_CONCURRENCY` at a time, and reads `trip.summary.time` as access
    seconds. A 400 on one pair drops that station (the way a null Matrix
    cell does); a rate-limit or 5xx still fails the job.
 3. Draws origin and egress isochrones with the same multimodal costing.

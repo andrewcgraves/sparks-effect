@@ -106,6 +106,7 @@ type Limits struct {
 	MatrixBLineAutoKm  float64
 	MatrixBLineOtherKm float64
 	MaxConcurrency     int
+	MaxAccessRoutes    int
 }
 
 const (
@@ -114,6 +115,7 @@ const (
 	DefaultMatrixBLineAutoKm  = 400.0
 	DefaultMatrixBLineOtherKm = 200.0
 	DefaultMaxConcurrency     = 8
+	DefaultMaxAccessRoutes    = 50
 )
 
 func DefaultLimits() Limits {
@@ -123,6 +125,7 @@ func DefaultLimits() Limits {
 		MatrixBLineAutoKm:  DefaultMatrixBLineAutoKm,
 		MatrixBLineOtherKm: DefaultMatrixBLineOtherKm,
 		MaxConcurrency:     DefaultMaxConcurrency,
+		MaxAccessRoutes:    DefaultMaxAccessRoutes,
 	}
 }
 

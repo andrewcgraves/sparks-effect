@@ -38,6 +38,9 @@ func TestDefaultsMatchTheDeployedContainer(t *testing.T) {
 	if cfg.Limits.MatrixBLineOtherKm != 200 {
 		t.Errorf("MatrixBLineOtherKm = %v, want 200", cfg.Limits.MatrixBLineOtherKm)
 	}
+	if cfg.Limits.MaxAccessRoutes != 50 {
+		t.Errorf("MaxAccessRoutes = %d, want 50", cfg.Limits.MaxAccessRoutes)
+	}
 	if cfg.Limits.MaxConcurrency <= 0 {
 		t.Errorf("MaxConcurrency = %d, want a positive bound", cfg.Limits.MaxConcurrency)
 	}
@@ -49,6 +52,7 @@ func TestLimitsAreOverridable(t *testing.T) {
 	t.Setenv("VALHALLA_MATRIX_BLINE_AUTO_KM", "250.5")
 	t.Setenv("VALHALLA_MATRIX_BLINE_OTHER_KM", "100")
 	t.Setenv("VALHALLA_MAX_CONCURRENCY", "2")
+	t.Setenv("VALHALLA_MAX_ACCESS_ROUTES", "120")
 
 	got := config.Load().Limits
 	want := valhalla.Limits{
@@ -57,6 +61,7 @@ func TestLimitsAreOverridable(t *testing.T) {
 		MatrixBLineAutoKm:  250.5,
 		MatrixBLineOtherKm: 100,
 		MaxConcurrency:     2,
+		MaxAccessRoutes:    120,
 	}
 	if got != want {
 		t.Errorf("Limits = %+v, want %+v", got, want)
@@ -67,6 +72,7 @@ func TestNonsenseLimitsFallBackToDefaults(t *testing.T) {
 	t.Setenv("VALHALLA_MAX_CONCURRENCY", "0")
 	t.Setenv("VALHALLA_MAX_MATRIX_PAIRS", "not-a-number")
 	t.Setenv("VALHALLA_MAX_ISO_CONTOUR_MINS", "-5")
+	t.Setenv("VALHALLA_MAX_ACCESS_ROUTES", "0")
 
 	got := config.Load().Limits
 	def := valhalla.DefaultLimits()
@@ -75,6 +81,9 @@ func TestNonsenseLimitsFallBackToDefaults(t *testing.T) {
 	}
 	if got.MaxMatrixPairs != def.MaxMatrixPairs {
 		t.Errorf("MaxMatrixPairs = %d, want the default %d", got.MaxMatrixPairs, def.MaxMatrixPairs)
+	}
+	if got.MaxAccessRoutes != def.MaxAccessRoutes {
+		t.Errorf("MaxAccessRoutes = %d, want the default %d", got.MaxAccessRoutes, def.MaxAccessRoutes)
 	}
 	if got.MaxIsoContourMins != def.MaxIsoContourMins {
 		t.Errorf("MaxIsoContourMins = %d, want the default %d", got.MaxIsoContourMins, def.MaxIsoContourMins)
@@ -169,6 +178,7 @@ func TestUnrecognizedEnvNamesLeftoverAndUnknown(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://legacy")
 	t.Setenv("DATABASE_MAX_CONNS", "8")
 	t.Setenv("SPARKS_NEW_FLAG", "1")
+	t.Setenv("VALHALLA_MAX_ACCESS_ROUTES", "120")
 
 	got := config.UnrecognizedEnv()
 	for _, want := range []string{"DATABASE_URL", "DATABASE_MAX_CONNS", "SPARKS_NEW_FLAG"} {
@@ -176,7 +186,7 @@ func TestUnrecognizedEnvNamesLeftoverAndUnknown(t *testing.T) {
 			t.Errorf("UnrecognizedEnv() = %v, missing %q", got, want)
 		}
 	}
-	for _, known := range []string{"API_URL", "AMQP_URL", "VALHALLA_URL", "WORKER_TOKEN"} {
+	for _, known := range []string{"API_URL", "AMQP_URL", "VALHALLA_URL", "WORKER_TOKEN", "VALHALLA_MAX_ACCESS_ROUTES"} {
 		if containsName(got, known) {
 			t.Errorf("UnrecognizedEnv() = %v, unexpectedly includes known %q", got, known)
 		}
