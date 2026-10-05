@@ -3,6 +3,7 @@ BUILD_DIR := ./bin
 CMD_DIR := ./cmd/worker
 
 GOLANGCI_LINT_VERSION := v2.12.2
+GOVULNCHECK_VERSION := v1.8.0
 
 DOCKER := docker
 
@@ -22,7 +23,7 @@ API_STORE_FIXTURE   := internal/handler/testdata/worker-store.golden.json
 TEST_VALHALLA_URL ?=
 
 .PHONY: all deps build run test test-integration itest acceptance check-config check-contract \
-	mq-up mq-wait mq-down vet lint tidy clean dev-workflow
+	mq-up mq-wait mq-down vet lint vulncheck tidy clean dev-workflow
 
 all: build
 
@@ -155,6 +156,21 @@ lint:
 		GOBIN="$$gobin" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION); \
 	fi; \
 	"$$gobin/golangci-lint" run ./...
+
+# vulncheck fails on a known vulnerability that this code actually calls. Not
+# part of `dev-workflow`: it needs the network (vuln.go.dev). CI runs it in the
+# check job.
+#
+# Standard-library findings are reported against the `go` on PATH, not the
+# version in go.mod, so a local run on an older toolchain can fail where CI,
+# on the latest patch of GO_VERSION, passes. GOTOOLCHAIN=go<patch> make
+# vulncheck reproduces CI's answer.
+vulncheck:
+	@gobin="$$(go env GOPATH)/bin"; \
+	if [ ! -x "$$gobin/govulncheck" ]; then \
+		GOBIN="$$gobin" go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION); \
+	fi; \
+	"$$gobin/govulncheck" ./...
 
 tidy:
 	go mod tidy
