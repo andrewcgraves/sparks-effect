@@ -1803,6 +1803,101 @@ func TestChainer_transitAccessUsesPairwiseRouteNotMatrix(t *testing.T) {
 	}
 }
 
+func rodeAccess(secs int) *valhalla.RouteResponse {
+	route := routedAccess(secs)
+	route.RodeTransit = true
+	return route
+}
+
+func TestChainer_transitAccessCarriesWhetherTheLegRode(t *testing.T) {
+	rodeTo := node("station-rode", -122.39, 37.71)
+	beyond := node("station-beyond", -122.43, 37.67)
+	graph := &fakeGraph{
+		nodes: []transit.Node{
+			rodeTo,
+			node("station-walked", -122.41, 37.69),
+			beyond,
+		},
+		travelTimes: map[[2]string]int{
+			{"station-walked", "station-beyond"}: 600,
+		},
+	}
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteFn: func(r valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+			switch r.Destination {
+			case valhalla.LatLng{Lat: rodeTo.Lat, Lng: rodeTo.Lng}:
+				return rodeAccess(600), nil
+			case valhalla.LatLng{Lat: beyond.Lat, Lng: beyond.Lng}:
+				// Rides, but slower than walking to station-walked and riding
+				// on, so the journey that wins does not start here.
+				return rodeAccess(3000), nil
+			}
+			return routedAccess(600), nil
+		},
+	}
+
+	resp, err := newChainer(fc, graph).Chain(context.Background(), req(90, transit.TravelModeTransit))
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+
+	stations := stationsBySlug(t, resp)
+	for slug, want := range map[string]bool{
+		"station-rode":   true,
+		"station-walked": false,
+		// Reached by riding the scenario from a station that was walked to:
+		// its access leg is that walk, not its own slower leg that rode.
+		"station-beyond": false,
+	} {
+		s, ok := stations[slug]
+		if !ok {
+			t.Errorf("%s missing — a walked access leg must label the station, not drop it", slug)
+			continue
+		}
+		if s.AccessRodeTransit == nil {
+			t.Errorf("%s: access_rode_transit absent on a transit access leg", slug)
+			continue
+		}
+		if *s.AccessRodeTransit != want {
+			t.Errorf("%s: access_rode_transit = %v, want %v", slug, *s.AccessRodeTransit, want)
+		}
+	}
+	if got := stations["station-beyond"].PredecessorSlug; got != "station-walked" {
+		t.Fatalf("station-beyond came from %q, want station-walked", got)
+	}
+
+	wire, err := json.Marshal(resp.Metadata.ReachableStations)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(wire), `"access_rode_transit":false`) {
+		t.Errorf("a walked transit leg must be an explicit false on the wire, got %s", wire)
+	}
+}
+
+func TestChainer_nonTransitAccessOmitsWhetherTheLegRode(t *testing.T) {
+	for _, mode := range []transit.TravelMode{transit.TravelModeWalk, transit.TravelModeBike, transit.TravelModeDrive} {
+		t.Run(string(mode), func(t *testing.T) {
+			fc := &valhalla.StubClient{IsochroneResp: cannedIso(), MatrixResp: walkableFrom(300, 0)}
+			resp, err := newChainer(fc, newTestGraph()).Chain(context.Background(), req(90, mode))
+			if err != nil {
+				t.Fatalf("Chain: %v", err)
+			}
+			if len(resp.Metadata.ReachableStations) == 0 {
+				t.Fatal("no reachable stations to check")
+			}
+			wire, err := json.Marshal(resp.Metadata.ReachableStations)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if strings.Contains(string(wire), "access_rode_transit") {
+				t.Errorf("%s cannot disagree with its own label, so it carries no access_rode_transit: %s", mode, wire)
+			}
+		})
+	}
+}
+
 func TestChainer_transitRoute400DropsThatStation(t *testing.T) {
 	stationB := node("station-b", -122.41, 37.69)
 	graph := &fakeGraph{nodes: []transit.Node{

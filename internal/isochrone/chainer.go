@@ -122,7 +122,7 @@ func (c *chainImpl) Chain(ctx context.Context, req ChainRequest) (*ChainResponse
 			"clamped_secs", originContourSecs)
 	}
 
-	originIso, matrixResp, err := c.originAndAccess(ctx, req, costing, originContourSecs, nearbyNodes)
+	originIso, matrixResp, rodeTransit, err := c.originAndAccess(ctx, req, costing, originContourSecs, nearbyNodes)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +131,7 @@ func (c *chainImpl) Chain(ctx context.Context, req ChainRequest) (*ChainResponse
 	accessSecs := c.accessTimes(ctx, req, nearbyNodes, matrixResp)
 	c.log.Debug(ctx, "chain: access reachability", "reachable", len(accessSecs), "total_nodes", len(nodes))
 
-	egressCandidates, reached := c.bestEgressPerNode(req, nodes, accessSecs)
+	egressCandidates, reached := c.bestEgressPerNode(req, nodes, accessSecs, rodeTransit)
 	c.log.Debug(ctx, "chain: egress candidates", "count", len(egressCandidates))
 
 	progress, omittedProgress := tripProgress(nodes, reached, req.BudgetMins*60)
@@ -295,10 +295,11 @@ func (c *chainImpl) originAndAccess(
 	costing valhalla.Costing,
 	originContourSecs int,
 	nearbyNodes []transit.Node,
-) (*valhalla.IsochroneResponse, *valhalla.MatrixResponse, error) {
+) (*valhalla.IsochroneResponse, *valhalla.MatrixResponse, map[string]bool, error) {
 	var (
-		originIso  *valhalla.IsochroneResponse
-		matrixResp *valhalla.MatrixResponse
+		originIso   *valhalla.IsochroneResponse
+		matrixResp  *valhalla.MatrixResponse
+		rodeTransit map[string]bool
 	)
 
 	g, gctx := errgroup.WithContext(ctx)
@@ -319,19 +320,19 @@ func (c *chainImpl) originAndAccess(
 
 	if len(nearbyNodes) > 0 {
 		g.Go(func() error {
-			m, mErr := c.accessMatrix(gctx, req, costing, nearbyNodes)
+			m, rode, mErr := c.accessMatrix(gctx, req, costing, nearbyNodes)
 			if mErr != nil {
 				return mErr
 			}
-			matrixResp = m
+			matrixResp, rodeTransit = m, rode
 			return nil
 		})
 	}
 
 	if err := g.Wait(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return originIso, matrixResp, nil
+	return originIso, matrixResp, rodeTransit, nil
 }
 
 func (c *chainImpl) accessMatrix(
@@ -339,7 +340,7 @@ func (c *chainImpl) accessMatrix(
 	req ChainRequest,
 	costing valhalla.Costing,
 	nearbyNodes []transit.Node,
-) (*valhalla.MatrixResponse, error) {
+) (*valhalla.MatrixResponse, map[string]bool, error) {
 	if !costing.SupportsMatrix() {
 		return c.pairwiseAccess(ctx, req, costing, nearbyNodes)
 	}
@@ -353,9 +354,9 @@ func (c *chainImpl) accessMatrix(
 		Costing:      costing,
 	})
 	if mErr != nil {
-		return nil, wrapRoutingErr(mErr)
+		return nil, nil, wrapRoutingErr(mErr)
 	}
-	return m, nil
+	return m, nil, nil
 }
 
 func (c *chainImpl) pairwiseAccess(
@@ -363,8 +364,9 @@ func (c *chainImpl) pairwiseAccess(
 	req ChainRequest,
 	costing valhalla.Costing,
 	nearbyNodes []transit.Node,
-) (*valhalla.MatrixResponse, error) {
+) (*valhalla.MatrixResponse, map[string]bool, error) {
 	cells := make([]valhalla.MatrixCell, len(nearbyNodes))
+	rodeBy := make([]bool, len(nearbyNodes))
 	var routed, rode atomic.Int64
 
 	concurrency := c.limits.MaxConcurrency
@@ -399,13 +401,19 @@ func (c *chainImpl) pairwiseAccess(
 			if route.RodeTransit {
 				rode.Add(1)
 			}
+			// Valhalla answers a multimodal request it has no service for by
+			// walking the whole way, with a 200. That time is still the right
+			// access time — dropping it would shrink the surface to stations
+			// genuinely best reached on transit — but it must not be served as
+			// a transit time, so the fact travels with the station (SPA-336).
+			rodeBy[i] = route.RodeTransit
 			cells[i] = valhalla.Cell(route.Time, route.DistanceKm)
 			return nil
 		})
 	}
 
 	if err := g.Wait(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	nRode := rode.Load()
 	c.metrics.TransitAccess(true, int(nRode))
@@ -418,7 +426,11 @@ func (c *chainImpl) pairwiseAccess(
 		"rode_transit", rode.Load(),
 		"departs_at", req.DepartAt.Format(time.RFC3339))
 
-	return &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{cells}}, nil
+	rodeTransit := make(map[string]bool, len(nearbyNodes))
+	for i, n := range nearbyNodes {
+		rodeTransit[n.Slug] = rodeBy[i]
+	}
+	return &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{cells}}, rodeTransit, nil
 }
 
 const snapSlackKm = 2 * float64(valhalla.LocationRadiusM) / 1000.0
@@ -491,12 +503,14 @@ type egressCandidate struct {
 	journey       transit.Reached
 	legs          []Leg
 	viaTransit    bool
+	rodeTransit   *bool
 }
 
 func (c *chainImpl) bestEgressPerNode(
 	req ChainRequest,
 	nodes []transit.Node,
 	accessSecs map[string]int,
+	accessRodeTransit map[string]bool,
 ) ([]egressCandidate, map[string]transit.Reached) {
 	budgetSecs := req.BudgetMins * 60
 	reached := c.graph.Search(accessSecs)
@@ -512,6 +526,13 @@ func (c *chainImpl) bestEgressPerNode(
 		}
 		rSecs := budgetSecs - journey.TotalSecs
 		aSecs := accessSecs[journey.SourceSlug]
+		// Only a pairwise transit access leg can disagree with the mode it
+		// was asked in; every other mode leaves the field off the wire.
+		var rode *bool
+		if accessRodeTransit != nil {
+			r := accessRodeTransit[journey.SourceSlug]
+			rode = &r
+		}
 		candidates = append(candidates, egressCandidate{
 			node:          n,
 			remainingSecs: rSecs,
@@ -521,6 +542,7 @@ func (c *chainImpl) bestEgressPerNode(
 			journey:       journey,
 			legs:          legsTo(n.Slug, reached),
 			viaTransit:    journey.PredecessorSlug != "",
+			rodeTransit:   rode,
 		})
 	}
 	return candidates, reached
@@ -763,6 +785,8 @@ func (c *chainImpl) assemble(
 			BoardSlug:       ec.journey.BoardSlug,
 			BoardWaitSecs:   ec.journey.BoardWaitSecs,
 			Legs:            ec.legs,
+
+			AccessRodeTransit: ec.rodeTransit,
 		})
 	}
 

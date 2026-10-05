@@ -29,7 +29,7 @@ origin ───────────────▶ station ─────�
 
 | Term | Definition |
 | --- | --- |
-| **Access leg** | Getting from the origin to a station, routed by Valhalla in the requested mode. One Matrix call for walk/bike/drive; pairwise `/route` for transit, because Valhalla's Matrix rejects `multimodal` |
+| **Access leg** | Getting from the origin to a station, routed by Valhalla in the requested mode. One Matrix call for walk/bike/drive; pairwise `/route` for transit, because Valhalla's Matrix rejects `multimodal`. A transit access leg may not ride anything — Valhalla walks the whole way when it finds no service — so each reachable station says whether its own access leg did, as `access_rode_transit` |
 | **Egress leg** | Getting *away* from a station the rider reached, drawn as an isochrone sized by whatever budget is left. This is the bulk of the work — one call per station reached by riding transit |
 | **Origin isochrone** | The surface reachable from the origin without boarding anything. A station reached by walking alone needs no egress call: the origin polygon already covers its own reach |
 | **Journey** | The graph-side part: everything between stepping onto the first vehicle and stepping off the last, as one `transit.Reached` value. Access time in, ride and dwell and boarding wait accumulated, predecessor chain recorded |

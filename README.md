@@ -470,8 +470,16 @@ walks the whole way and answers 200, with a plausible shape and a plausible
 duration, so a tileset whose GTFS calendars have all expired is
 indistinguishable from a corridor with genuinely poor service unless the
 maneuvers are read. `RouteResponse.RodeTransit` reads them, the transit access
-fan-out logs how many of its legs boarded anything, and `make acceptance`
-asserts it against a real server on a pair where the answer is known:
+fan-out logs and counts how many of its legs boarded anything, and every
+reachable station carries the answer for its own access leg as
+`access_rode_transit` (SPA-336). The station is kept either way: a walked leg is
+still the fastest way there, and dropping it would shrink the surface. It is
+only labelled, so the website can say "Walk" rather than "Transit". The field is
+written for transit only, as an explicit `false` when the leg walked; walk, bike
+and drive omit it, because they cannot disagree with their own mode. A station
+reached by riding the scenario inherits the answer from the station its journey
+started at. `make acceptance` asserts the maneuver reading against a real
+server on a pair where the answer is known:
 
 ```
 make acceptance TEST_VALHALLA_URL=http://localhost:8002

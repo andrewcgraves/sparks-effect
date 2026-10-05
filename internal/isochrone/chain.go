@@ -44,6 +44,9 @@ type ReachableStation struct {
 	BoardSlug       string `json:"board_slug,omitempty"`
 	BoardWaitSecs   int    `json:"board_wait_secs,omitempty"`
 	Legs            []Leg  `json:"legs,omitempty"`
+	// A pointer so a walked transit leg is an explicit false on the wire:
+	// absent means the leg was not a transit access leg at all.
+	AccessRodeTransit *bool `json:"access_rode_transit,omitempty"`
 }
 
 type TripProgress struct {
