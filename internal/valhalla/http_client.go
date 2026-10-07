@@ -160,16 +160,28 @@ func (c *HTTPClient) Matrix(ctx context.Context, req MatrixRequest) (*MatrixResp
 	return &resp, nil
 }
 
+type transitStop struct {
+	ArrivalDateTime   string `json:"arrival_date_time"`
+	DepartureDateTime string `json:"departure_date_time"`
+}
+
+type maneuver struct {
+	TravelMode  string  `json:"travel_mode"`
+	Time        float64 `json:"time"`
+	TransitInfo struct {
+		OperatorName string        `json:"operator_name"`
+		TransitStops []transitStop `json:"transit_stops"`
+	} `json:"transit_info"`
+}
+
 type routeBody struct {
 	Trip struct {
+		Locations []struct {
+			DateTime string `json:"date_time"`
+		} `json:"locations"`
 		Legs []struct {
-			Shape     string `json:"shape"`
-			Maneuvers []struct {
-				TravelMode  string `json:"travel_mode"`
-				TransitInfo struct {
-					OperatorName string `json:"operator_name"`
-				} `json:"transit_info"`
-			} `json:"maneuvers"`
+			Shape     string     `json:"shape"`
+			Maneuvers []maneuver `json:"maneuvers"`
 		} `json:"legs"`
 		Summary struct {
 			Time   float64 `json:"time"`
@@ -238,13 +250,17 @@ func (c *HTTPClient) Route(ctx context.Context, req RouteRequest) (*RouteRespons
 	if len(shape) < minDrawableShapePoints {
 		return nil, fmt.Errorf("%w: route carried no drawable shape", ErrUpstream)
 	}
-	return &RouteResponse{
+	out := &RouteResponse{
 		Shape:       shape,
 		Time:        int(math.Round(resp.Trip.Summary.Time)),
 		DistanceKm:  resp.Trip.Summary.Length,
 		RodeTransit: resp.rodeTransit(),
 		Operators:   resp.operators(),
-	}, nil
+	}
+	if req.Costing == CostingMultimodal {
+		out.Breakdown, out.BreakdownErr = resp.breakdown(req.DepartAt, out.Time)
+	}
+	return out, nil
 }
 
 type statusBody struct {

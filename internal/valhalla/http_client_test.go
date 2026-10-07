@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -886,6 +888,397 @@ func TestRoute_reportsWhetherItActuallyRodeTransit(t *testing.T) {
 				t.Errorf("RodeTransit = %v, want %v", resp.RodeTransit, tc.want)
 			}
 		})
+	}
+}
+
+type fixtureStop struct {
+	arrives, departs string
+}
+
+type fixtureManeuver struct {
+	mode  string
+	secs  float64
+	stops []fixtureStop
+}
+
+// Valhalla writes a transit stop's clocks with the offset inline (its own
+// test/gurka/test_gtfs.cc asserts "2023-02-27T23:58-05:00"), and echoes the
+// origin's date_time bare, with the offset in a separate field. The fixtures
+// do the same unless a test says otherwise.
+func stopClock(hhmm string) string {
+	return "2026-09-02T" + hhmm + "-07:00"
+}
+
+func bareClock(hhmm string) string {
+	return "2026-09-02T" + hhmm
+}
+
+const originClock = "2026-09-02T08:00"
+
+func walking(secs float64) fixtureManeuver {
+	return fixtureManeuver{mode: "pedestrian", secs: secs}
+}
+
+func riding(secs float64, boards, alights string) fixtureManeuver {
+	return fixtureManeuver{mode: "transit", secs: secs, stops: []fixtureStop{{departs: boards}, {arrives: alights}}}
+}
+
+func tripBody(t *testing.T, originClock string, summarySecs float64, maneuvers ...fixtureManeuver) string {
+	t.Helper()
+	ms := make([]map[string]any, len(maneuvers))
+	for i, m := range maneuvers {
+		ms[i] = map[string]any{"travel_mode": m.mode, "time": m.secs}
+		if m.mode != "transit" {
+			continue
+		}
+		stops := make([]map[string]any, len(m.stops))
+		for j, st := range m.stops {
+			stop := map[string]any{"type": "stop", "name": fmt.Sprintf("stop %d", j)}
+			if st.arrives != "" {
+				stop["arrival_date_time"] = st.arrives
+			}
+			if st.departs != "" {
+				stop["departure_date_time"] = st.departs
+			}
+			stops[j] = stop
+		}
+		ms[i]["transit_info"] = map[string]any{"operator_name": "VTA", "transit_stops": stops}
+	}
+	trip := map[string]any{
+		"legs":    []map[string]any{{"shape": shapeThreePoints, "maneuvers": ms}},
+		"summary": map[string]any{"time": summarySecs, "length": 2.06},
+	}
+	if originClock != "" {
+		trip["locations"] = []map[string]any{
+			{"type": "break", "lat": 37.7, "lon": -122.4, "date_time": originClock, "time_zone_offset": "-07:00"},
+			{"type": "break", "lat": 37.701, "lon": -122.4005},
+		}
+	}
+	raw, err := json.Marshal(map[string]any{"trip": trip})
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	return string(raw)
+}
+
+func routeFixture(t *testing.T, costing valhalla.Costing, body string) *valhalla.RouteResponse {
+	t.Helper()
+	srv := newCaptureServer(t, http.StatusOK, body)
+	resp, err := valhalla.NewHTTPClient(srv.URL).Route(context.Background(), valhalla.RouteRequest{
+		Origin:      valhalla.LatLng{Lat: 37.7, Lng: -122.4},
+		Destination: valhalla.LatLng{Lat: 37.701, Lng: -122.4005},
+		Costing:     costing,
+		DepartAt:    morningDeparture(t),
+	})
+	if err != nil {
+		t.Fatalf("Route: %v — an unreconciled split must never fail the route", err)
+	}
+	return resp
+}
+
+func assertBreakdown(t *testing.T, resp *valhalla.RouteResponse, want valhalla.Breakdown) {
+	t.Helper()
+	if resp.BreakdownErr != nil {
+		t.Fatalf("BreakdownErr = %v, want a reconciled split", resp.BreakdownErr)
+	}
+	if resp.Breakdown == nil {
+		t.Fatal("Breakdown is nil, want a split")
+	}
+	if *resp.Breakdown != want {
+		t.Errorf("Breakdown = %+v, want %+v", *resp.Breakdown, want)
+	}
+	if got := resp.Breakdown.Total(); got != resp.Time {
+		t.Errorf("walk + wait + ride = %d s, but the access time is %d s; the split must sum to it exactly", got, resp.Time)
+	}
+}
+
+func assertUnreconciled(t *testing.T, resp *valhalla.RouteResponse) {
+	t.Helper()
+	if !errors.Is(resp.BreakdownErr, valhalla.ErrUnreconciled) {
+		t.Errorf("BreakdownErr = %v, want ErrUnreconciled", resp.BreakdownErr)
+	}
+	if resp.Breakdown != nil {
+		t.Errorf("Breakdown = %+v, want none: a split that does not reconcile is withheld, not rounded", *resp.Breakdown)
+	}
+}
+
+// The forced SJSU -> Diridon itinerary SPA-335 recorded, departing 08:00: a
+// 22.9 min walk reaches the platform at 08:22:54, the Green Line departs
+// 08:31 and arrives 08:40, the transit maneuver's own time is 16.7 min with
+// the wait folded inside it, and a 6.9 min walk follows. 46.5 min in all.
+// The maneuver is a 9.0 min timetabled ride and a 7.7 min wait; the clock gap
+// from the platform to the 08:31 departure is 8.1 min, 24 s more.
+const (
+	spa335Platform    = 600 + 700 + 74
+	spa335Maneuver    = 1002
+	spa335Egress      = 414
+	spa335Total       = spa335Platform + spa335Maneuver + spa335Egress
+	spa335Ride        = 540
+	spa335Wait        = spa335Maneuver - spa335Ride
+	spa335ClockGapSec = 486
+)
+
+func spa335TripReaching(platformSecs float64, clock func(string) string, alights string) []fixtureManeuver {
+	return []fixtureManeuver{
+		walking(600), walking(700), walking(platformSecs - 1300),
+		{mode: "transit", secs: spa335Maneuver, stops: []fixtureStop{
+			{departs: clock("08:31")},
+			{arrives: clock("08:35"), departs: clock("08:35")},
+			{arrives: clock(alights)},
+		}},
+		walking(spa335Egress),
+	}
+}
+
+func spa335Trip() []fixtureManeuver {
+	return spa335TripReaching(spa335Platform, stopClock, "08:40")
+}
+
+func spa335Split() valhalla.Breakdown {
+	return valhalla.Breakdown{WalkSecs: spa335Platform + spa335Egress, WaitSecs: spa335Wait, RideSecs: spa335Ride}
+}
+
+func TestRoute_takesTheWaitOutOfTheTransitManeuverAsSPA335MeasuredIt(t *testing.T) {
+	// The ride is the timetabled 08:31 to 08:40, 9.0 min, and the wait is what
+	// the 16.7 min maneuver holds beyond it, 7.7 min: the wait comes out of
+	// the maneuver. Adding the 8.1 min clock gap beside the maneuver instead
+	// would report 54.6 min for a 46.5 min trip.
+	if spa335Wait != 462 || spa335ClockGapSec-spa335Wait != 24 {
+		t.Fatalf("fixture: wait %d s, %d s from the clock gap; SPA-335 measured 462 s and 24 s", spa335Wait, spa335ClockGapSec-spa335Wait)
+	}
+	tests := []struct {
+		name   string
+		origin string
+		clock  func(string) string
+	}{
+		{"anchored on the origin's echoed date_time", originClock, stopClock},
+		{"anchored on the departure the request sent", "", stopClock},
+		{"an origin date_time carrying its offset", originClock + "-07:00", stopClock},
+		{"stop clocks without an offset", originClock, bareClock},
+		{"stop clocks in another offset still read as local wall clocks", originClock, func(hhmm string) string {
+			return "2026-09-02T" + hhmm + "+09:00"
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := routeFixture(t, valhalla.CostingMultimodal,
+				tripBody(t, tc.origin, spa335Total, spa335TripReaching(spa335Platform, tc.clock, "08:40")...))
+			if resp.Time != spa335Total {
+				t.Fatalf("Time = %d, want the unchanged %d s total", resp.Time, spa335Total)
+			}
+			if !resp.RodeTransit {
+				t.Error("RodeTransit = false on a leg with a transit maneuver")
+			}
+			assertBreakdown(t, resp, spa335Split())
+		})
+	}
+}
+
+func TestRoute_reconcilesTheClockGapAgainstTheWaitToTheSecond(t *testing.T) {
+	// The wait the maneuver leaves is checked against the clock gap from the
+	// platform to the boarding departure. The boarding clock is minute
+	// precision, so up to ReconcileToleranceSecs either way is its rounding;
+	// a second more refuses the split. Moving the platform arrival moves the
+	// gap and leaves the wait alone.
+	tests := []struct {
+		name         string
+		platform     float64
+		disagreement int
+		reconciles   bool
+	}{
+		{"SPA-335's measured 24 s", spa335Platform, 24, true},
+		{"exactly 60 s late", 1338, 60, true},
+		{"61 s late", 1337, 61, false},
+		{"exactly 60 s early", 1458, -60, true},
+		{"61 s early", 1459, -61, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if gap := 1860 - int(tc.platform); gap-spa335Wait != tc.disagreement {
+				t.Fatalf("fixture: a %d s gap is %d s from the %d s wait, not %d", gap, gap-spa335Wait, spa335Wait, tc.disagreement)
+			}
+			total := tc.platform + spa335Maneuver + spa335Egress
+			resp := routeFixture(t, valhalla.CostingMultimodal,
+				tripBody(t, originClock, total, spa335TripReaching(tc.platform, stopClock, "08:40")...))
+			if resp.Time != int(total) {
+				t.Errorf("Time = %d, want summary.time unchanged whatever the split does", resp.Time)
+			}
+			if !tc.reconciles {
+				assertUnreconciled(t, resp)
+				return
+			}
+			assertBreakdown(t, resp, valhalla.Breakdown{
+				WalkSecs: int(tc.platform) + spa335Egress,
+				WaitSecs: spa335Wait,
+				RideSecs: spa335Ride,
+			})
+		})
+	}
+}
+
+func TestRoute_theAlightingClockSetsTheRide(t *testing.T) {
+	// The ride is alighting clock minus boarding clock, so moving the 08:40
+	// arrival moves the ride and, inside the same maneuver, the wait.
+	t.Run("a minute early still reconciles", func(t *testing.T) {
+		resp := routeFixture(t, valhalla.CostingMultimodal,
+			tripBody(t, originClock, spa335Total, spa335TripReaching(spa335Platform, stopClock, "08:39")...))
+		// Ride 480 s, wait 522 s, 36 s under the 486 s clock gap.
+		assertBreakdown(t, resp, valhalla.Breakdown{WalkSecs: spa335Platform + spa335Egress, WaitSecs: 522, RideSecs: 480})
+	})
+	t.Run("a minute late leaves a wait 84 s off the clock gap", func(t *testing.T) {
+		resp := routeFixture(t, valhalla.CostingMultimodal,
+			tripBody(t, originClock, spa335Total, spa335TripReaching(spa335Platform, stopClock, "08:41")...))
+		assertUnreconciled(t, resp)
+	})
+}
+
+func TestRoute_putsTheRoundingResidueOnTheWalk(t *testing.T) {
+	// The components sum to the rounded total exactly, so the walk carries the
+	// sub-second rounding of the total, the wait and the ride, plus any float
+	// drift within SummaryDriftToleranceSecs, and nothing more: it never
+	// strays from the walking maneuvers' sum by more than that.
+	tests := []struct {
+		name             string
+		summary          float64
+		maneuver, egress float64
+		walk             int
+	}{
+		{"a total that rounds down", spa335Total + 0.4, spa335Maneuver, spa335Egress + 0.4, spa335Platform + spa335Egress},
+		{"a total that rounds up", spa335Total + 0.6, spa335Maneuver, spa335Egress + 0.6, spa335Platform + spa335Egress + 1},
+		{"a fractional transit maneuver", spa335Total + 0.4, spa335Maneuver + 0.4, spa335Egress, spa335Platform + spa335Egress},
+		{"1.4 s of float drift", spa335Total + 1.4, spa335Maneuver, spa335Egress, spa335Platform + spa335Egress + 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			trip := spa335Trip()
+			trip[3].secs, trip[4].secs = tc.maneuver, tc.egress
+			resp := routeFixture(t, valhalla.CostingMultimodal, tripBody(t, originClock, tc.summary, trip...))
+			assertBreakdown(t, resp, valhalla.Breakdown{WalkSecs: tc.walk, WaitSecs: spa335Wait, RideSecs: spa335Ride})
+		})
+	}
+}
+
+func TestRoute_refusesManeuversThatDriftFromTheTotal(t *testing.T) {
+	// SPA-335's maneuvers sum to summary.time exactly. Past float rounding the
+	// difference would land on the walk, so the split is refused instead.
+	for _, drift := range []float64{3, -3} {
+		t.Run(fmt.Sprintf("%+.0f s", drift), func(t *testing.T) {
+			resp := routeFixture(t, valhalla.CostingMultimodal,
+				tripBody(t, originClock, spa335Total+drift, spa335Trip()...))
+			if resp.Time != spa335Total+int(drift) {
+				t.Errorf("Time = %d, want summary.time unchanged whatever the split does", resp.Time)
+			}
+			assertUnreconciled(t, resp)
+		})
+	}
+}
+
+func TestRoute_aLegWalkedEndToEndIsAllWalk(t *testing.T) {
+	// Walk = total holds without measuring anything, so a walked leg is split
+	// whatever its maneuvers sum to and whatever clock Valhalla echoed.
+	tests := []struct {
+		name      string
+		origin    string
+		summary   float64
+		maneuvers []fixtureManeuver
+	}{
+		{"maneuvers that sum to the total", "", 1800.4,
+			[]fixtureManeuver{walking(900), walking(600), walking(300.4)}},
+		{"maneuvers far from the total", originClock, 1800,
+			[]fixtureManeuver{walking(900), walking(600)}},
+		{"a bad origin clock it never needs", "08:00", 1800,
+			[]fixtureManeuver{walking(1800)}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := routeFixture(t, valhalla.CostingMultimodal, tripBody(t, tc.origin, tc.summary, tc.maneuvers...))
+			if resp.RodeTransit {
+				t.Error("RodeTransit = true on a leg with no transit maneuver")
+			}
+			assertBreakdown(t, resp, valhalla.Breakdown{WalkSecs: 1800})
+		})
+	}
+}
+
+func TestRoute_eachTransferMeasuresItsOwnWait(t *testing.T) {
+	// 08:05:00 at the first platform, 2 min wait for 08:07, ride to 08:15,
+	// a 2 min transfer walk to 08:17:00, 8 min wait for 08:25, ride to 08:40.
+	// Measuring the second wait from the trip's start, or from the first
+	// boarding, would get it wrong.
+	resp := routeFixture(t, valhalla.CostingMultimodal, tripBody(t, originClock, 2460,
+		walking(300),
+		riding(600, stopClock("08:07"), stopClock("08:15")),
+		walking(120),
+		riding(1380, stopClock("08:25"), stopClock("08:40")),
+		walking(60),
+	))
+	assertBreakdown(t, resp, valhalla.Breakdown{WalkSecs: 480, WaitSecs: 120 + 480, RideSecs: 480 + 900})
+}
+
+func TestRoute_aDepartureJustBeforeThePlatformClockIsNoWait(t *testing.T) {
+	// 08:05:20 at the platform for an 08:05 departure: 20 s of minute
+	// rounding, not a train that left before the rider arrived.
+	resp := routeFixture(t, valhalla.CostingMultimodal, tripBody(t, originClock, 640+600,
+		walking(320),
+		riding(600, stopClock("08:05"), stopClock("08:15")),
+		walking(320),
+	))
+	assertBreakdown(t, resp, valhalla.Breakdown{WalkSecs: 640, WaitSecs: 0, RideSecs: 600})
+}
+
+func TestRoute_refusesASplitTheClocksCannotPlace(t *testing.T) {
+	tests := []struct {
+		name      string
+		origin    string
+		maneuvers []fixtureManeuver
+		summary   float64
+	}{
+		{"no boarding departure", originClock, []fixtureManeuver{
+			walking(300), riding(600, "", stopClock("08:15")),
+		}, 900},
+		{"no alighting arrival", originClock, []fixtureManeuver{
+			walking(300), riding(600, stopClock("08:07"), ""),
+		}, 900},
+		{"a stop clock that is not a clock", originClock, []fixtureManeuver{
+			walking(300), riding(600, "08:07", stopClock("08:15")),
+		}, 900},
+		{"no stops at all", originClock, []fixtureManeuver{
+			walking(300), {mode: "transit", secs: 600},
+		}, 900},
+		{"departs well before the rider reaches the platform", originClock, []fixtureManeuver{
+			walking(300), riding(600, stopClock("08:03"), stopClock("08:15")),
+		}, 900},
+		{"alights before it boards", originClock, []fixtureManeuver{
+			walking(300), riding(600, stopClock("08:07"), stopClock("08:06")),
+		}, 900},
+		{"an origin date_time that is not a clock", "08:00", []fixtureManeuver{
+			walking(300), riding(600, stopClock("08:07"), stopClock("08:15")),
+		}, 900},
+		{"a negative maneuver time", originClock, []fixtureManeuver{
+			walking(310), walking(-10), riding(600, stopClock("08:07"), stopClock("08:15")),
+		}, 900},
+		// Riding from the first second, 600 s by the timetable, inside a total
+		// that rounds to 599 s: within the float drift allowance, but the
+		// clocked wait and ride alone exceed the total and leave a negative walk.
+		{"a ride longer than the whole leg", originClock, []fixtureManeuver{
+			riding(600, stopClock("08:00"), stopClock("08:10")),
+		}, 598.5},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := routeFixture(t, valhalla.CostingMultimodal, tripBody(t, tc.origin, tc.summary, tc.maneuvers...))
+			if want := int(math.Round(tc.summary)); resp.Time != want {
+				t.Errorf("Time = %d, want %d: the total stands without its split", resp.Time, want)
+			}
+			assertUnreconciled(t, resp)
+		})
+	}
+}
+
+func TestRoute_onlyMultimodalHasABreakdown(t *testing.T) {
+	resp := routeFixture(t, valhalla.CostingPedestrian, tripBody(t, "", 1800, walking(1800)))
+	if resp.Breakdown != nil || resp.BreakdownErr != nil {
+		t.Errorf("pedestrian route: Breakdown = %v, BreakdownErr = %v; want neither", resp.Breakdown, resp.BreakdownErr)
 	}
 }
 

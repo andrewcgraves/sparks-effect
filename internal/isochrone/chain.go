@@ -33,6 +33,12 @@ type Leg struct {
 	DwellS    int    `json:"dwell_s,omitempty"`
 }
 
+type AccessBreakdown struct {
+	AccessWalkSecs int `json:"access_walk_secs"`
+	AccessWaitSecs int `json:"access_wait_secs"`
+	AccessRideSecs int `json:"access_ride_secs"`
+}
+
 type ReachableStation struct {
 	StationSlug     string `json:"station_slug"`
 	AccessMins      int    `json:"access_mins"`
@@ -47,6 +53,11 @@ type ReachableStation struct {
 	// A pointer so a walked transit leg is an explicit false on the wire:
 	// absent means the leg was not a transit access leg at all.
 	AccessRodeTransit *bool `json:"access_rode_transit,omitempty"`
+	// Embedded by pointer so its three fields sit flat beside access_secs and
+	// board_wait_secs, and arrive all together or not at all: a walked leg
+	// carries explicit zeros for wait and ride, while a leg with no split —
+	// walk, bike and drive, or a split that did not reconcile — carries none.
+	*AccessBreakdown
 }
 
 type TripProgress struct {

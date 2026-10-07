@@ -1876,6 +1876,186 @@ func TestChainer_transitAccessCarriesWhetherTheLegRode(t *testing.T) {
 	}
 }
 
+func splitAccess(walk, wait, ride int) *valhalla.RouteResponse {
+	route := routedAccess(walk + wait + ride)
+	route.RodeTransit = wait+ride > 0
+	route.Breakdown = &valhalla.Breakdown{WalkSecs: walk, WaitSecs: wait, RideSecs: ride}
+	return route
+}
+
+func TestChainer_transitAccessCarriesItsWalkWaitAndRide(t *testing.T) {
+	rodeTo := node("station-rode", -122.39, 37.71)
+	walkedTo := node("station-walked", -122.41, 37.69)
+	beyond := node("station-beyond", -122.43, 37.67)
+	graph := &fakeGraph{
+		nodes: []transit.Node{rodeTo, walkedTo, beyond},
+		travelTimes: map[[2]string]int{
+			{"station-walked", "station-beyond"}: 600,
+		},
+		waitTimes: map[[2]string]int{
+			{"station-walked", "station-beyond"}: 300,
+		},
+	}
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteFn: func(r valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+			switch r.Destination {
+			case valhalla.LatLng{Lat: rodeTo.Lat, Lng: rodeTo.Lng}:
+				return splitAccess(1788, 462, 540), nil
+			case valhalla.LatLng{Lat: beyond.Lat, Lng: beyond.Lng}:
+				return splitAccess(600, 1200, 1200), nil
+			}
+			return splitAccess(900, 0, 0), nil
+		},
+	}
+
+	resp, err := newChainer(fc, graph).Chain(context.Background(), req(90, transit.TravelModeTransit))
+	if err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	stations := stationsBySlug(t, resp)
+	for slug, want := range map[string]isochrone.AccessBreakdown{
+		"station-rode":   {AccessWalkSecs: 1788, AccessWaitSecs: 462, AccessRideSecs: 540},
+		"station-walked": {AccessWalkSecs: 900},
+		// Reached by riding the scenario from station-walked: its access_secs
+		// is station-walked's access leg, so its split is too, and the
+		// authored ride's wait stays in board_wait_secs beside it.
+		"station-beyond": {AccessWalkSecs: 900},
+	} {
+		s, ok := stations[slug]
+		if !ok {
+			t.Errorf("%s missing", slug)
+			continue
+		}
+		if s.AccessBreakdown == nil {
+			t.Errorf("%s: no access breakdown on a transit access leg that reconciled", slug)
+			continue
+		}
+		if *s.AccessBreakdown != want {
+			t.Errorf("%s: access breakdown = %+v, want %+v", slug, *s.AccessBreakdown, want)
+		}
+		if sum := s.AccessWalkSecs + s.AccessWaitSecs + s.AccessRideSecs; sum != s.AccessSecs {
+			t.Errorf("%s: walk + wait + ride = %d s, want access_secs %d", slug, sum, s.AccessSecs)
+		}
+	}
+	if b := stations["station-beyond"]; b.PredecessorSlug != "station-walked" || b.BoardWaitSecs != 300 {
+		t.Fatalf("station-beyond came from %q with board_wait_secs %d, want station-walked and 300", b.PredecessorSlug, b.BoardWaitSecs)
+	}
+
+	wire, err := json.Marshal(resp.Metadata.ReachableStations)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded []map[string]any
+	if err := json.Unmarshal(wire, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, s := range decoded {
+		if s["station_slug"] != "station-walked" {
+			continue
+		}
+		for field, want := range map[string]float64{
+			"access_secs": 900, "access_walk_secs": 900, "access_wait_secs": 0, "access_ride_secs": 0,
+		} {
+			if got, ok := s[field]; !ok || got != want {
+				t.Errorf("station-walked %s = %v (present %v), want an explicit %v: a walked leg is all walk", field, got, ok, want)
+			}
+		}
+		if s["access_rode_transit"] != false {
+			t.Errorf("station-walked access_rode_transit = %v, want false", s["access_rode_transit"])
+		}
+	}
+}
+
+func TestChainer_unreconciledAccessKeepsTheStationWithoutASplit(t *testing.T) {
+	notSumming := splitAccess(600, 300, 300)
+	notSumming.Breakdown.RideSecs = 299
+	refused := routedAccess(1200)
+	refused.RodeTransit = true
+	refused.BreakdownErr = fmt.Errorf("%w: departs 08:31, 426 s after reaching the platform, but the maneuver leaves a 522 s wait", valhalla.ErrUnreconciled)
+
+	for name, route := range map[string]*valhalla.RouteResponse{
+		"the client refused it":               refused,
+		"the client's split is not the total": notSumming,
+	} {
+		t.Run(name, func(t *testing.T) {
+			fc := &valhalla.StubClient{
+				IsochroneResp: cannedIso(),
+				RouteFn: func(valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+					return route, nil
+				},
+			}
+			var buf bytes.Buffer
+			chainer := isochrone.New(fc, &fakeGraph{nodes: []transit.Node{
+				node("station-a", -122.39, 37.71),
+				node("station-b", -122.41, 37.69),
+			}}, valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.New(&buf, false), nil)
+
+			resp, err := chainer.Chain(context.Background(), req(90, transit.TravelModeTransit))
+			if err != nil {
+				t.Fatalf("Chain: %v — a split that does not reconcile must not fail the job", err)
+			}
+			stations := stationsBySlug(t, resp)
+			for _, slug := range []string{"station-a", "station-b"} {
+				s, ok := stations[slug]
+				if !ok {
+					t.Fatalf("%s missing — its access time still stands without a split", slug)
+				}
+				if s.AccessSecs != route.Time || s.AccessRodeTransit == nil || !*s.AccessRodeTransit {
+					t.Errorf("%s: access_secs %d, access_rode_transit %v; want %d and true", slug, s.AccessSecs, s.AccessRodeTransit, route.Time)
+				}
+				if s.AccessBreakdown != nil {
+					t.Errorf("%s carries %+v; a split that does not sum to its access time is withheld", slug, *s.AccessBreakdown)
+				}
+			}
+
+			// One warning for the job, not one per station, carrying the
+			// count and a sample of why.
+			var warnings []map[string]any
+			for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+				var rec map[string]any
+				if err := json.Unmarshal([]byte(line), &rec); err != nil {
+					t.Fatalf("log line %q: %v", line, err)
+				}
+				if rec["level"] == "WARN" {
+					warnings = append(warnings, rec)
+				}
+			}
+			if len(warnings) != 1 {
+				t.Fatalf("%d warnings for two unreconciled stations, want exactly one per job:\n%s", len(warnings), buf.String())
+			}
+			w := warnings[0]
+			if w["unreconciled"] != float64(2) {
+				t.Errorf("warning counts unreconciled = %v, want 2", w["unreconciled"])
+			}
+			if sample, _ := w["unreconciled_sample"].(string); !strings.Contains(sample, valhalla.ErrUnreconciled.Error()) {
+				t.Errorf("warning's unreconciled_sample = %q, want the first station's error", sample)
+			}
+		})
+	}
+}
+
+func TestChainer_reconciledAccessLogsNoWarning(t *testing.T) {
+	fc := &valhalla.StubClient{
+		IsochroneResp: cannedIso(),
+		RouteFn: func(valhalla.RouteRequest) (*valhalla.RouteResponse, error) {
+			return splitAccess(1788, 462, 540), nil
+		},
+	}
+	var buf bytes.Buffer
+	chainer := isochrone.New(fc, &fakeGraph{nodes: []transit.Node{node("station-a", -122.39, 37.71)}},
+		valhalla.DefaultLimits(), isochrone.EgressCache{}, logger.New(&buf, false), nil)
+	if _, err := chainer.Chain(context.Background(), req(90, transit.TravelModeTransit)); err != nil {
+		t.Fatalf("Chain: %v", err)
+	}
+	if strings.Contains(buf.String(), `"level":"WARN"`) {
+		t.Errorf("a job whose every split reconciled logged a warning:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), `"unreconciled":0`) {
+		t.Errorf("the access summary line should still count unreconciled splits:\n%s", buf.String())
+	}
+}
+
 func TestChainer_nonTransitAccessOmitsWhetherTheLegRode(t *testing.T) {
 	for _, mode := range []transit.TravelMode{transit.TravelModeWalk, transit.TravelModeBike, transit.TravelModeDrive} {
 		t.Run(string(mode), func(t *testing.T) {
@@ -1893,6 +2073,11 @@ func TestChainer_nonTransitAccessOmitsWhetherTheLegRode(t *testing.T) {
 			}
 			if strings.Contains(string(wire), "access_rode_transit") {
 				t.Errorf("%s cannot disagree with its own label, so it carries no access_rode_transit: %s", mode, wire)
+			}
+			for _, field := range []string{"access_walk_secs", "access_wait_secs", "access_ride_secs"} {
+				if strings.Contains(string(wire), field) {
+					t.Errorf("%s access comes from the matrix, which has no maneuvers to split, yet carries %s: %s", mode, field, wire)
+				}
 			}
 		})
 	}

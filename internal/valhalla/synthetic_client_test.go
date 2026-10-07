@@ -210,6 +210,9 @@ func TestSyntheticAcceptsMultimodalCosting(t *testing.T) {
 	if route.Time <= 0 {
 		t.Errorf("Time = %d, want a positive multimodal access time", route.Time)
 	}
+	if route.Breakdown == nil || route.Breakdown.Total() != route.Time || !route.RodeTransit {
+		t.Errorf("Breakdown = %+v for a %d s leg that rode; want a split summing to it", route.Breakdown, route.Time)
+	}
 }
 
 func TestSyntheticReportsNoStatus(t *testing.T) {

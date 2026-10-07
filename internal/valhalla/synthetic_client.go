@@ -91,13 +91,19 @@ func (c *SyntheticClient) Route(_ context.Context, req RouteRequest) (*RouteResp
 		return nil, err
 	}
 	roadKm := geo.HaversineKm(req.Origin.Lat, req.Origin.Lng, req.Destination.Lat, req.Destination.Lng) * geo.DetourFactor
-	return &RouteResponse{
+	out := &RouteResponse{
 		Shape:      []LatLng{req.Origin, req.Destination},
 		Time:       int(math.Round(roadKm / speed * 3600.0)),
 		DistanceKm: roadKm,
 
 		RodeTransit: req.Costing == CostingMultimodal,
-	}, nil
+	}
+	if out.RodeTransit {
+		// A synthetic multimodal leg claims to ride, so its split says the
+		// same: all of it riding, which sums to Time like any real one.
+		out.Breakdown = &Breakdown{RideSecs: out.Time}
+	}
+	return out, nil
 }
 
 func (c *SyntheticClient) Status(context.Context) (Status, error) {

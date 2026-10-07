@@ -11,6 +11,8 @@ var (
 	ErrBadRequest = errors.New("valhalla: bad request")
 	ErrRateLimit  = errors.New("valhalla: rate limit exceeded")
 	ErrUpstream   = errors.New("valhalla: upstream error")
+
+	ErrUnreconciled = errors.New("valhalla: route time does not reconcile into walk, wait and ride")
 )
 
 type Costing string
@@ -78,12 +80,29 @@ type RouteRequest struct {
 	DepartAt    time.Time
 }
 
+type Breakdown struct {
+	WalkSecs int
+	WaitSecs int
+	RideSecs int
+}
+
+func (b Breakdown) Total() int {
+	return b.WalkSecs + b.WaitSecs + b.RideSecs
+}
+
 type RouteResponse struct {
 	Shape       []LatLng
 	Time        int
 	DistanceKm  float64
 	RodeTransit bool
 	Operators   []string
+	// Multimodal only, and never an approximation: Breakdown sums to Time
+	// exactly or is nil, with BreakdownErr (wrapping ErrUnreconciled) saying
+	// why. A route whose split cannot be reconciled is still a good route —
+	// Time and RodeTransit stand on their own — so the failure travels beside
+	// it rather than failing the call.
+	Breakdown    *Breakdown
+	BreakdownErr error
 }
 
 type Status struct {

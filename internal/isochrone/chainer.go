@@ -122,7 +122,7 @@ func (c *chainImpl) Chain(ctx context.Context, req ChainRequest) (*ChainResponse
 			"clamped_secs", originContourSecs)
 	}
 
-	originIso, matrixResp, rodeTransit, err := c.originAndAccess(ctx, req, costing, originContourSecs, nearbyNodes)
+	originIso, matrixResp, transitLegs, err := c.originAndAccess(ctx, req, costing, originContourSecs, nearbyNodes)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +131,7 @@ func (c *chainImpl) Chain(ctx context.Context, req ChainRequest) (*ChainResponse
 	accessSecs := c.accessTimes(ctx, req, nearbyNodes, matrixResp)
 	c.log.Debug(ctx, "chain: access reachability", "reachable", len(accessSecs), "total_nodes", len(nodes))
 
-	egressCandidates, reached := c.bestEgressPerNode(req, nodes, accessSecs, rodeTransit)
+	egressCandidates, reached := c.bestEgressPerNode(req, nodes, accessSecs, transitLegs)
 	c.log.Debug(ctx, "chain: egress candidates", "count", len(egressCandidates))
 
 	progress, omittedProgress := tripProgress(nodes, reached, req.BudgetMins*60)
@@ -295,11 +295,11 @@ func (c *chainImpl) originAndAccess(
 	costing valhalla.Costing,
 	originContourSecs int,
 	nearbyNodes []transit.Node,
-) (*valhalla.IsochroneResponse, *valhalla.MatrixResponse, map[string]bool, error) {
+) (*valhalla.IsochroneResponse, *valhalla.MatrixResponse, map[string]transitAccessLeg, error) {
 	var (
 		originIso   *valhalla.IsochroneResponse
 		matrixResp  *valhalla.MatrixResponse
-		rodeTransit map[string]bool
+		transitLegs map[string]transitAccessLeg
 	)
 
 	g, gctx := errgroup.WithContext(ctx)
@@ -320,11 +320,11 @@ func (c *chainImpl) originAndAccess(
 
 	if len(nearbyNodes) > 0 {
 		g.Go(func() error {
-			m, rode, mErr := c.accessMatrix(gctx, req, costing, nearbyNodes)
+			m, legs, mErr := c.accessMatrix(gctx, req, costing, nearbyNodes)
 			if mErr != nil {
 				return mErr
 			}
-			matrixResp, rodeTransit = m, rode
+			matrixResp, transitLegs = m, legs
 			return nil
 		})
 	}
@@ -332,7 +332,7 @@ func (c *chainImpl) originAndAccess(
 	if err := g.Wait(); err != nil {
 		return nil, nil, nil, err
 	}
-	return originIso, matrixResp, rodeTransit, nil
+	return originIso, matrixResp, transitLegs, nil
 }
 
 func (c *chainImpl) accessMatrix(
@@ -340,7 +340,7 @@ func (c *chainImpl) accessMatrix(
 	req ChainRequest,
 	costing valhalla.Costing,
 	nearbyNodes []transit.Node,
-) (*valhalla.MatrixResponse, map[string]bool, error) {
+) (*valhalla.MatrixResponse, map[string]transitAccessLeg, error) {
 	if !costing.SupportsMatrix() {
 		return c.pairwiseAccess(ctx, req, costing, nearbyNodes)
 	}
@@ -364,9 +364,10 @@ func (c *chainImpl) pairwiseAccess(
 	req ChainRequest,
 	costing valhalla.Costing,
 	nearbyNodes []transit.Node,
-) (*valhalla.MatrixResponse, map[string]bool, error) {
+) (*valhalla.MatrixResponse, map[string]transitAccessLeg, error) {
 	cells := make([]valhalla.MatrixCell, len(nearbyNodes))
-	rodeBy := make([]bool, len(nearbyNodes))
+	legs := make([]transitAccessLeg, len(nearbyNodes))
+	splitErrs := make([]error, len(nearbyNodes))
 	var routed, rode atomic.Int64
 
 	concurrency := c.limits.MaxConcurrency
@@ -406,7 +407,23 @@ func (c *chainImpl) pairwiseAccess(
 			// access time — dropping it would shrink the surface to stations
 			// genuinely best reached on transit — but it must not be served as
 			// a transit time, so the fact travels with the station (SPA-336).
-			rodeBy[i] = route.RodeTransit
+			legs[i] = transitAccessLeg{rodeTransit: route.RodeTransit}
+			if b, bErr := accessBreakdownOf(route); bErr != nil {
+				// The total still stands, so the station is kept and only its
+				// split is withheld: a split that does not add up to the time
+				// beside it would be worse than none. Per station this is
+				// only Debug: a response shape that stops reconciling would
+				// otherwise warn up to MaxAccessRoutes times a job. The job's
+				// one summary line below warns instead, with a sample.
+				splitErrs[i] = bErr
+				c.log.Debug(gctx, "chain: transit access leg does not reconcile into walk, wait and ride, reporting its time without a breakdown",
+					"compile_job_id", req.CompileJobID,
+					"station_slug", n.Slug,
+					"access_secs", route.Time,
+					"err", bErr.Error())
+			} else {
+				legs[i].breakdown = b
+			}
 			cells[i] = valhalla.Cell(route.Time, route.DistanceKm)
 			return nil
 		})
@@ -419,18 +436,75 @@ func (c *chainImpl) pairwiseAccess(
 	c.metrics.TransitAccess(true, int(nRode))
 	c.metrics.TransitAccess(false, int(routed.Load()-nRode))
 
-	c.log.Info(ctx, "chain: transit access legs routed",
+	var (
+		unreconciled int
+		sample       error
+	)
+	for _, e := range splitErrs {
+		if e == nil {
+			continue
+		}
+		if unreconciled == 0 {
+			sample = e
+		}
+		unreconciled++
+	}
+	logArgs := []any{
 		"compile_job_id", req.CompileJobID,
 		"asked", len(nearbyNodes),
 		"routed", routed.Load(),
 		"rode_transit", rode.Load(),
-		"departs_at", req.DepartAt.Format(time.RFC3339))
-
-	rodeTransit := make(map[string]bool, len(nearbyNodes))
-	for i, n := range nearbyNodes {
-		rodeTransit[n.Slug] = rodeBy[i]
+		"unreconciled", unreconciled,
+		"departs_at", req.DepartAt.Format(time.RFC3339),
 	}
-	return &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{cells}}, rodeTransit, nil
+	if sample == nil {
+		c.log.Info(ctx, "chain: transit access legs routed", logArgs...)
+	} else {
+		// One warning per job, whatever the count, so a response shape that
+		// stops reconciling is loud without flooding the log. The sample is
+		// the first unreconciled station in request order, so it is stable
+		// across reruns; the rest are at Debug above.
+		c.log.Warn(ctx, "chain: transit access legs routed, some without a walk, wait and ride split",
+			append(logArgs, "unreconciled_sample", sample.Error())...)
+	}
+
+	bySlug := make(map[string]transitAccessLeg, len(nearbyNodes))
+	for i, n := range nearbyNodes {
+		bySlug[n.Slug] = legs[i]
+	}
+	return &valhalla.MatrixResponse{SourcesToTargets: [][]valhalla.MatrixCell{cells}}, bySlug, nil
+}
+
+type transitAccessLeg struct {
+	rodeTransit bool
+	breakdown   *AccessBreakdown
+}
+
+func accessBreakdownOf(route *valhalla.RouteResponse) (*AccessBreakdown, error) {
+	if route.BreakdownErr != nil {
+		return nil, route.BreakdownErr
+	}
+	b := route.Breakdown
+	if b == nil {
+		return nil, nil
+	}
+	// The client promises this; it is asserted again here because the chain
+	// result is where a split that does not sum would actually mislead.
+	if b.Total() != route.Time || b.WalkSecs < 0 || b.WaitSecs < 0 || b.RideSecs < 0 {
+		return nil, fmt.Errorf("%w: walk %d + wait %d + ride %d s is not the %d s access time",
+			valhalla.ErrUnreconciled, b.WalkSecs, b.WaitSecs, b.RideSecs, route.Time)
+	}
+	// Waiting or riding on a leg that boarded nothing would contradict the
+	// access_rode_transit printed beside it.
+	if !route.RodeTransit && b.WaitSecs+b.RideSecs != 0 {
+		return nil, fmt.Errorf("%w: a walked leg reports %d s waiting and %d s riding",
+			valhalla.ErrUnreconciled, b.WaitSecs, b.RideSecs)
+	}
+	return &AccessBreakdown{
+		AccessWalkSecs: b.WalkSecs,
+		AccessWaitSecs: b.WaitSecs,
+		AccessRideSecs: b.RideSecs,
+	}, nil
 }
 
 const snapSlackKm = 2 * float64(valhalla.LocationRadiusM) / 1000.0
@@ -504,13 +578,14 @@ type egressCandidate struct {
 	legs          []Leg
 	viaTransit    bool
 	rodeTransit   *bool
+	breakdown     *AccessBreakdown
 }
 
 func (c *chainImpl) bestEgressPerNode(
 	req ChainRequest,
 	nodes []transit.Node,
 	accessSecs map[string]int,
-	accessRodeTransit map[string]bool,
+	transitLegs map[string]transitAccessLeg,
 ) ([]egressCandidate, map[string]transit.Reached) {
 	budgetSecs := req.BudgetMins * 60
 	reached := c.graph.Search(accessSecs)
@@ -528,10 +603,20 @@ func (c *chainImpl) bestEgressPerNode(
 		aSecs := accessSecs[journey.SourceSlug]
 		// Only a pairwise transit access leg can disagree with the mode it
 		// was asked in; every other mode leaves the field off the wire.
-		var rode *bool
-		if accessRodeTransit != nil {
-			r := accessRodeTransit[journey.SourceSlug]
-			rode = &r
+		// Both labels are keyed on the journey's source, exactly as aSecs is:
+		// a station reached by riding the scenario reports the access leg to
+		// the station it boarded at, because that is what its access_secs is.
+		var (
+			rode      *bool
+			breakdown *AccessBreakdown
+		)
+		if transitLegs != nil {
+			leg := transitLegs[journey.SourceSlug]
+			rode = &leg.rodeTransit
+			if leg.breakdown != nil {
+				b := *leg.breakdown
+				breakdown = &b
+			}
 		}
 		candidates = append(candidates, egressCandidate{
 			node:          n,
@@ -543,6 +628,7 @@ func (c *chainImpl) bestEgressPerNode(
 			legs:          legsTo(n.Slug, reached),
 			viaTransit:    journey.PredecessorSlug != "",
 			rodeTransit:   rode,
+			breakdown:     breakdown,
 		})
 	}
 	return candidates, reached
@@ -787,6 +873,7 @@ func (c *chainImpl) assemble(
 			Legs:            ec.legs,
 
 			AccessRodeTransit: ec.rodeTransit,
+			AccessBreakdown:   ec.breakdown,
 		})
 	}
 

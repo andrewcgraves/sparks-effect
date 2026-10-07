@@ -518,3 +518,51 @@ Egress is the same: a per-station 400 or timeout drops that polygon
 rather than failing the job, as long as another egress (or a cache hit)
 remains. If every egress miss fails transiently, the job is still
 transient. A rate limit still fails the job.
+
+### Where the access time goes
+
+A transit access time is door-to-door wall clock, schedule wait included
+([ADR-0004](https://github.com/andrewcgraves/sparks-effect-api/blob/main/docs/adr/0004-transit-isochrone-claim-and-reported-time.md)),
+so every reachable station with a transit access leg also reports
+`access_walk_secs`, `access_wait_secs` and `access_ride_secs` beside
+`access_secs`, summing to it exactly (SPA-348). `access_secs` is unchanged.
+A walked leg reports its whole time as walk with explicit zeros; walk, bike and
+drive carry none of the three, since the matrix that serves them has no
+maneuvers. Like `access_rode_transit`, a station reached by riding the scenario
+carries the split of the station its journey started at, because that is the
+leg its `access_secs` is.
+
+The split comes from each `/route` maneuver's `time` and, for a transit
+maneuver, its stops' `departure_date_time` and `arrival_date_time`:
+
+- **Walk** — the non-transit maneuvers.
+- **Ride** — the timetabled ride: the alighting stop's arrival clock minus the
+  boarding stop's departure clock, capped at the maneuver's `time`.
+- **Wait** — taken *out of* the transit maneuver, never added beside it.
+  Valhalla folds the platform wait into the maneuver's own `time` (SPA-335: a
+  16.7 min maneuver that was a 9.0 min ride from 08:31 to 08:40 and a 7.7 min
+  wait), so the wait is whatever the maneuver holds beyond the ride. Each
+  vehicle on a leg with a transfer has its own.
+
+A leg Valhalla walked end to end is all walk without any of this: there is
+nothing to take out of it.
+
+Valhalla's stop clocks are minute precision and carry their UTC offset
+(`2026-09-02T08:31-07:00`), while the origin's echoed `date_time` is a bare
+local clock; all of them are read as local wall clocks, the offset dropped. The
+wait is cross-checked against the clock gap from reaching the platform — the
+origin's `date_time` plus every maneuver before — to the boarding departure.
+SPA-335's gap was 8.1 min against the 7.7 min wait, 24 s apart: the boarding
+clock's minute rounding. Up to `ReconcileToleranceSecs` (60 s, one clock tick)
+either way is accepted; more, or a transit maneuver without both clocks, and
+the split is *unreconciled*. Separately, the maneuvers must sum to
+`summary.time` within `SummaryDriftToleranceSecs` (2 s; SPA-335's maneuvers summed
+exactly), so the walk cannot absorb a difference between them. The total
+rounds to whole seconds and the walk carries that rounding residue, so the
+three sum to `access_secs` exactly. An unreconciled split is withheld while the
+station and its `access_secs` are kept: the total is still right, and a split
+that does not sum to it would be worse than none. Each one is logged at Debug;
+the job's `transit access legs routed` line counts them as `unreconciled` and
+is raised to a single Warn, with the first one's error as
+`unreconciled_sample`, whenever that count is not zero. `make acceptance`
+checks the split reconciles on a real ridden route.

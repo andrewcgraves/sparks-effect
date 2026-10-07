@@ -29,12 +29,35 @@ origin ───────────────▶ station ─────�
 
 | Term | Definition |
 | --- | --- |
-| **Access leg** | Getting from the origin to a station, routed by Valhalla in the requested mode. One Matrix call for walk/bike/drive; pairwise `/route` for transit, because Valhalla's Matrix rejects `multimodal`. A transit access leg may not ride anything — Valhalla walks the whole way when it finds no service — so each reachable station says whether its own access leg did, as `access_rode_transit` |
+| **Access leg** | Getting from the origin to a station, routed by Valhalla in the requested mode. One Matrix call for walk/bike/drive; pairwise `/route` for transit, because Valhalla's Matrix rejects `multimodal`. A transit access leg may not ride anything — Valhalla walks the whole way when it finds no service — so each reachable station says whether its own access leg did, as `access_rode_transit`, and how its access time splits into walk, wait and ride (below) |
 | **Egress leg** | Getting *away* from a station the rider reached, drawn as an isochrone sized by whatever budget is left. This is the bulk of the work — one call per station reached by riding transit |
 | **Origin isochrone** | The surface reachable from the origin without boarding anything. A station reached by walking alone needs no egress call: the origin polygon already covers its own reach |
 | **Journey** | The graph-side part: everything between stepping onto the first vehicle and stepping off the last, as one `transit.Reached` value. Access time in, ride and dwell and boarding wait accumulated, predecessor chain recorded |
 | **Leg** | One hop of that journey — a single `Edge` traversed, with its service, seconds and dwell. `Legs` on a reachable station is the whole ridden path, oldest first |
 | **Publication** | The act of the API publishing the queue message, and by extension the frozen inputs it carries. "The publication fixed the station positions" means: the graph in the message is immutable, so anything keyed on its compile job id can never go stale. Not to be confused with a **published** service in sparks-effect-api ([ADR-0005](https://github.com/andrewcgraves/sparks-effect-api/blob/main/docs/adr/0005-publishing-an-authored-service.md)): the same freezing one level up, pinning the compile job whose graph every message for that service then carries. This repository never sees that sense; here the word always means the queue message |
+
+## Access time and its split
+
+| Term | Definition |
+| --- | --- |
+| **Access time** | Door-to-door elapsed wall clock for the access leg, from leaving the origin to arriving at the boarding station, including the wait for the first scheduled departure. `access_secs`. It is what Valhalla's `summary.time` says for a depart-at request, and it is the figure the journey is seeded with ([ADR-0004](https://github.com/andrewcgraves/sparks-effect-api/blob/main/docs/adr/0004-transit-isochrone-claim-and-reported-time.md)) |
+| **In-motion time** | Walking plus riding with every wait removed: `access_walk_secs + access_ride_secs`. A component of an access time, never a substitute for one. Not the API's **run time** — that is a compiled edge's time in motion with dwell excluded, one level down in the model; in-motion time is a whole access leg and keeps whatever dwell Valhalla's ride includes |
+| **Access split** | The access time as `access_walk_secs`, `access_wait_secs` and `access_ride_secs`, which sum to `access_secs` exactly. Transit access legs only: the matrix that serves walk, bike and drive has no maneuvers to split, so those modes carry none. A leg Valhalla walked end to end is all walk, with an explicit zero wait and zero ride, beside `access_rode_transit: false` |
+| **Access wait** | `access_wait_secs`: every wait on the access leg — for its first scheduled departure, and again at each transfer — the access leg's counterpart of the API's **boarding wait**, measured off Valhalla's timetable rather than charged by a policy. Named to sit beside `board_wait_secs`, and never overlapping it: `access_wait_secs` is inside `access_secs`, while `board_wait_secs` is the boarding wait for the authored service ridden on from the boarding station, which the graph search charges after the access time. Both are reported beside their totals, neither is subtracted from them |
+
+Valhalla folds the platform wait **inside** the transit maneuver's own `time`; there
+is no wait field. So the ride is the timetabled one — the alighting stop's arrival
+clock minus the boarding stop's departure clock — and the wait is what the maneuver
+holds beyond it, taken out of the maneuver rather than added beside it. That wait is
+cross-checked against the clock gap from reaching the platform to the boarding
+departure. Valhalla's stop clocks are minute precision, so the two may miss by up to
+a minute (SPA-335 measured 24 s); past that the clocks and the seconds describe
+different trips, and the split is **unreconciled**: withheld, the station and its
+access time kept.
+
+A station reached by riding the scenario has the access time of the station its
+journey started at, so it carries that station's split too, as it does that
+station's `access_rode_transit`.
 
 ## Reached vs reachable
 

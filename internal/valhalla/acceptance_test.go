@@ -64,6 +64,41 @@ func TestAcceptanceTransitRouteBoardsAService(t *testing.T) {
 	}
 }
 
+func TestAcceptanceRiddenRouteSplitsIntoWalkWaitAndRide(t *testing.T) {
+	// The unit fixtures mirror the response SPA-335 recorded; this asks a real
+	// server that the fields the split reads — each maneuver's time, the
+	// transit stops' departure and arrival clocks in the offset-bearing form
+	// the unit fixtures assume — are where they are read from, and that the
+	// boarding clock agrees with the wait the maneuver leaves to within
+	// ReconcileToleranceSecs.
+	client := acceptanceClient(t)
+	at := acceptanceDeparture(t)
+
+	route, err := client.Route(context.Background(), valhalla.RouteRequest{
+		Origin:      wilshireWestern,
+		Destination: unionStation,
+		Costing:     valhalla.CostingMultimodal,
+		DepartAt:    at,
+	})
+	if err != nil {
+		t.Fatalf("Route(multimodal) departing %s: %v", at.Format(time.RFC3339), err)
+	}
+	if !route.RodeTransit {
+		t.Skipf("walked the whole way departing %s; TestAcceptanceTransitRouteBoardsAService says why", at.Format(time.RFC3339))
+	}
+	if route.BreakdownErr != nil {
+		t.Fatalf("a ridden route did not reconcile into walk, wait and ride: %v", route.BreakdownErr)
+	}
+	b := route.Breakdown
+	t.Logf("Wilshire/Western to Union Station: %d s = walk %d + wait %d + ride %d", route.Time, b.WalkSecs, b.WaitSecs, b.RideSecs)
+	if b.Total() != route.Time {
+		t.Errorf("walk + wait + ride = %d s, want the %d s total", b.Total(), route.Time)
+	}
+	if b.RideSecs <= 0 {
+		t.Errorf("ride = %d s on a route that boarded a service", b.RideSecs)
+	}
+}
+
 func TestAcceptanceTransitBeatsWalkingOnTheSamePair(t *testing.T) {
 	client := acceptanceClient(t)
 	at := acceptanceDeparture(t)
