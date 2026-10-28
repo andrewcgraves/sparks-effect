@@ -2,6 +2,7 @@ package logger
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -11,17 +12,33 @@ type Logger struct {
 	sl *slog.Logger
 }
 
-func New(out io.Writer, debug bool) *Logger {
+func New(out io.Writer, debug bool, also ...slog.Handler) *Logger {
 	level := slog.LevelInfo
 	if debug {
 		level = slog.LevelDebug
 	}
-	handler := traceHandler{Handler: slog.NewJSONHandler(out, &slog.HandlerOptions{Level: level})}
-	return &Logger{sl: slog.New(handler)}
+	var handler slog.Handler = slog.NewJSONHandler(out, &slog.HandlerOptions{Level: level})
+	if copies := nonNil(also); len(copies) > 0 {
+		// stderr stays the primary sink — Railway's log viewer reads it — and
+		// an exporter is a copy of it, not a replacement. The level gate sits
+		// on the tee because the OTLP bridge accepts every level itself.
+		handler = teeHandler{level: level, handlers: append([]slog.Handler{handler}, copies...)}
+	}
+	return &Logger{sl: slog.New(traceHandler{Handler: handler})}
 }
 
-func Default(debug bool) *Logger {
-	return New(os.Stderr, debug)
+func Default(debug bool, also ...slog.Handler) *Logger {
+	return New(os.Stderr, debug, also...)
+}
+
+func nonNil(handlers []slog.Handler) []slog.Handler {
+	var out []slog.Handler
+	for _, h := range handlers {
+		if h != nil {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 func Discard() *Logger {
@@ -75,4 +92,39 @@ func (h traceHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h traceHandler) WithGroup(name string) slog.Handler {
 	return traceHandler{Handler: h.Handler.WithGroup(name)}
+}
+
+type teeHandler struct {
+	level    slog.Level
+	handlers []slog.Handler
+}
+
+func (h teeHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= h.level
+}
+
+func (h teeHandler) Handle(ctx context.Context, r slog.Record) error {
+	var errs []error
+	for _, handler := range h.handlers {
+		if handler.Enabled(ctx, r.Level) {
+			errs = append(errs, handler.Handle(ctx, r))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (h teeHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	out := make([]slog.Handler, len(h.handlers))
+	for i, handler := range h.handlers {
+		out[i] = handler.WithAttrs(attrs)
+	}
+	return teeHandler{level: h.level, handlers: out}
+}
+
+func (h teeHandler) WithGroup(name string) slog.Handler {
+	out := make([]slog.Handler, len(h.handlers))
+	for i, handler := range h.handlers {
+		out[i] = handler.WithGroup(name)
+	}
+	return teeHandler{level: h.level, handlers: out}
 }

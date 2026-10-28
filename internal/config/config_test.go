@@ -277,3 +277,14 @@ func TestAPITimeoutIsOverridable(t *testing.T) {
 		t.Errorf("APITimeout = %s, want 5s", got)
 	}
 }
+
+func TestExportLogsFollowsTheOTLPEndpoint(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	if config.Load().ExportLogs {
+		t.Error("ExportLogs = true with no endpoint; logs must stay on stderr only by default")
+	}
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://otlp-gateway-prod-us-west-0.grafana.net/otlp")
+	if !config.Load().ExportLogs {
+		t.Error("ExportLogs = false with an endpoint set")
+	}
+}

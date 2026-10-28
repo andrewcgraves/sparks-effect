@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -131,5 +132,63 @@ func TestTraceID_roundTrips(t *testing.T) {
 
 	if _, ok := logger.TraceID(context.Background()); ok {
 		t.Error("TraceID reported ok=true on a context with no trace id")
+	}
+}
+
+func TestNew_copiesEveryLineToTheExtraHandler(t *testing.T) {
+	var primary, copied bytes.Buffer
+	lg := logger.New(&primary, false, slog.NewJSONHandler(&copied, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ctx := logger.WithTraceID(context.Background(), "trace-tee")
+
+	lg.Debug(ctx, "filtered by the level gate")
+	lg.Info(ctx, "shipped", "job_id", "job-1")
+
+	for name, buf := range map[string]*bytes.Buffer{"primary": &primary, "copy": &copied} {
+		lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+		if len(lines) != 1 {
+			t.Fatalf("%s got %d lines, want 1 (debug is gated for both sinks):\n%s", name, len(lines), buf.String())
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(lines[0]), &parsed); err != nil {
+			t.Fatalf("%s line is not valid JSON: %v", name, err)
+		}
+		if parsed["msg"] != "shipped" || parsed["job_id"] != "job-1" || parsed["trace_id"] != "trace-tee" {
+			t.Errorf("%s line = %v, want msg, job_id and trace_id", name, parsed)
+		}
+	}
+}
+
+func TestNew_ignoresNilExtraHandlers(t *testing.T) {
+	var buf bytes.Buffer
+	lg := logger.New(&buf, false, nil)
+	lg.Info(context.Background(), "still writes")
+	if !strings.Contains(buf.String(), `"still writes"`) {
+		t.Errorf("a nil extra handler broke the primary sink: %q", buf.String())
+	}
+}
+
+func TestOTLP_disabledHandsBackNothing(t *testing.T) {
+	handler, shutdown, err := logger.OTLP(context.Background(), false)
+	if err != nil || handler != nil {
+		t.Fatalf("OTLP(disabled) = %v, %v; want nil handler and nil error", handler, err)
+	}
+	if err := shutdown(context.Background()); err != nil {
+		t.Errorf("noop shutdown = %v", err)
+	}
+}
+
+func TestOTLP_enabledBuildsAHandlerFromTheEnvironment(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	handler, shutdown, err := logger.OTLP(context.Background(), true)
+	if err != nil {
+		t.Fatalf("OTLP(enabled) = %v", err)
+	}
+	if handler == nil {
+		t.Fatal("OTLP(enabled) handed back no handler")
+	}
+	// Nothing was logged, so shutdown has nothing to flush to the dead
+	// endpoint and must come back clean.
+	if err := shutdown(context.Background()); err != nil {
+		t.Errorf("shutdown with no records = %v", err)
 	}
 }

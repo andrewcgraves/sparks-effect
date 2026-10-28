@@ -26,6 +26,7 @@ type Config struct {
 	Debug             bool
 	MetricsAddr       string
 	StuckAfter        time.Duration
+	ExportLogs        bool
 }
 
 const defaultRoutingQueue = "routing.jobs"
@@ -57,6 +58,7 @@ const (
 	envVerbose           = "VERBOSE"
 	envMetricsAddr       = "METRICS_ADDR"
 	envStuckAfter        = "WORKER_STUCK_AFTER"
+	envOTLPEndpoint      = "OTEL_EXPORTER_OTLP_ENDPOINT"
 )
 
 var knownEnv = map[string]struct{}{
@@ -80,6 +82,7 @@ var knownEnv = map[string]struct{}{
 	envVerbose:           {},
 	envMetricsAddr:       {},
 	envStuckAfter:        {},
+	envOTLPEndpoint:      {},
 }
 
 var watchedPrefixes = []string{
@@ -116,6 +119,9 @@ func Load() Config {
 		Debug:             os.Getenv(envLogLevel) == "debug" || os.Getenv(envVerbose) == "true",
 		MetricsAddr:       getEnv(envMetricsAddr, ":9090"),
 		StuckAfter:        envDuration(envStuckAfter, defaultStuckAfter),
+		// The exporter reads the OTEL_EXPORTER_OTLP_* variables itself; this
+		// only decides whether to build one, as the API's config does.
+		ExportLogs: os.Getenv(envOTLPEndpoint) != "",
 	}
 }
 

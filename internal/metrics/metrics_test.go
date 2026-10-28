@@ -25,6 +25,7 @@ func TestHandlerExposesZeroSeries(t *testing.T) {
 		"valhalla_errors_total",
 		"transit_access_legs_total",
 		"routing_job_in_progress_seconds",
+		"routing_worker_start_time_seconds",
 	} {
 		if !strings.Contains(body, name) {
 			t.Errorf("/metrics is missing %s:\n%s", name, body)
@@ -83,6 +84,21 @@ func TestJobInProgressGaugeReadsTheObservedDuration(t *testing.T) {
 	for _, want := range []string{
 		"# TYPE routing_job_in_progress_seconds gauge",
 		"routing_job_in_progress_seconds 90.5\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics response missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestStartTimeGaugeIsTheBootClock(t *testing.T) {
+	m := &Set{}
+	m.MarkStarted(time.Date(2026, time.October, 24, 12, 0, 0, 0, time.UTC))
+
+	body := scrape(t, m)
+	for _, want := range []string{
+		"# TYPE routing_worker_start_time_seconds gauge",
+		"routing_worker_start_time_seconds 1792843200\n",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics response missing %q:\n%s", want, body)

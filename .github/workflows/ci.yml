@@ -1,5 +1,8 @@
 name: CI
 
+# Tags are deliberately not a trigger here: a release promotes an image this
+# workflow already built and tested on `main`, and rebuilding it would defeat
+# that. See `release.yml`.
 on:
   push:
     branches: [main]
@@ -85,6 +88,12 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
+          # `sha-<commit>` is the promotable artifact: immutable, and what
+          # `release.yml` re-tags as `:prd` when a release tag names this
+          # commit. `staging` is a moving tag for whatever the trunk last
+          # built, and what the routing-worker-staging Railway service pins.
+          # No `latest` — a moving tag something deploys from is how
+          # production drifts with nobody choosing to move it.
           tags: |
             type=sha
             type=raw,value=staging
@@ -97,9 +106,42 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-  # Staging is whatever `main` last published. Linear's worker staging pipeline
-  # is a separate stream from production because production is a pin bump in
-  # kustomize-config (SPA-267), not a tag or re-tag in this repo.
+  # Moving `:staging` does not by itself make Railway pull it. Railway's own
+  # image auto-update polls GHCR and catches up within hours; this job is what
+  # makes a merge land on staging within a minute. It is its own job, not a
+  # step of `publish`, because the Railway token lives on the `production`
+  # GitHub environment (both worker services share one Railway environment,
+  # so one project token covers them) and the image publish should not wait
+  # on anything that environment ever requires.
+  deploy-staging:
+    name: Redeploy the staging Railway service
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      # Skipped with a notice when the token is not set, rather than failing
+      # a publish that did in fact push the image.
+      - name: Redeploy routing-worker-staging
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RAILWAY_TOKEN:-}" ]]; then
+            echo "::notice::RAILWAY_TOKEN is not set — image is tagged :staging; add a Railway project token to the production GitHub environment, or wait for Railway's image auto-update"
+            exit 0
+          fi
+
+          npm install --global @railway/cli
+
+          # The token is scoped to one Railway environment and that
+          # environment holds both worker services, so the service name is
+          # what keeps this off production.
+          railway redeploy --service routing-worker-staging --yes
+
+  # Staging is whatever `main` last published. Linear's staging pipeline is a
+  # separate stream from production because the two environments can (and do)
+  # hold different commits at the same time — see docs/releases.md.
   linear-staging:
     name: Record staging release in Linear
     needs: [check, build, publish]
@@ -116,7 +158,7 @@ jobs:
 
       # Secrets cannot be referenced in `if:` (GitHub treats that as a
       # workflow-file error), so the empty check lives in a shell step and
-      # gates the action via an output.
+      # gates the action via an output, same idea as RAILWAY_TOKEN.
       - name: Check for the staging pipeline key
         id: linear
         env:
@@ -129,6 +171,19 @@ jobs:
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # install.sh inside linear-release-action downloads its CLI with a bare
+      # curl and no retry, so a single connection reset from github.com fails
+      # the job (curl exit 35). curl reads $CURL_HOME/.curlrc before its own
+      # arguments, and the action's composite steps inherit $GITHUB_ENV, so
+      # this makes every curl in the action retry without forking it.
+      - name: Retry the Linear CLI download on transient network errors
+        if: steps.linear.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'retry = 5' 'retry-all-errors' 'retry-delay = 3' 'retry-max-time = 120' \
+            > "$RUNNER_TEMP/.curlrc"
+          echo "CURL_HOME=$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Sync Linear staging release
         if: steps.linear.outputs.configured == 'true'

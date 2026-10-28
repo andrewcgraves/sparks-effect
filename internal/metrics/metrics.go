@@ -38,6 +38,17 @@ type Set struct {
 	valhalla      [3]atomic.Uint64
 	transitAccess [2]atomic.Uint64
 	inProgress    atomic.Pointer[func() time.Duration]
+	startTime     atomic.Int64
+}
+
+func (m *Set) MarkStarted(at time.Time) {
+	if m == nil {
+		return
+	}
+	// Railway has no kube_pod_container_status_restarts_total, so a restart
+	// loop has to be visible from the worker's own scrape: each boot stamps a
+	// new value here, and changes() over this series counts the restarts.
+	m.startTime.Store(at.Unix())
 }
 
 func (m *Set) Job(outcome string) {
@@ -185,6 +196,9 @@ func (m *Set) writeMetrics(w http.ResponseWriter, _ *http.Request) {
 	write(w, "# HELP routing_job_in_progress_seconds How long the job in hand has been running; 0 when idle.\n")
 	write(w, "# TYPE routing_job_in_progress_seconds gauge\n")
 	write(w, "routing_job_in_progress_seconds %g\n", m.jobInProgressSeconds())
+	write(w, "# HELP routing_worker_start_time_seconds Unix time this worker process started; 0 until boot stamps it.\n")
+	write(w, "# TYPE routing_worker_start_time_seconds gauge\n")
+	write(w, "routing_worker_start_time_seconds %d\n", m.startTime.Load())
 }
 
 func writeFamily(w io.Writer, name, help, label string, values []string, counters []atomic.Uint64) {

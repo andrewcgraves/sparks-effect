@@ -51,22 +51,48 @@ func loadDotenv(path string) error {
 }
 
 func main() {
+	os.Exit(start())
+}
+
+// start returns the exit code instead of calling os.Exit so the deferred
+// OTLP flush runs: os.Exit skips defers, and the lines worth exporting most
+// are the fatal ones written just before exiting.
+func start() int {
 	opts, err := parseArgs(os.Args[1:])
 	if err != nil {
-		os.Exit(2)
+		return 2
 	}
 	if err := loadDotenv(opts.envFile); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return 1
 	}
 
 	cfg := config.Load()
-	log := logger.Default(cfg.Debug)
 	ctx := context.Background()
+
+	// -check promises no network, and the exporter would open a connection
+	// on its first flush, so it stays off there.
+	otlp, flushLogs, err := logger.OTLP(ctx, cfg.ExportLogs && !opts.check)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = flushLogs(flushCtx)
+	}()
+	log := logger.Default(cfg.Debug, otlp)
+	switch {
+	case otlp != nil:
+		log.Info(ctx, "logger: exporting logs over OTLP")
+	case !cfg.ExportLogs:
+		log.Info(ctx, "logger: OTEL_EXPORTER_OTLP_ENDPOINT not set; logs stay on stderr")
+	}
 
 	if err := inspectConfig(cfg, log); err != nil {
 		log.Error(ctx, "fatal", "err", err.Error())
-		os.Exit(1)
+		return 1
 	}
 	if opts.check {
 		log.Info(ctx, "config: ok",
@@ -74,13 +100,14 @@ func main() {
 			"routing_queue", cfg.RoutingQueue,
 			"metrics_addr", cfg.MetricsAddr,
 			"stuck_after", cfg.StuckAfter.String())
-		return
+		return 0
 	}
 
 	if err := run(cfg, log); err != nil {
 		log.Error(ctx, "fatal", "err", err.Error())
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 // inspectConfig asserts the process env is one this binary can honour. It
@@ -105,6 +132,8 @@ const heartbeatEvery = 30 * time.Second
 func run(cfg config.Config, log *logger.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	metrics.Process.MarkStarted(time.Now())
 
 	connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

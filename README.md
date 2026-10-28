@@ -210,9 +210,16 @@ puts the original bytes back unchanged, so the counter would never advance.
 
 ## Branching and releases
 
-One trunk: `main`. Branch from it, PR into it. Production runs whichever
-`sha-<commit>` image `kustomize-config` pins — see
-[`docs/releases.md`](docs/releases.md).
+One trunk: `main`. Branch from it, PR into it. Staging follows `main`: every
+push publishes `sha-<commit>` and moves `:staging`, and CI redeploys the
+`routing-worker-staging` Railway service in the same run. Production is
+promoted by tag, the same way as the API and the website: push a `vX.Y.Z` tag
+on a commit that is already on `main`, and the **Release** workflow re-tags
+that commit's existing image as `:prd` (nothing is rebuilt) and redeploys
+`routing-worker`.
+
+To roll back, release an older tag: Actions → Release → Run workflow → pass
+the tag. See [`docs/releases.md`](docs/releases.md).
 
 ## Running it
 
@@ -261,7 +268,34 @@ default, unset — stays at info level: a job's arrival, the decisions that
 shape its result (contour clamping, matrix truncation, cache hits/misses),
 and its outcome, but not the blow-by-blow.
 
-The worker also serves five Prometheus counters and one gauge on
+### Shipping logs to Grafana Cloud
+
+On Railway nothing tails the container's stderr into Loki the way Alloy
+tailed the pod's, so with `OTEL_EXPORTER_OTLP_ENDPOINT` set the worker also
+ships every log line it writes as an OTLP log record, to the same Grafana
+Cloud gateway and with the same credentials the API uses:
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod-us-west-0.grafana.net/otlp
+OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64 of instance-id:token>"
+OTEL_RESOURCE_ATTRIBUTES=service.namespace=production   # staging on routing-worker-staging
+```
+
+stderr stays the primary sink and Railway's log viewer keeps reading it; the
+export is a copy, gated by the same `LOG_LEVEL`. The resource carries
+`service.name=sparks-effect-routing-worker` and the `service.namespace` from
+`OTEL_RESOURCE_ATTRIBUTES`, which Grafana folds into `job`, so the two worker
+services stay apart in Loki exactly as the API's staging and production do:
+
+```logql
+{service_name="sparks-effect-routing-worker", service_namespace="production"} | trace_id="…"
+```
+
+With no endpoint set nothing is exported and boot logs one `info` line saying
+so. `-check` never builds the exporter, so a config check still opens no
+connection. Fatal lines are flushed before the process exits.
+
+The worker also serves five Prometheus counters and two gauges on
 `:9090/metrics` (override with `METRICS_ADDR`):
 
 | Metric | Labels | What it counts |
@@ -272,6 +306,7 @@ The worker also serves five Prometheus counters and one gauge on
 | `valhalla_errors_total` | `class=bad_request\|rate_limit\|upstream` | Errors from the Valhalla client |
 | `transit_access_legs_total` | `rode=true\|false` | Pairwise transit access legs that Valhalla successfully routed, labelled by whether they actually rode |
 | `routing_job_in_progress_seconds` (gauge) | — | How long the job in hand has been running; 0 when idle |
+| `routing_worker_start_time_seconds` (gauge) | — | Unix time the process booted. Railway has no restart counter, so the restart-loop alert is `changes(routing_worker_start_time_seconds[1h]) > 3` |
 
 Job, cache, and Valhalla labels are the handler and client vocabulary already
 in use (`Outcome.String()`, `ErrBadRequest` / `ErrRateLimit` / `ErrUpstream`).
