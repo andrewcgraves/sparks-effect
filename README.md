@@ -535,6 +535,20 @@ This suite is part of the post-cycle procedure, not CI — it needs a real
 tileset. kustomize-config's `make verify-cycle` port-forwards the Valhalla
 Service and runs `make acceptance` from a checkout of this repository after
 its in-pod checks; a failure there is a failed cycle (SPA-339).
+
+On Railway, Valhalla has no public address and Railway's SSH refuses a bare
+`ssh -N -L` tunnel, so the suite runs inside the Valhalla container instead,
+against its own loopback. It reads no files, only `TEST_VALHALLA_URL` (and
+`TEST_TRANSIT_DEPART_AT`), so a static test binary is all it needs:
+
+```
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c -o acceptance.test ./internal/valhalla/
+railway ssh --service valhalla -- 'cat > /tmp/acceptance.test && chmod +x /tmp/acceptance.test' < acceptance.test
+railway ssh --service valhalla -- 'TEST_VALHALLA_URL=http://127.0.0.1:8002 /tmp/acceptance.test -test.run Acceptance -test.v; rm -f /tmp/acceptance.test'
+```
+
+The binary lands in the container's `/tmp`, not the tiles volume, and is
+removed after the run.
 `TEST_TRANSIT_DEPART_AT=YYYY-MM-DDTHH:MM` asks about a specific service date,
 which is how "do the feeds on the volume still cover next week?" gets answered
 before it turns into an undersized isochrone.
