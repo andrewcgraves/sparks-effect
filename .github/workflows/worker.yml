@@ -52,7 +52,7 @@ jobs:
     name: Test, lint, vet
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The exact patch comes from go.mod's `go` directive. It moves together
       # with the Dockerfile's golang image.
@@ -80,7 +80,7 @@ jobs:
     name: API↔worker contract
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # No setup-go and no network: check-contract is a diff between two
       # directories of the same checkout. Keep it that way — a variable that
@@ -94,7 +94,7 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v5
         with:
@@ -117,7 +117,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # The step below walks history to name the image.
           fetch-depth: 0
@@ -234,7 +234,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # linear-release-action scans commits since the last Linear release,
           # which needs the full history.
