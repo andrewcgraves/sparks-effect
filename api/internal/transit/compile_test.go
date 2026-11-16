@@ -1,0 +1,686 @@
+package transit
+
+import (
+	"strings"
+	"testing"
+)
+
+func testStations() []Station {
+	return []Station{
+		{ID: "st-a", Slug: "a", Name: "A", Location: GeoPoint{Coordinates: []float64{-122.4, 37.7}}},
+		{ID: "st-b", Slug: "b", Name: "B", Location: GeoPoint{Coordinates: []float64{-122.5, 37.8}}},
+		{ID: "st-c", Slug: "c", Name: "C", Location: GeoPoint{Coordinates: []float64{-122.6, 37.9}}},
+	}
+}
+
+func platformStations(heights ...string) []Station {
+	sts := testStations()
+	for i, h := range heights {
+		sts[i].PlatformHeight = h
+	}
+	return sts
+}
+
+func testSegments() TravelTimes {
+	return TravelTimes{
+		ScenarioSlug: "test",
+		Segments: []SegmentTime{
+			{FromSlug: "a", ToSlug: "b", RunSeconds: 600},
+			{FromSlug: "b", ToSlug: "c", RunSeconds: 1200},
+		},
+	}
+}
+
+func testVehicle() VehicleType {
+	return VehicleType{
+		ID:          "vt-1",
+		FloorHeight: "high",
+		DwellLevelS: 90,
+		DwellStepS:  180,
+	}
+}
+
+func TestCompile_createsServiceGraphsWithEdges(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	services := []Service{
+		{
+			ID:            "svc-local",
+			Active:        true,
+			Name:          "Local",
+			VehicleTypeID: "vt-1",
+			Stops: []ServiceStop{
+				{StationID: "st-a", Sequence: 1},
+				{StationID: "st-b", Sequence: 2},
+				{StationID: "st-c", Sequence: 3},
+			},
+		},
+		{
+			ID:     "svc-inactive",
+			Active: false,
+			Stops:  []ServiceStop{{StationID: "st-a", Sequence: 1}},
+		},
+	}
+
+	g, err := Compile(sc, nil, testStations(), services, []VehicleType{testVehicle()}, testSegments(), DefaultBoardingWaitPolicy())
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if len(g.Services) != 1 {
+		t.Fatalf("want 1 active ServiceGraph, got %d", len(g.Services))
+	}
+	sg := g.Services[0]
+	if sg.ServiceID != "svc-local" {
+		t.Errorf("ServiceID: want svc-local, got %s", sg.ServiceID)
+	}
+	if sg.WaitSecs != 0 {
+		t.Errorf("WaitSecs: want 0 (M2 wires wait), got %d", sg.WaitSecs)
+	}
+	if len(sg.Edges) != 4 {
+		t.Fatalf("want 4 directed edges (2 hops × both dirs), got %d: %v", len(sg.Edges), sg.Edges)
+	}
+}
+
+func TestCompile_edgeSecondsIncludeRunAndDwell(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	stations := platformStations("high", "high", "high")
+	services := []Service{{
+		ID:            "svc-local",
+		Active:        true,
+		VehicleTypeID: "vt-1",
+		Stops: []ServiceStop{
+			{StationID: "st-a", Sequence: 1},
+			{StationID: "st-b", Sequence: 2},
+			{StationID: "st-c", Sequence: 3},
+		},
+	}}
+
+	g, err := Compile(sc, nil, stations, services, []VehicleType{testVehicle()}, testSegments(), DefaultBoardingWaitPolicy())
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	byKey := map[string]int{}
+	for _, e := range g.Services[0].Edges {
+		byKey[e.FromSlug+"→"+e.ToSlug] = e.Seconds
+	}
+	// a→b: 10m*60 + dwell(b)=90
+	if got := byKey["a→b"]; got != 10*60+90 {
+		t.Errorf("a→b: want %d, got %d", 10*60+90, got)
+	}
+	// b→c: 20m*60 + dwell(c)=90
+	if got := byKey["b→c"]; got != 20*60+90 {
+		t.Errorf("b→c: want %d, got %d", 20*60+90, got)
+	}
+}
+
+func TestCompile_edgesReportDwellAlongsideTotal(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	override := 30
+	stations := platformStations("high", "low", "high")
+	segments := TravelTimes{Segments: []SegmentTime{
+		{FromSlug: "a", ToSlug: "b", RunSeconds: 60},
+		{FromSlug: "b", ToSlug: "c", RunSeconds: 60},
+	}}
+	services := []Service{{
+		ID:            "svc-1",
+		Active:        true,
+		VehicleTypeID: "vt-1",
+		Stops: []ServiceStop{
+			{StationID: "st-a", Sequence: 1},
+			{StationID: "st-b", Sequence: 2},
+			{StationID: "st-c", Sequence: 3, DwellS: &override},
+		},
+	}}
+
+	g, err := Compile(sc, nil, stations, services, []VehicleType{testVehicle()}, segments, DefaultBoardingWaitPolicy())
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	byKey := map[string]Edge{}
+	for _, e := range g.Services[0].Edges {
+		byKey[e.FromSlug+"→"+e.ToSlug] = e
+	}
+	// a→b arrives at b, which dwells the step time (platform heights differ).
+	if got := byKey["a→b"]; got.DwellS != 180 || got.Seconds != 60+180 {
+		t.Errorf("a→b: want DwellS 180 and Seconds %d, got DwellS %d and Seconds %d",
+			60+180, got.DwellS, got.Seconds)
+	}
+	// b→c arrives at c, whose stop overrides dwell to 30.
+	if got := byKey["b→c"]; got.DwellS != 30 || got.Seconds != 60+30 {
+		t.Errorf("b→c: want DwellS 30 and Seconds %d, got DwellS %d and Seconds %d",
+			60+30, got.DwellS, got.Seconds)
+	}
+}
+
+func TestCompile_expressSkipsIntermediateDwell(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	stations := platformStations("high", "high", "high")
+	express := Service{
+		ID:            "svc-express",
+		Active:        true,
+		VehicleTypeID: "vt-1",
+		Stops: []ServiceStop{
+			{StationID: "st-a", Sequence: 1},
+			{StationID: "st-c", Sequence: 2},
+		},
+	}
+	local := Service{
+		ID:            "svc-local",
+		Active:        true,
+		VehicleTypeID: "vt-1",
+		Stops: []ServiceStop{
+			{StationID: "st-a", Sequence: 1},
+			{StationID: "st-b", Sequence: 2},
+			{StationID: "st-c", Sequence: 3},
+		},
+	}
+
+	g, err := Compile(sc, nil, stations, []Service{express, local}, []VehicleType{testVehicle()}, testSegments(), DefaultBoardingWaitPolicy())
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	var expressAC, localAC int
+	for _, sg := range g.Services {
+		secs := 0
+		for _, e := range sg.Edges {
+			if e.FromSlug == "a" && (e.ToSlug == "b" || e.ToSlug == "c") {
+				secs += e.Seconds
+			}
+			if e.FromSlug == "b" && e.ToSlug == "c" {
+				secs += e.Seconds
+			}
+		}
+		if sg.ServiceID == "svc-express" {
+			for _, e := range sg.Edges {
+				if e.FromSlug == "a" && e.ToSlug == "c" {
+					expressAC = e.Seconds
+				}
+			}
+		}
+		if sg.ServiceID == "svc-local" {
+			localAC = secs
+		}
+	}
+	// express a→c: (10+20)*60 + dwell(c)=90, no dwell at skipped b
+	wantExpress := (10+20)*60 + 90
+	if expressAC != wantExpress {
+		t.Errorf("express a→c: want %d, got %d", wantExpress, expressAC)
+	}
+	// local a→b→c: 10*60+90 + 20*60+90
+	wantLocal := 10*60 + 90 + 20*60 + 90
+	if localAC != wantLocal {
+		t.Errorf("local a→c via b: want %d, got %d", wantLocal, localAC)
+	}
+	if localAC-expressAC != 90 {
+		t.Errorf("local−express delta: want skipped dwell 90, got %d", localAC-expressAC)
+	}
+}
+
+func TestCompile_dwellResolution(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	override := 30
+	stations := platformStations("high", "low", "high")
+	segments := TravelTimes{Segments: []SegmentTime{
+		{FromSlug: "a", ToSlug: "b", RunSeconds: 60},
+		{FromSlug: "b", ToSlug: "c", RunSeconds: 60},
+	}}
+	vt := testVehicle()
+	services := []Service{{
+		ID:            "svc-1",
+		Active:        true,
+		VehicleTypeID: "vt-1",
+		Stops: []ServiceStop{
+			{StationID: "st-a", Sequence: 1},
+			{StationID: "st-b", Sequence: 2},
+			{StationID: "st-c", Sequence: 3, DwellS: &override},
+		},
+	}}
+
+	g, err := Compile(sc, nil, stations, services, []VehicleType{vt}, segments, DefaultBoardingWaitPolicy())
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	byKey := map[string]int{}
+	for _, e := range g.Services[0].Edges {
+		byKey[e.FromSlug+"→"+e.ToSlug] = e.Seconds
+	}
+	// a→b: step dwell (low≠high) = 180
+	if got := byKey["a→b"]; got != 60+180 {
+		t.Errorf("a→b step dwell: want %d, got %d", 60+180, got)
+	}
+	// b→c: override 30
+	if got := byKey["b→c"]; got != 60+30 {
+		t.Errorf("b→c override dwell: want %d, got %d", 60+30, got)
+	}
+}
+
+func TestCompile_unknownStationSlugInSegments(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	tt := TravelTimes{
+		Segments: []SegmentTime{{FromSlug: "a", ToSlug: "missing", RunSeconds: 300}},
+	}
+	_, err := Compile(sc, nil, testStations(), nil, nil, tt, DefaultBoardingWaitPolicy())
+	if err == nil {
+		t.Fatal("expected error for unknown segment station slug")
+	}
+	if !strings.Contains(err.Error(), "missing") {
+		t.Errorf("error should mention unknown slug, got: %v", err)
+	}
+}
+
+func compileABEdges(t *testing.T, segments TravelTimes) map[string]Edge {
+	t.Helper()
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	services := []Service{{
+		ID:            "svc-local",
+		Active:        true,
+		VehicleTypeID: "vt-1",
+		Stops: []ServiceStop{
+			{StationID: "st-a", Sequence: 1},
+			{StationID: "st-b", Sequence: 2},
+		},
+	}}
+	g, err := Compile(sc, nil, testStations(), services, []VehicleType{testVehicle()}, segments, DefaultBoardingWaitPolicy())
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	byKey := map[string]Edge{}
+	for _, e := range g.Services[0].Edges {
+		byKey[e.FromSlug+"→"+e.ToSlug] = e
+	}
+	return byKey
+}
+
+func TestCompile_reverseOverrideProducesAsymmetricEdges(t *testing.T) {
+	rev := 400
+	segments := testSegments()
+	segments.Segments[0].ReverseRunSeconds = &rev
+
+	byKey := compileABEdges(t, segments)
+	fwd := byKey["a→b"]
+	revEdge := byKey["b→a"]
+	if fwd.Seconds == revEdge.Seconds {
+		t.Fatalf("a→b and b→a both %d; override should produce different durations", fwd.Seconds)
+	}
+	if fwd.Seconds-fwd.DwellS != 600 {
+		t.Errorf("a→b run time: want 600, got %d (Seconds %d DwellS %d)",
+			fwd.Seconds-fwd.DwellS, fwd.Seconds, fwd.DwellS)
+	}
+	if revEdge.Seconds-revEdge.DwellS != 400 {
+		t.Errorf("b→a run time: want 400, got %d (Seconds %d DwellS %d)",
+			revEdge.Seconds-revEdge.DwellS, revEdge.Seconds, revEdge.DwellS)
+	}
+}
+
+func TestCompile_nilReverseOverrideMirrorsForward(t *testing.T) {
+	byKey := compileABEdges(t, testSegments())
+	fwd := byKey["a→b"]
+	revEdge := byKey["b→a"]
+	if fwd.Seconds != revEdge.Seconds {
+		t.Errorf("nil override: a→b %d, b→a %d, want identical durations", fwd.Seconds, revEdge.Seconds)
+	}
+}
+
+func TestCompile_reverseOverrideDifferenceIsRunTimeNotDwell(t *testing.T) {
+	rev := 400
+	segments := testSegments()
+	segments.Segments[0].ReverseRunSeconds = &rev
+
+	byKey := compileABEdges(t, segments)
+	fwd := byKey["a→b"]
+	revEdge := byKey["b→a"]
+	if fwd.DwellS != revEdge.DwellS {
+		t.Fatalf("dwell should match both ways, got a→b %d and b→a %d", fwd.DwellS, revEdge.DwellS)
+	}
+	if (fwd.Seconds-fwd.DwellS)-(revEdge.Seconds-revEdge.DwellS) != 200 {
+		t.Errorf("run-time delta: want 200 (600−400), got fwd run %d rev run %d",
+			fwd.Seconds-fwd.DwellS, revEdge.Seconds-revEdge.DwellS)
+	}
+}
+
+func TestCompile_nonPositiveReverseOverrideFails(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	for _, rev := range []int{0, -1} {
+		tt := testSegments()
+		tt.Segments[0].ReverseRunSeconds = &rev
+		_, err := Compile(sc, nil, testStations(), nil, nil, tt, DefaultBoardingWaitPolicy())
+		if err == nil {
+			t.Fatalf("reverse_run_seconds=%d: expected error", rev)
+		}
+		if !strings.Contains(err.Error(), "a→b") {
+			t.Errorf("reverse_run_seconds=%d: error should name the segment a→b, got: %v", rev, err)
+		}
+	}
+}
+
+func TestCompile_symmetricDiamondKeepsBothDirectionsOnTheForwardPath(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	stations := []Station{
+		{ID: "st-a", Slug: "a", Name: "A", Location: GeoPoint{Coordinates: []float64{-122.4, 37.7}}},
+		{ID: "st-b", Slug: "b", Name: "B", Location: GeoPoint{Coordinates: []float64{-122.5, 37.8}}},
+		{ID: "st-c", Slug: "c", Name: "C", Location: GeoPoint{Coordinates: []float64{-122.6, 37.9}}},
+		{ID: "st-d", Slug: "d", Name: "D", Location: GeoPoint{Coordinates: []float64{-122.7, 38.0}}},
+	}
+	segments := TravelTimes{Segments: []SegmentTime{
+		{FromSlug: "a", ToSlug: "c", RunSeconds: 300},
+		{FromSlug: "a", ToSlug: "b", RunSeconds: 100},
+		{FromSlug: "b", ToSlug: "d", RunSeconds: 100},
+		{FromSlug: "c", ToSlug: "d", RunSeconds: 300},
+	}}
+	services := []Service{{
+		ID:            "svc-ad",
+		Active:        true,
+		VehicleTypeID: "vt-1",
+		Stops: []ServiceStop{
+			{StationID: "st-a", Sequence: 1},
+			{StationID: "st-d", Sequence: 2},
+		},
+	}}
+
+	g, err := Compile(sc, nil, stations, services, []VehicleType{testVehicle()}, segments, DefaultBoardingWaitPolicy())
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	byKey := map[string]Edge{}
+	for _, e := range g.Services[0].Edges {
+		byKey[e.FromSlug+"→"+e.ToSlug] = e
+	}
+	fwd := byKey["a→d"]
+	rev := byKey["d→a"]
+	const want = 780
+	if fwd.Seconds != want || rev.Seconds != want {
+		t.Errorf("a→d %d, d→a %d, want %d both ways (same physical route)", fwd.Seconds, rev.Seconds, want)
+	}
+	if fwd.DwellS != 180 || rev.DwellS != 180 {
+		t.Errorf("DwellS: a→d %d, d→a %d, want 180 both ways from the c-route", fwd.DwellS, rev.DwellS)
+	}
+}
+
+func TestCompile_reverseEqualToForwardCompiles(t *testing.T) {
+	rev := 600
+	segments := testSegments()
+	segments.Segments[0].ReverseRunSeconds = &rev
+
+	byKey := compileABEdges(t, segments)
+	fwd := byKey["a→b"]
+	revEdge := byKey["b→a"]
+	if fwd.Seconds != revEdge.Seconds {
+		t.Errorf("equal override: a→b %d, b→a %d, want identical durations", fwd.Seconds, revEdge.Seconds)
+	}
+}
+
+func TestCompile_unknownServiceStopStation(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	services := []Service{{
+		ID:            "svc-1",
+		Active:        true,
+		VehicleTypeID: "vt-1",
+		Stops:         []ServiceStop{{StationID: "st-unknown", Sequence: 1}},
+	}}
+	_, err := Compile(sc, nil, testStations(), services, []VehicleType{testVehicle()}, testSegments(), DefaultBoardingWaitPolicy())
+	if err == nil {
+		t.Fatal("expected error for unknown service stop station")
+	}
+	if !strings.Contains(err.Error(), "st-unknown") {
+		t.Errorf("error should mention station id, got: %v", err)
+	}
+}
+
+func TestCompile_serviceStopNotOnSegmentPath(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	stations := append(testStations(), Station{ID: "st-orphan", Slug: "orphan", Name: "Orphan"})
+	services := []Service{{
+		ID:            "svc-1",
+		Active:        true,
+		VehicleTypeID: "vt-1",
+		Stops:         []ServiceStop{{StationID: "st-orphan", Sequence: 1}},
+	}}
+	_, err := Compile(sc, nil, stations, services, []VehicleType{testVehicle()}, testSegments(), DefaultBoardingWaitPolicy())
+	if err == nil {
+		t.Fatal("expected error for service stop not on segment path")
+	}
+	if !strings.Contains(err.Error(), "orphan") {
+		t.Errorf("error should mention orphan slug, got: %v", err)
+	}
+}
+
+func TestCompile_waitSecsFromFrequencyWindows(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	makeService := func(id string, headways []int) Service {
+		windows := make([]FrequencyWindow, len(headways))
+		for i, h := range headways {
+			windows[i] = FrequencyWindow{HeadwayS: h}
+		}
+		return Service{
+			ID:            id,
+			Active:        true,
+			VehicleTypeID: "vt-1",
+			Stops: []ServiceStop{
+				{StationID: "st-a", Sequence: 1},
+				{StationID: "st-b", Sequence: 2},
+			},
+			FrequencyWindows: windows,
+		}
+	}
+
+	services := []Service{
+		makeService("svc-one", []int{1800}),
+		makeService("svc-multi", []int{1800, 3600}),
+	}
+
+	g, err := Compile(sc, nil, testStations(), services, []VehicleType{testVehicle()}, testSegments(),
+		BoardingWaitPolicy{Kind: BoardingWaitHalfHeadway})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	byID := map[string]ServiceGraph{}
+	for _, sg := range g.Services {
+		byID[sg.ServiceID] = sg
+	}
+	if got := byID["svc-one"].WaitSecs; got != 900 {
+		t.Errorf("svc-one WaitSecs: want 900, got %d", got)
+	}
+	if got := byID["svc-multi"].WaitSecs; got != 900 {
+		t.Errorf("svc-multi WaitSecs (best/peak headway): want 900, got %d", got)
+	}
+	if got := byID["svc-one"].WaitPolicy; got != string(BoardingWaitHalfHeadway) {
+		t.Errorf("svc-one WaitPolicy: want %q, got %q", BoardingWaitHalfHeadway, got)
+	}
+}
+
+func TestNewStore_holdsCompiledGraph(t *testing.T) {
+	store := mustNewStore(t)
+	g, ok := store.Graph("ca-hsr")
+	if !ok {
+		t.Fatal("expected compiled TransitGraph for ca-hsr")
+	}
+	// One graph per active service, whatever the seed currently declares —
+	// counting them against a literal only re-breaks every time a service is
+	// added or parked.
+	sc, _ := store.GetScenarioBySlug("ca-hsr")
+	want := len(store.GetServicesByScenario(sc.ID))
+	if want == 0 {
+		t.Fatal("expected ca-hsr to declare at least one active service")
+	}
+	if len(g.Services) != want {
+		t.Fatalf("want one service graph per active service (%d), got %d", want, len(g.Services))
+	}
+}
+
+func TestCompile_emitsOneNodePerStation(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	stations := testStations()
+	services := []Service{{
+		ID: "svc-local", Active: true, VehicleTypeID: "vt-1",
+		Stops: []ServiceStop{{StationID: "st-a", Sequence: 1}, {StationID: "st-b", Sequence: 2}},
+	}}
+
+	g, err := Compile(sc, nil, stations, services, []VehicleType{testVehicle()}, testSegments(), DefaultBoardingWaitPolicy())
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	// Every station of the scenario is a node, including "c" which no service
+	// calls at — the seeded store offered all of them as isochrone origins.
+	if len(g.Nodes) != len(stations) {
+		t.Fatalf("len(Nodes) = %d, want %d (one per station)", len(g.Nodes), len(stations))
+	}
+	byslug := make(map[string]GraphNode, len(g.Nodes))
+	for _, n := range g.Nodes {
+		byslug[n.Slug] = n
+	}
+	a, ok := byslug["a"]
+	if !ok {
+		t.Fatalf("no node for station a; nodes = %+v", g.Nodes)
+	}
+	if a.Lat != 37.7 || a.Lng != -122.4 {
+		t.Errorf("node a position = (%v, %v), want (37.7, -122.4)", a.Lat, a.Lng)
+	}
+	if len(a.Names) != 1 || a.Names[0] != "A" {
+		t.Errorf("node a Names = %v, want [A]", a.Names)
+	}
+}
+
+func TestCompile_nodeCarriesRoutingAnchorSeparatelyFromLocation(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	stations := testStations()
+	stations[0].RoutingLocation = &GeoPoint{Coordinates: []float64{-122.41, 37.71}}
+	services := []Service{{
+		ID: "svc-local", Active: true, VehicleTypeID: "vt-1",
+		Stops: []ServiceStop{{StationID: "st-a", Sequence: 1}, {StationID: "st-b", Sequence: 2}},
+	}}
+
+	g, err := Compile(sc, nil, stations, services, []VehicleType{testVehicle()}, testSegments(), DefaultBoardingWaitPolicy())
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	byslug := make(map[string]GraphNode, len(g.Nodes))
+	for _, n := range g.Nodes {
+		byslug[n.Slug] = n
+	}
+
+	a := byslug["a"]
+	if a.Lat != 37.7 || a.Lng != -122.4 {
+		t.Errorf("node a Lat/Lng = (%v, %v), want the unmoved station location (37.7, -122.4)", a.Lat, a.Lng)
+	}
+	if a.RoutingLat == nil || a.RoutingLng == nil {
+		t.Fatalf("node a RoutingLat/RoutingLng = %v/%v, want the routing anchor", a.RoutingLat, a.RoutingLng)
+	}
+	if *a.RoutingLat != 37.71 || *a.RoutingLng != -122.41 {
+		t.Errorf("node a routing anchor = (%v, %v), want (37.71, -122.41)", *a.RoutingLat, *a.RoutingLng)
+	}
+
+	b := byslug["b"]
+	if b.RoutingLat != nil || b.RoutingLng != nil {
+		t.Errorf("node b has no routing_location on its station, want RoutingLat/RoutingLng nil, got %v/%v",
+			b.RoutingLat, b.RoutingLng)
+	}
+}
+
+func TestCompile_rejectsStationWithMalformedLocation(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	stations := []Station{
+		{ID: "st-a", Slug: "a", Name: "A", Location: GeoPoint{Coordinates: []float64{-122.4, 37.7}}},
+		{ID: "st-b", Slug: "b", Name: "B", Location: GeoPoint{Coordinates: []float64{-122.5}}},
+	}
+	services := []Service{{
+		ID: "svc-local", Active: true, VehicleTypeID: "vt-1",
+		Stops: []ServiceStop{{StationID: "st-a", Sequence: 1}, {StationID: "st-b", Sequence: 2}},
+	}}
+
+	segments := TravelTimes{ScenarioSlug: "test", Segments: []SegmentTime{
+		{FromSlug: "a", ToSlug: "b", RunSeconds: 600},
+	}}
+
+	_, err := Compile(sc, nil, stations, services, []VehicleType{testVehicle()}, segments, DefaultBoardingWaitPolicy())
+	if err == nil {
+		t.Fatal("Compile(DefaultBoardingWaitPolicy()) error = nil, want an error for a station with no usable location")
+	}
+	if !strings.Contains(err.Error(), "b") {
+		t.Errorf("error = %v, want it to name the offending station", err)
+	}
+}
+
+func TestCompile_rejectsStationWithMalformedRoutingLocation(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	stations := []Station{
+		{ID: "st-a", Slug: "a", Name: "A", Location: GeoPoint{Coordinates: []float64{-122.4, 37.7}}},
+		{
+			ID: "st-b", Slug: "b", Name: "B",
+			Location:        GeoPoint{Coordinates: []float64{-122.5, 37.8}},
+			RoutingLocation: &GeoPoint{Coordinates: []float64{-122.51}},
+		},
+	}
+	services := []Service{{
+		ID: "svc-local", Active: true, VehicleTypeID: "vt-1",
+		Stops: []ServiceStop{{StationID: "st-a", Sequence: 1}, {StationID: "st-b", Sequence: 2}},
+	}}
+
+	segments := TravelTimes{ScenarioSlug: "test", Segments: []SegmentTime{
+		{FromSlug: "a", ToSlug: "b", RunSeconds: 600},
+	}}
+
+	_, err := Compile(sc, nil, stations, services, []VehicleType{testVehicle()}, segments, DefaultBoardingWaitPolicy())
+	if err == nil {
+		t.Fatal("Compile(DefaultBoardingWaitPolicy()) error = nil, want an error for a station with a malformed routing_location")
+	}
+	if !strings.Contains(err.Error(), "b") {
+		t.Errorf("error = %v, want it to name the offending station", err)
+	}
+}
+
+func TestCompile_reverseOverrideHonouredAcrossMultiHopLeg(t *testing.T) {
+	sc := Scenario{ID: "sc-1", Slug: "test"}
+	rev := 400
+	segments := testSegments() // a→b 600, b→c 1200
+	segments.Segments[0].ReverseRunSeconds = &rev
+
+	// Stops at the two ends only — a (seq 1) and c (seq 2), skipping b.
+	services := []Service{{
+		ID:            "svc-express",
+		Active:        true,
+		VehicleTypeID: "vt-1",
+		Stops: []ServiceStop{
+			{StationID: "st-a", Sequence: 1},
+			{StationID: "st-c", Sequence: 2},
+		},
+	}}
+
+	// Platform heights match testVehicle's floor height, so every dwell is
+	// DwellLevelS (90) and the arithmetic below stays readable.
+	g, err := Compile(sc, nil, platformStations("high", "high", "high"), services,
+		[]VehicleType{testVehicle()}, segments, DefaultBoardingWaitPolicy())
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	byKey := map[string]Edge{}
+	for _, e := range g.Services[0].Edges {
+		byKey[e.FromSlug+"→"+e.ToSlug] = e
+	}
+	fwd, ok := byKey["a→c"]
+	if !ok {
+		t.Fatalf("no a→c edge compiled, got %v", g.Services[0].Edges)
+	}
+	revEdge, ok := byKey["c→a"]
+	if !ok {
+		t.Fatalf("no c→a edge compiled, got %v", g.Services[0].Edges)
+	}
+	// Forward: both segments at their declared run time, plus one dwell at c —
+	// b is passed through, not called at.
+	if run := fwd.Seconds - fwd.DwellS; run != 1800 {
+		t.Errorf("a→c run time: want 1800 (600+1200), got %d (Seconds %d DwellS %d)", run, fwd.Seconds, fwd.DwellS)
+	}
+	// Reverse: 1200 for c→b, which carries no override, plus the overridden 400
+	// for b→a. The override applies to its own segment only, not the whole leg.
+	if run := revEdge.Seconds - revEdge.DwellS; run != 1600 {
+		t.Errorf("c→a run time: want 1600 (1200 + 400 override), got %d (Seconds %d DwellS %d)",
+			run, revEdge.Seconds, revEdge.DwellS)
+	}
+	// The asymmetry belongs entirely to the run time: the same single stop is
+	// served on arrival either way, so dwell must not move with it.
+	if fwd.DwellS != revEdge.DwellS {
+		t.Fatalf("dwell should match both ways, got a→c %d and c→a %d", fwd.DwellS, revEdge.DwellS)
+	}
+	if fwd.DwellS != 90 {
+		t.Errorf("a→c dwell: want 90 (one called stop at 90), got %d", fwd.DwellS)
+	}
+}

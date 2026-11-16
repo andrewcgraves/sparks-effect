@@ -1,0 +1,136 @@
+package postgres_test
+
+import (
+	"context"
+	"encoding/json"
+	"slices"
+	"testing"
+
+	"github.com/andrewcgraves/sparks-effect-api/internal/persistence/postgres"
+	"github.com/andrewcgraves/sparks-effect-api/internal/transit"
+)
+
+var retiredPrerenderedIDs = []string{
+	"00000000-0000-4006-8001-000000000001", // San Jose - 240 min by bike
+	"00000000-0000-4006-8001-000000000002", // Burbank Airport - 240 min on foot
+}
+
+var retiredShortTransitPrerenderedIDs = []string{
+	"00000000-0000-4006-8001-000000000003", // San Francisco (Transbay) - 90 min by transit
+	"00000000-0000-4006-8001-000000000006", // Los Angeles (Union Station) - 90 min by transit
+}
+
+var retiredFirstHomePagePrerenderedIDs = []string{
+	"00000000-0000-4006-8001-000000000004", // San Jose (Diridon) - 60 min by bike
+	"00000000-0000-4006-8001-000000000005", // Fresno - 120 min by transit
+	"00000000-0000-4006-8001-000000000007", // Anaheim (ARTIC) - 60 min on foot
+	"00000000-0000-4006-8001-000000000008", // Burbank Airport - 120 min on foot
+	"00000000-0000-4006-8001-000000000009", // San Francisco (Transbay) - 135 min by transit
+	"00000000-0000-4006-8001-00000000000a", // Los Angeles (Union Station) - 135 min by transit
+}
+
+// No migration names this one, so every retirement must leave it standing.
+const keptPrerenderedID = "00000000-0000-4006-8001-00000000000b"
+
+func insertCaHSRPrerendered(t *testing.T, repo *postgres.Repo, url string) {
+	t.Helper()
+	exec(t, url,
+		`INSERT INTO scenarios (id, slug, name) VALUES ('`+phase1ScenarioID+`', 'ca-hsr', 'CA HSR')`)
+	for _, id := range slices.Concat(retiredPrerenderedIDs, retiredShortTransitPrerenderedIDs,
+		retiredFirstHomePagePrerenderedIDs, []string{keptPrerenderedID}) {
+		entry := transit.PrerenderedIsochrone{
+			ID: id, ScenarioSlug: "ca-hsr", Label: id,
+			Lat: 37.3, Lng: -121.9, BudgetMins: 60, Mode: transit.TravelModeBike,
+			Result: json.RawMessage(`{"opaque":true}`),
+		}
+		if err := repo.CreatePrerenderedIsochrone(context.Background(), &entry); err != nil {
+			t.Fatalf("CreatePrerenderedIsochrone %s: %v", id, err)
+		}
+	}
+}
+
+func assertOnlyKeptPrerendered(t *testing.T, url string, retired []string) {
+	t.Helper()
+	for _, id := range retired {
+		if got := scalarCount(t, url,
+			`SELECT count(*) FROM prerendered_isochrones WHERE id = '`+id+`'`); got != 0 {
+			t.Errorf("retired prerendered isochrone %s survived the migration", id)
+		}
+	}
+	if got := scalarCount(t, url,
+		`SELECT count(*) FROM prerendered_isochrones WHERE id = '`+keptPrerenderedID+`'`); got != 1 {
+		t.Error("the migration deleted a prerendered isochrone it does not name")
+	}
+}
+
+func TestRetirePrerenderedMigrationDeletesTheTwoOutdatedEntries(t *testing.T) {
+	repo, url := freshRepo(t)
+	insertCaHSRPrerendered(t, repo, url)
+
+	rewindTo(t, url, 35)
+	if err := postgres.Migrate(context.Background(), url); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	assertOnlyKeptPrerendered(t, url, retiredPrerenderedIDs)
+}
+
+func TestRetirePrerenderedMigrationIsSafeToReRun(t *testing.T) {
+	repo, url := freshRepo(t)
+	insertCaHSRPrerendered(t, repo, url)
+
+	for pass := 1; pass <= 2; pass++ {
+		rewindTo(t, url, 35)
+		if err := postgres.Migrate(context.Background(), url); err != nil {
+			t.Fatalf("Migrate pass %d: %v", pass, err)
+		}
+	}
+	assertOnlyKeptPrerendered(t, url, retiredPrerenderedIDs)
+}
+
+func TestRetireShortTransitPrerenderedMigrationDeletesTheSFAndLA90MinuteEntries(t *testing.T) {
+	repo, url := freshRepo(t)
+	insertCaHSRPrerendered(t, repo, url)
+
+	rewindTo(t, url, 38)
+	if err := postgres.Migrate(context.Background(), url); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	assertOnlyKeptPrerendered(t, url, retiredShortTransitPrerenderedIDs)
+}
+
+func TestRetireShortTransitPrerenderedMigrationIsSafeToReRun(t *testing.T) {
+	repo, url := freshRepo(t)
+	insertCaHSRPrerendered(t, repo, url)
+
+	for pass := 1; pass <= 2; pass++ {
+		rewindTo(t, url, 38)
+		if err := postgres.Migrate(context.Background(), url); err != nil {
+			t.Fatalf("Migrate pass %d: %v", pass, err)
+		}
+	}
+	assertOnlyKeptPrerendered(t, url, retiredShortTransitPrerenderedIDs)
+}
+
+func TestRetireFirstHomePagePrerenderedMigrationDeletesTheSixEntries(t *testing.T) {
+	repo, url := freshRepo(t)
+	insertCaHSRPrerendered(t, repo, url)
+
+	rewindTo(t, url, 39)
+	if err := postgres.Migrate(context.Background(), url); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	assertOnlyKeptPrerendered(t, url, retiredFirstHomePagePrerenderedIDs)
+}
+
+func TestRetireFirstHomePagePrerenderedMigrationIsSafeToReRun(t *testing.T) {
+	repo, url := freshRepo(t)
+	insertCaHSRPrerendered(t, repo, url)
+
+	for pass := 1; pass <= 2; pass++ {
+		rewindTo(t, url, 39)
+		if err := postgres.Migrate(context.Background(), url); err != nil {
+			t.Fatalf("Migrate pass %d: %v", pass, err)
+		}
+	}
+	assertOnlyKeptPrerendered(t, url, retiredFirstHomePagePrerenderedIDs)
+}

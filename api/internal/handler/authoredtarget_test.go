@@ -1,0 +1,214 @@
+package handler_test
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/andrewcgraves/sparks-effect-api/internal/account"
+	"github.com/andrewcgraves/sparks-effect-api/internal/compile"
+	"github.com/andrewcgraves/sparks-effect-api/internal/handler"
+	"github.com/andrewcgraves/sparks-effect-api/internal/routing"
+	"github.com/andrewcgraves/sparks-effect-api/internal/transit"
+)
+
+func errorBody(t *testing.T, rec *httptest.ResponseRecorder) map[string]string {
+	t.Helper()
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal %q: %v", rec.Body.String(), err)
+	}
+	return body
+}
+
+func TestCompileAuthoredTargetNonOwnerIsNotFound(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler func(handler.CompileStore) http.HandlerFunc
+		path    string
+		slug    string
+		wantMsg string
+	}{
+		{"service", func(s handler.CompileStore) http.HandlerFunc {
+			return handler.CompileUserService(s, compile.NewRunner(s, transit.DefaultBoardingWaitPolicy(), nil))
+		}, "/api/services/line-a/compile", "line-a", "service not found"},
+		{"scenario", func(s handler.CompileStore) http.HandlerFunc {
+			return handler.CompileUserScenario(s, compile.NewRunner(s, transit.DefaultBoardingWaitPolicy(), nil))
+		}, "/api/user-scenarios/trip/compile", "trip", "scenario not found"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newFakeCompileStore()
+			store.compilableUserFixture("owner")
+
+			rec := postAs(t, tt.handler(store), tt.path, "slug", tt.slug, account.User{ID: "someone-else"})
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body %s", rec.Code, rec.Body.String())
+			}
+			if got := errorBody(t, rec)["error"]; got != tt.wantMsg {
+				t.Errorf("error = %q, want %q", got, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestAuthoredTargetGraphNotYetCompiledNamesItsTarget(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler func(handler.CompileStore) http.HandlerFunc
+		path    string
+		slug    string
+		wantMsg string
+	}{
+		{"service", handler.UserServiceGraph, "/api/services/line-a/graph", "line-a", "no compiled graph for this service yet"},
+		{"scenario", handler.UserScenarioGraph, "/api/user-scenarios/trip/graph", "trip", "no compiled graph for this scenario yet"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newFakeCompileStore()
+			store.compilableUserFixture("user-1")
+
+			owner := account.User{ID: "user-1"}
+			rec := getWithPathValueAs(t, tt.handler(store), tt.path, "slug", tt.slug, &owner)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404; body %s", rec.Code, rec.Body.String())
+			}
+			if got := errorBody(t, rec)["error"]; got != tt.wantMsg {
+				t.Errorf("error = %q, want %q", got, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestAuthoredTargetGraphBundlesRoutesForBothTargets(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler func(handler.CompileStore) http.HandlerFunc
+		seed    func(store *fakeCompileStore, svcID, scenarioID string)
+		path    string
+		slug    string
+	}{
+		{
+			name:    "service",
+			handler: handler.UserServiceGraph,
+			seed: func(store *fakeCompileStore, svcID, _ string) {
+				seedServiceCompileJob(store, svcID, &transit.TransitGraph{
+					Services: []transit.ServiceGraph{{ServiceID: svcID}},
+				})
+			},
+			path: "/api/services/line-a/graph", slug: "line-a",
+		},
+		{
+			name:    "scenario",
+			handler: handler.UserScenarioGraph,
+			seed: func(store *fakeCompileStore, svcID, scenarioID string) {
+				store.jobs["job-1"] = transit.Job{
+					ID: "job-1", Kind: transit.JobKindCompileUserScenario, Status: transit.JobStatusSucceeded,
+					UserScenarioID: &scenarioID,
+					Result:         &transit.TransitGraph{Services: []transit.ServiceGraph{{ServiceID: svcID}}},
+				}
+			},
+			path: "/api/user-scenarios/trip/graph", slug: "trip",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newFakeCompileStore()
+			svcID, scenarioID := store.compilableUserFixture("user-1")
+			tt.seed(store, svcID, scenarioID)
+
+			owner := account.User{ID: "user-1"}
+			rec := getWithPathValueAs(t, tt.handler(store), tt.path, "slug", tt.slug, &owner)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+			}
+
+			var resp struct {
+				Services []transit.ServiceGraph `json:"services"`
+				Routes   []transit.Route        `json:"routes"`
+			}
+			if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if len(resp.Services) != 1 || resp.Services[0].ServiceID != svcID {
+				t.Errorf("services = %+v, want the stored graph", resp.Services)
+			}
+			if len(resp.Routes) != 1 || resp.Routes[0].ID != "rt-user" {
+				t.Fatalf("routes = %+v, want the service's route bundled", resp.Routes)
+			}
+		})
+	}
+}
+
+func TestAuthoredTargetIsochroneStaleNamesItsTarget(t *testing.T) {
+	created := time.Now().Add(-time.Hour)
+
+	t.Run("service", func(t *testing.T) {
+		store := newFakeServiceStore()
+		seedServiceRow(store, "svc-1", "line-a", svcOwner.ID, created.Add(time.Minute)) // edited after compile
+		store.jobs["line-a"] = transit.Job{
+			ID: "job-1", Status: transit.JobStatusSucceeded, CreatedAt: created,
+			CompiledServiceIDs: []string{"svc-1"}, Result: freshGraph(),
+		}
+
+		rec := svcIsoServeAs(t, store, &routing.FakePublisher{}, svcOwner, "/api/services/line-a/isochrone", isoValidBody)
+		assertStale(t, rec, "compiled graph is stale; recompile the service and retry")
+	})
+
+	t.Run("scenario", func(t *testing.T) {
+		store := newFakeScenarioStore()
+		seedScenarioRow(store, "scn-1", "trip", scnOwner.ID, []string{"svc-1"})
+		store.members["svc-1"] = transit.UserService{ID: "svc-1", UpdatedAt: created.Add(time.Minute)}
+		store.jobs["trip"] = transit.Job{
+			ID: "job-1", Status: transit.JobStatusSucceeded, CreatedAt: created,
+			CompiledServiceIDs: []string{"svc-1"}, Result: freshGraph(),
+		}
+
+		rec := isoServeAs(t, store, &routing.FakePublisher{}, scnOwner, "/api/user-scenarios/trip/isochrone", isoValidBody)
+		assertStale(t, rec, "compiled graph is stale; recompile the scenario and retry")
+	})
+}
+
+func assertStale(t *testing.T, rec *httptest.ResponseRecorder, wantMsg string) {
+	t.Helper()
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body %s", rec.Code, rec.Body.String())
+	}
+	body := errorBody(t, rec)
+	if body["code"] != handler.StaleGraphErrorCode {
+		t.Errorf("code = %q, want %q", body["code"], handler.StaleGraphErrorCode)
+	}
+	if body["error"] != wantMsg {
+		t.Errorf("error = %q, want %q", body["error"], wantMsg)
+	}
+}
+
+func TestAuthoredTargetIsochroneNotYetCompiledNamesItsTarget(t *testing.T) {
+	t.Run("service", func(t *testing.T) {
+		store := newFakeServiceStore()
+		seedServiceRow(store, "svc-1", "line-a", svcOwner.ID, time.Now())
+
+		rec := svcIsoServeAs(t, store, &routing.FakePublisher{}, svcOwner, "/api/services/line-a/isochrone", isoValidBody)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404; body %s", rec.Code, rec.Body.String())
+		}
+		if got := errorBody(t, rec)["error"]; got != "no compiled graph for this service yet" {
+			t.Errorf("error = %q, want the service wording", got)
+		}
+	})
+
+	t.Run("scenario", func(t *testing.T) {
+		store := newFakeScenarioStore()
+		seedScenarioRow(store, "scn-1", "trip", scnOwner.ID, []string{"svc-1"})
+
+		rec := isoServeAs(t, store, &routing.FakePublisher{}, scnOwner, "/api/user-scenarios/trip/isochrone", isoValidBody)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404; body %s", rec.Code, rec.Body.String())
+		}
+		if got := errorBody(t, rec)["error"]; got != "no compiled graph for this scenario yet" {
+			t.Errorf("error = %q, want the scenario wording", got)
+		}
+	})
+}

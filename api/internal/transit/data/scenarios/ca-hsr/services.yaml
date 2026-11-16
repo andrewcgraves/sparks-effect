@@ -1,0 +1,145 @@
+# Services for the CA HSR scenario.
+#
+# HSR Express: key stops only (skips Madera and Kings/Tulare). It does not
+#   call at Merced.
+# HSR Local: Phase 1 stops SF–Anaheim. Merced is not a Phase 1 call.
+# Merced Shuttle: hourly Merced–Madera spur. The 2026 Business Plan describes
+#   this as an hourly shuttle with a timed connection at Madera.
+# Brightline West: Palmdale–Victor Valley–Las Vegas spur, interchanging with Phase 1 at Palmdale.
+#
+# Frequency windows are representative of the 2026 Business Plan peak/off-peak headways.
+# HeadwayS 1800 = every 30 min (peak), 3600 = every 60 min (off-peak).
+# The Merced Shuttle is the exception: one all-day hourly window, no peak split.
+#
+# boarding_wait is an optional per-service override (SPA-237):
+#   boarding_wait: {policy: half_headway}
+#   boarding_wait: {policy: fixed, secs: 120}
+# Absent means inherit from the global default (BOARDING_WAIT_POLICY, itself
+# none unless set). Seeded scenarios have no scenario-level override.
+
+- id: "00000000-0000-4004-8001-000000000001"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  route_id: "00000000-0000-4002-8001-000000000001"
+  vehicle_type_id: "00000000-0000-4003-8001-000000000001"
+  name: "HSR Express"
+  direction: "both"
+  # Un-parked in SPA-464. It was parked in SPA-223 on the belief that two
+  # stopping patterns over one corridor would report a station twice. They do
+  # not: the compiled graph has one node per station, and the routing worker's
+  # search keeps the fastest arrival at each, naming the winning service.
+  #
+  # A skipped stop saves only its dwell. run_seconds come from the all-stop
+  # matrix, so the braking and acceleration for Madera and Kings/Tulare are
+  # still in the hops the Express rides through.
+  active: true
+  provenance: calibrated
+  stops:
+    - station_id: "00000000-0000-4005-8001-000000000001"
+      sequence: 1
+    - station_id: "00000000-0000-4005-8001-000000000002"
+      sequence: 2
+    - station_id: "00000000-0000-4005-8001-000000000003"
+      sequence: 3
+    - station_id: "00000000-0000-4005-8001-000000000004"
+      sequence: 4
+    - station_id: "00000000-0000-4005-8001-000000000007"
+      sequence: 5
+    - station_id: "00000000-0000-4005-8001-000000000009"
+      sequence: 6
+    - station_id: "00000000-0000-4005-8001-00000000000a"
+      sequence: 7
+    - station_id: "00000000-0000-4005-8001-00000000000c"
+      sequence: 8
+    - station_id: "00000000-0000-4005-8001-00000000000d"
+      sequence: 9
+    - station_id: "00000000-0000-4005-8001-00000000000e"
+      sequence: 10
+  frequency_windows:
+    - start_time: "06:00"
+      end_time: "09:00"
+      headway_s: 1800
+    - start_time: "09:00"
+      end_time: "22:00"
+      headway_s: 3600
+
+- id: "00000000-0000-4004-8001-000000000002"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  route_id: "00000000-0000-4002-8001-000000000001"
+  vehicle_type_id: "00000000-0000-4003-8001-000000000001"
+  name: "HSR Local"
+  direction: "both"
+  active: true
+  provenance: calibrated
+  stops:
+    - station_id: "00000000-0000-4005-8001-000000000001"
+      sequence: 1
+    - station_id: "00000000-0000-4005-8001-000000000002"
+      sequence: 2
+    - station_id: "00000000-0000-4005-8001-000000000003"
+      sequence: 3
+    - station_id: "00000000-0000-4005-8001-000000000004"
+      sequence: 4
+    - station_id: "00000000-0000-4005-8001-000000000006"
+      sequence: 5
+    - station_id: "00000000-0000-4005-8001-000000000007"
+      sequence: 6
+    - station_id: "00000000-0000-4005-8001-000000000008"
+      sequence: 7
+    - station_id: "00000000-0000-4005-8001-000000000009"
+      sequence: 8
+    - station_id: "00000000-0000-4005-8001-00000000000a"
+      sequence: 9
+    - station_id: "00000000-0000-4005-8001-00000000000c"
+      sequence: 10
+    - station_id: "00000000-0000-4005-8001-00000000000d"
+      sequence: 11
+    - station_id: "00000000-0000-4005-8001-00000000000e"
+      sequence: 12
+  frequency_windows:
+    - start_time: "06:00"
+      end_time: "09:00"
+      headway_s: 3600
+    - start_time: "09:00"
+      end_time: "20:00"
+      headway_s: 5400
+
+# Hourly Merced–Madera shuttle with a timed connection at Madera, as the
+# 2026 Business Plan describes it. One window, 06:00–22:00; no peak/off-peak split.
+- id: "00000000-0000-4004-8001-000000000004"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  route_id: "00000000-0000-4002-8001-000000000003"
+  vehicle_type_id: "00000000-0000-4003-8001-000000000001"
+  name: "Merced Shuttle"
+  direction: "both"
+  active: true
+  provenance: calibrated
+  stops:
+    - station_id: "00000000-0000-4005-8001-000000000005"
+      sequence: 1
+    - station_id: "00000000-0000-4005-8001-000000000006"
+      sequence: 2
+  frequency_windows:
+    - start_time: "06:00"
+      end_time: "22:00"
+      headway_s: 3600
+
+# --- Brightline West — Palmdale–Victor Valley–Las Vegas ---
+- id: "00000000-0000-4004-8001-000000000003"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  route_id: "00000000-0000-4002-8001-000000000002"
+  vehicle_type_id: "00000000-0000-4003-8001-000000000001"
+  name: "Brightline West"
+  direction: "both"
+  active: true
+  provenance: calibrated
+  stops:
+    - station_id: "00000000-0000-4005-8001-00000000000a"
+      sequence: 1
+    - station_id: "00000000-0000-4005-8001-00000000000b"
+      sequence: 2
+    - station_id: "00000000-0000-4005-8001-00000000000f"
+      sequence: 3
+  frequency_windows:
+    - start_time: "06:00"
+      end_time: "22:00"
+      headway_s: 7200

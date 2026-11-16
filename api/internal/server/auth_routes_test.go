@@ -1,0 +1,726 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/andrewcgraves/sparks-effect-api/internal/account"
+	"github.com/andrewcgraves/sparks-effect-api/internal/auth"
+	"github.com/andrewcgraves/sparks-effect-api/internal/compile"
+	"github.com/andrewcgraves/sparks-effect-api/internal/config"
+	"github.com/andrewcgraves/sparks-effect-api/internal/handler"
+	"github.com/andrewcgraves/sparks-effect-api/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-api/internal/routing"
+	"github.com/andrewcgraves/sparks-effect-api/internal/transit"
+)
+
+type stubAuthDeps struct {
+	sessions  map[string]account.User
+	inFlight  int
+	published []transit.PublishedServiceSummary
+	queue     handler.RoutingQueue
+}
+
+func (s *stubAuthDeps) RoutingQueueSnapshot(context.Context, time.Duration) (handler.RoutingQueue, error) {
+	return s.queue, nil
+}
+
+func (s *stubAuthDeps) GetSessionUser(_ context.Context, tokenHash string) (account.User, bool, error) {
+	u, ok := s.sessions[tokenHash]
+	return u, ok, nil
+}
+
+func (s *stubAuthDeps) GetUserCredentialsByEmail(context.Context, string) (account.User, string, bool, error) {
+	return account.User{}, "", false, nil
+}
+
+func (s *stubAuthDeps) CreateUserService(context.Context, transit.UserService) error { return nil }
+func (s *stubAuthDeps) UpdateUserService(context.Context, transit.UserService) error { return nil }
+func (s *stubAuthDeps) DeleteUserService(context.Context, string) error              { return nil }
+
+func (s *stubAuthDeps) GetUserServiceByID(context.Context, string) (transit.UserService, bool, error) {
+	return transit.UserService{}, false, nil
+}
+
+func (s *stubAuthDeps) GetUserServiceBySlug(context.Context, string) (transit.UserService, bool, error) {
+	return transit.UserService{}, false, nil
+}
+
+func (s *stubAuthDeps) ListUserServicesByOwner(context.Context, string) ([]transit.UserService, error) {
+	return nil, nil
+}
+
+func (s *stubAuthDeps) CreateUserScenario(context.Context, transit.UserScenario) error { return nil }
+func (s *stubAuthDeps) UpdateUserScenario(context.Context, transit.UserScenario) error { return nil }
+func (s *stubAuthDeps) DeleteUserScenario(context.Context, string) error               { return nil }
+
+func (s *stubAuthDeps) GetUserScenarioByID(context.Context, string) (transit.UserScenario, bool, error) {
+	return transit.UserScenario{}, false, nil
+}
+
+func (s *stubAuthDeps) GetUserScenarioBySlug(context.Context, string) (transit.UserScenario, bool, error) {
+	return transit.UserScenario{}, false, nil
+}
+
+func (s *stubAuthDeps) ListUserScenariosByOwner(context.Context, string) ([]transit.UserScenario, error) {
+	return nil, nil
+}
+
+func (s *stubAuthDeps) UserServiceIDsOwnedBy(context.Context, string, []string) (map[string]bool, error) {
+	return nil, nil
+}
+
+func (s *stubAuthDeps) UpdateUserName(context.Context, string, string) (account.User, bool, error) {
+	return account.User{}, false, nil
+}
+func (s *stubAuthDeps) ChangePassword(context.Context, account.PasswordChange) (bool, error) {
+	return false, nil
+}
+func (s *stubAuthDeps) DeleteUserSessions(context.Context, string) error       { return nil }
+func (s *stubAuthDeps) CreateSession(context.Context, account.Session) error   { return nil }
+func (s *stubAuthDeps) DeleteSession(context.Context, string) error            { return nil }
+func (s *stubAuthDeps) CreateUser(context.Context, account.User, string) error { return nil }
+func (s *stubAuthDeps) GetUserByID(_ context.Context, id string) (account.User, bool, error) {
+	return account.User{ID: id}, true, nil
+}
+func (s *stubAuthDeps) CreateInvite(context.Context, account.User, account.Token) error { return nil }
+func (s *stubAuthDeps) CreateResetToken(context.Context, account.Token) error           { return nil }
+func (s *stubAuthDeps) GetAccountToken(context.Context, string) (account.Token, account.User, bool, error) {
+	return account.Token{}, account.User{}, false, nil
+}
+func (s *stubAuthDeps) RedeemAccountToken(context.Context, string, string, account.Session) (account.User, bool, error) {
+	return account.User{}, false, nil
+}
+func (s *stubAuthDeps) GetUserByEmail(context.Context, string) (account.User, bool, error) {
+	return account.User{}, false, nil
+}
+func (s *stubAuthDeps) ListUsers(context.Context) ([]account.UserSummary, error) {
+	return nil, nil
+}
+func (s *stubAuthDeps) PatchUser(context.Context, string, account.UserPatch) (account.User, bool, error) {
+	return account.User{}, false, nil
+}
+func (s *stubAuthDeps) ListScenariosByOwner(context.Context, string) ([]transit.Scenario, error) {
+	return nil, nil
+}
+func (s *stubAuthDeps) ListServicesByOwner(context.Context, string) ([]transit.Service, error) {
+	return nil, nil
+}
+func (s *stubAuthDeps) CreateRoute(context.Context, transit.Route) error { return nil }
+func (s *stubAuthDeps) GetRouteBySlug(context.Context, string) (transit.Route, bool, error) {
+	return transit.Route{}, false, nil
+}
+func (s *stubAuthDeps) CreateStation(context.Context, transit.Station) error { return nil }
+func (s *stubAuthDeps) ListStationsByScenario(context.Context, string) ([]transit.Station, error) {
+	return nil, nil
+}
+func (s *stubAuthDeps) ListRoutesByScenario(context.Context, string) ([]transit.Route, error) {
+	return nil, nil
+}
+func (s *stubAuthDeps) GetStationBySlug(context.Context, string, string) (transit.Station, bool, error) {
+	return transit.Station{}, false, nil
+}
+func (s *stubAuthDeps) UpdateStation(context.Context, transit.Station) error { return nil }
+func (s *stubAuthDeps) DeleteStation(context.Context, string) error          { return nil }
+func (s *stubAuthDeps) CountStationDependents(context.Context, string) (int, error) {
+	return 0, nil
+}
+func (s *stubAuthDeps) GetServiceByID(context.Context, string) (transit.Service, bool, error) {
+	return transit.Service{}, false, nil
+}
+func (s *stubAuthDeps) CreateService(context.Context, transit.Service) error { return nil }
+func (s *stubAuthDeps) UpdateService(context.Context, transit.Service) error { return nil }
+func (s *stubAuthDeps) DeleteService(context.Context, string) error          { return nil }
+func (s *stubAuthDeps) GetVehicleTypeByID(context.Context, string) (transit.VehicleType, bool, error) {
+	return transit.VehicleType{}, false, nil
+}
+func (s *stubAuthDeps) CreateScenario(context.Context, transit.Scenario) error { return nil }
+func (s *stubAuthDeps) UpdateScenario(context.Context, transit.Scenario) error { return nil }
+func (s *stubAuthDeps) DeleteScenario(context.Context, string) error           { return nil }
+func (s *stubAuthDeps) CountUnownedScenarioChildren(context.Context, string) (int, error) {
+	return 0, nil
+}
+func (s *stubAuthDeps) UpdateRoute(context.Context, transit.Route) error { return nil }
+func (s *stubAuthDeps) DeleteRoute(context.Context, string) error        { return nil }
+func (s *stubAuthDeps) CountRouteDependents(context.Context, string) (transit.RouteDependents, error) {
+	return transit.RouteDependents{}, nil
+}
+func (s *stubAuthDeps) ListRouteSummariesByOwner(context.Context, string) ([]transit.RouteSummary, error) {
+	return nil, nil
+}
+func (s *stubAuthDeps) ListCuratedRouteSummaries(context.Context) ([]transit.RouteSummary, error) {
+	return nil, nil
+}
+func (s *stubAuthDeps) GetScenarioBySlug(context.Context, string) (transit.Scenario, bool, error) {
+	return transit.Scenario{}, false, nil
+}
+func (s *stubAuthDeps) GetScenarioByID(context.Context, string) (transit.Scenario, bool, error) {
+	return transit.Scenario{}, false, nil
+}
+func (s *stubAuthDeps) UpsertTravelTimes(context.Context, transit.TravelTimes) error { return nil }
+func (s *stubAuthDeps) GetTravelTimes(context.Context, string) (transit.TravelTimes, bool, error) {
+	return transit.TravelTimes{}, false, nil
+}
+func (s *stubAuthDeps) CreateJob(context.Context, transit.Job) error { return nil }
+func (s *stubAuthDeps) GetJobByID(context.Context, string) (transit.Job, bool, error) {
+	return transit.Job{}, false, nil
+}
+func (s *stubAuthDeps) UpdateJobStatus(context.Context, string, string, string) error { return nil }
+func (s *stubAuthDeps) FailInterruptedJob(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+func (s *stubAuthDeps) CompleteJob(context.Context, string, transit.TransitGraph, []string) error {
+	return nil
+}
+func (s *stubAuthDeps) GetLatestSucceededJob(context.Context, string, string) (transit.Job, bool, error) {
+	return transit.Job{}, false, nil
+}
+func (s *stubAuthDeps) GetLatestSucceededUserScenarioJob(context.Context, string) (transit.Job, bool, error) {
+	return transit.Job{}, false, nil
+}
+func (s *stubAuthDeps) GetLatestSucceededUserServiceJob(context.Context, string) (transit.Job, bool, error) {
+	return transit.Job{}, false, nil
+}
+func (s *stubAuthDeps) PublishUserService(context.Context, string, handler.PublicationDecide) (transit.ServicePublication, error) {
+	return transit.ServicePublication{}, nil
+}
+func (s *stubAuthDeps) UnpublishUserService(context.Context, string) error { return nil }
+func (s *stubAuthDeps) GetServicePublicationBySlug(context.Context, string) (transit.ServicePublication, bool, error) {
+	return transit.ServicePublication{}, false, nil
+}
+func (s *stubAuthDeps) GetSucceededCompileJob(context.Context, string) (transit.Job, bool, error) {
+	return transit.Job{}, false, nil
+}
+func (s *stubAuthDeps) HasPendingServiceHandover(context.Context, string) (bool, error) {
+	return false, nil
+}
+func (s *stubAuthDeps) OfferServiceHandover(context.Context, transit.ServiceHandover, time.Duration) (transit.ServiceHandover, error) {
+	return transit.ServiceHandover{}, nil
+}
+func (s *stubAuthDeps) ListPendingServiceHandovers(context.Context, string) ([]transit.ServiceHandover, error) {
+	return nil, nil
+}
+func (s *stubAuthDeps) CancelServiceHandover(context.Context, string, string) (transit.ServiceHandover, error) {
+	return transit.ServiceHandover{}, handler.ErrHandoverNotFound
+}
+func (s *stubAuthDeps) DeclineServiceHandover(context.Context, string, string) (transit.ServiceHandover, error) {
+	return transit.ServiceHandover{}, handler.ErrHandoverNotFound
+}
+func (s *stubAuthDeps) AcceptServiceHandover(context.Context, string, string) (transit.ServiceHandover, error) {
+	return transit.ServiceHandover{}, handler.ErrHandoverNotFound
+}
+func (s *stubAuthDeps) TransferUserService(context.Context, string, string, string) (transit.ServiceHandover, error) {
+	return transit.ServiceHandover{}, errors.New("stub: no services")
+}
+func (s *stubAuthDeps) ListPublishedServiceSummaries(context.Context, *transit.PublishedIndexKey, int) (transit.PublishedIndexPage, error) {
+	return transit.PublishedIndexPage{Items: s.published}, nil
+}
+func (s *stubAuthDeps) ListUserServicesByIDs(context.Context, []string) ([]transit.UserService, error) {
+	return nil, nil
+}
+func (s *stubAuthDeps) ListRoutesByIDs(context.Context, []string) ([]transit.Route, error) {
+	return nil, nil
+}
+func (s *stubAuthDeps) ListServicesByScenario(context.Context, string) ([]transit.Service, error) {
+	return nil, nil
+}
+func (s *stubAuthDeps) ListVehicleTypes(context.Context) ([]transit.VehicleType, error) {
+	return nil, nil
+}
+
+func (s *stubAuthDeps) CreateRoutingJob(context.Context, *transit.RoutingJob) error { return nil }
+func (s *stubAuthDeps) FailRoutingJob(context.Context, string, string) error        { return nil }
+func (s *stubAuthDeps) GetRoutingJobByID(context.Context, string) (transit.RoutingJob, bool, error) {
+	return transit.RoutingJob{}, false, nil
+}
+func (s *stubAuthDeps) FindReusableRoutingJob(context.Context, transit.RoutingJob) (transit.RoutingJob, bool, error) {
+	return transit.RoutingJob{}, false, nil
+}
+
+func (s *stubAuthDeps) MarkRoutingJobRunning(context.Context, string) error { return nil }
+func (s *stubAuthDeps) SucceedRoutingJob(context.Context, string, handler.JobSucceededBody) error {
+	return nil
+}
+func (s *stubAuthDeps) GetIsochroneCache(context.Context, []handler.IsochroneKey) (map[handler.IsochroneKey]handler.CachedIsochrone, error) {
+	return map[handler.IsochroneKey]handler.CachedIsochrone{}, nil
+}
+func (s *stubAuthDeps) PutIsochroneCache(context.Context, []handler.CachedIsochrone) error {
+	return nil
+}
+
+func (s *stubAuthDeps) CountInFlightRoutingJobs(context.Context, time.Duration) (int, error) {
+	return s.inFlight, nil
+}
+
+func (s *stubAuthDeps) CountInFlightRoutingJobsBefore(context.Context, time.Time, time.Duration) (int, error) {
+	return 0, nil
+}
+
+func (s *stubAuthDeps) ListServiceMembershipByScenario(context.Context, string) ([]transit.ServiceMembership, error) {
+	return nil, nil
+}
+
+func (s *stubAuthDeps) ListPrerenderedIsochronesByScenario(context.Context, string) ([]transit.PrerenderedIsochrone, error) {
+	return nil, nil
+}
+
+func (s *stubAuthDeps) GetPrerenderedIsochrone(context.Context, string) (transit.PrerenderedIsochrone, bool, error) {
+	return transit.PrerenderedIsochrone{}, false, nil
+}
+
+func (s *stubAuthDeps) CreatePrerenderedIsochrone(context.Context, *transit.PrerenderedIsochrone) error {
+	return nil
+}
+
+func (s *stubAuthDeps) ApplyRetention(context.Context, bool) (handler.RetentionReport, error) {
+	return handler.RetentionReport{}, nil
+}
+
+const (
+	adminToken  = "admin-token"
+	userToken   = "user-token"
+	workerToken = "worker-token"
+)
+
+func newTestServer(t *testing.T, deps AuthDeps) http.Handler {
+	t.Helper()
+	store, err := transit.NewStore(transit.DefaultBoardingWaitPolicy())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	cfg := config.Config{Port: "8080", SessionTTL: time.Hour, WorkerToken: workerToken}
+	return New(cfg, store, deps, &routing.FakePublisher{}, compile.NewRunner(deps, cfg.BoardingWait, nil), logger.Discard(), nil, nil).Handler
+}
+
+func newStubDeps() *stubAuthDeps {
+	return &stubAuthDeps{sessions: map[string]account.User{
+		auth.HashToken(adminToken): {ID: "admin-1", Email: "admin@example.com", IsAdmin: true},
+		auth.HashToken(userToken):  {ID: "user-1", Email: "user@example.com"},
+	}}
+}
+
+func request(t *testing.T, h http.Handler, method, path, token string, body ...string) *httptest.ResponseRecorder {
+	t.Helper()
+	var req *http.Request
+	if len(body) == 0 || body[0] == "" {
+		req = httptest.NewRequest(method, path, http.NoBody)
+	} else {
+		req = httptest.NewRequest(method, path, strings.NewReader(body[0]))
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestProtectedRoutesRejectAnonymousCallers(t *testing.T) {
+	h := newTestServer(t, newStubDeps())
+
+	protected := []struct{ method, path string }{
+		{http.MethodGet, "/api/auth/me"},
+		{http.MethodPost, "/api/auth/logout"},
+		{http.MethodPatch, "/api/auth/me"},
+		{http.MethodPost, "/api/auth/password"},
+		{http.MethodPost, "/api/auth/sessions/revoke-all"},
+		{http.MethodGet, "/api/me/scenarios"},
+		{http.MethodGet, "/api/me/services"},
+		{http.MethodPost, "/api/admin/users"},
+		{http.MethodGet, "/api/admin/users"},
+		{http.MethodPatch, "/api/admin/users/some-id"},
+		{http.MethodPost, "/api/admin/invites"},
+		{http.MethodPost, "/api/admin/users/some-id/reset-link"},
+		{http.MethodPost, "/api/admin/routes"},
+		{http.MethodPost, "/api/admin/retention"},
+		{http.MethodPut, "/api/admin/services/some-slug/owner"},
+		{http.MethodPost, "/api/scenarios/ca-hsr/compile"},
+		{http.MethodGet, "/api/jobs/some-id"},
+		// The authored draft surface. GET .../publication and POST
+		// .../publication/isochrone are the public routes under /api/services;
+		// everything else here stays behind the gate.
+		{http.MethodPost, "/api/services"},
+		{http.MethodGet, "/api/services"},
+		{http.MethodGet, "/api/services/some-slug"},
+		{http.MethodPut, "/api/services/some-slug"},
+		{http.MethodDelete, "/api/services/some-slug"},
+		{http.MethodPost, "/api/services/some-slug/compile"},
+		{http.MethodGet, "/api/services/some-slug/graph"},
+		{http.MethodPost, "/api/services/some-slug/isochrone"},
+		{http.MethodPut, "/api/services/some-slug/publication"},
+		{http.MethodDelete, "/api/services/some-slug/publication"},
+		{http.MethodPost, "/api/services/some-slug/handovers"},
+		{http.MethodGet, "/api/me/handovers"},
+		{http.MethodPost, "/api/handovers/some-id/cancel"},
+		{http.MethodPost, "/api/handovers/some-id/decline"},
+		{http.MethodPost, "/api/handovers/some-id/accept"},
+		{http.MethodPost, "/api/user-scenarios"},
+		{http.MethodGet, "/api/user-scenarios"},
+		{http.MethodGet, "/api/user-scenarios/some-slug"},
+		{http.MethodPut, "/api/user-scenarios/some-slug"},
+		{http.MethodDelete, "/api/user-scenarios/some-slug"},
+		{http.MethodPost, "/api/user-scenarios/some-slug/compile"},
+		{http.MethodGet, "/api/user-scenarios/some-slug/graph"},
+		// Curating a prerendered isochrone is admin-only even though it hangs
+		// off the public /api/scenarios path, so an anonymous caller must be
+		// stopped at the gate rather than reaching the handler.
+		{http.MethodPost, "/api/scenarios/ca-hsr/prerendered-isochrones"},
+	}
+
+	for _, p := range protected {
+		t.Run(p.method+" "+p.path, func(t *testing.T) {
+			rec := request(t, h, p.method, p.path, "")
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want 401 for an unauthenticated caller", rec.Code)
+			}
+		})
+	}
+}
+
+func TestAdminRoutesRejectNonAdmins(t *testing.T) {
+	h := newTestServer(t, newStubDeps())
+
+	for _, route := range []struct{ method, path string }{
+		{http.MethodPost, "/api/admin/users"},
+		{http.MethodGet, "/api/admin/users"},
+		{http.MethodPatch, "/api/admin/users/some-id"},
+		{http.MethodPost, "/api/admin/invites"},
+		{http.MethodPost, "/api/admin/users/some-id/reset-link"},
+		{http.MethodPost, "/api/admin/routes"},
+		{http.MethodPost, "/api/admin/retention"},
+		{http.MethodPut, "/api/admin/services/some-slug/owner"},
+		// Not under /api/admin/, so nothing about its path says it is gated —
+		// which is exactly why it is asserted here.
+		{http.MethodPost, "/api/scenarios/ca-hsr/prerendered-isochrones"},
+	} {
+		t.Run(route.method+" "+route.path, func(t *testing.T) {
+			rec := request(t, h, route.method, route.path, userToken)
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("status = %d, want 403 for a non-admin", rec.Code)
+			}
+
+			// The same route admits an admin — proving the 403 was the gate and
+			// not a misrouted request. The stub knows no users, so PATCH answers
+			// 404 from the handler; a body is sent so it gets that far.
+			if route.method == http.MethodPatch {
+				rec = request(t, h, route.method, route.path, adminToken, `{"is_admin":true}`)
+				if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "user not found") {
+					t.Errorf("admin PATCH: status %d body %s, want the handler's 404", rec.Code, rec.Body.String())
+				}
+				return
+			}
+			// Likewise the stub knows no services, so the owner move answers
+			// the handler's 404 for the slug.
+			if route.method == http.MethodPut {
+				rec = request(t, h, route.method, route.path, adminToken, `{"user_id":"`+mustUUID(t)+`"}`)
+				if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "service not found") {
+					t.Errorf("admin PUT: status %d body %s, want the handler's 404", rec.Code, rec.Body.String())
+				}
+				return
+			}
+			rec = request(t, h, route.method, route.path, adminToken)
+			if rec.Code == http.StatusForbidden || rec.Code == http.StatusNotFound {
+				t.Errorf("admin was blocked from an admin route: status %d", rec.Code)
+			}
+		})
+	}
+}
+
+func TestAuthenticatedRoutesAdmitValidTokens(t *testing.T) {
+	h := newTestServer(t, newStubDeps())
+
+	for _, path := range []string{"/api/auth/me", "/api/me/scenarios", "/api/me/services"} {
+		t.Run(path, func(t *testing.T) {
+			rec := request(t, h, http.MethodGet, path, userToken)
+			if rec.Code != http.StatusOK {
+				t.Errorf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestCompileJobRoutesAdmitValidTokens(t *testing.T) {
+	h := newTestServer(t, newStubDeps())
+
+	for _, p := range []struct{ method, path string }{
+		{http.MethodPost, "/api/scenarios/ca-hsr/compile"},
+		{http.MethodGet, "/api/jobs/some-id"},
+		{http.MethodPost, "/api/services/some-slug/compile"},
+		{http.MethodGet, "/api/services/some-slug/graph"},
+		{http.MethodPost, "/api/services/some-slug/isochrone"},
+		{http.MethodPut, "/api/services/some-slug/publication"},
+		{http.MethodDelete, "/api/services/some-slug/publication"},
+		{http.MethodPost, "/api/user-scenarios/some-slug/compile"},
+		{http.MethodGet, "/api/user-scenarios/some-slug/graph"},
+	} {
+		t.Run(p.method+" "+p.path, func(t *testing.T) {
+			rec := request(t, h, p.method, p.path, userToken)
+			if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+				t.Errorf("status = %d, a valid token must pass the auth gate", rec.Code)
+			}
+		})
+	}
+}
+
+func TestUserScenarioRoutesAdmitValidTokensAndDontShadowPublicReads(t *testing.T) {
+	h := newTestServer(t, newStubDeps())
+
+	for _, p := range []struct{ method, path string }{
+		{http.MethodPost, "/api/user-scenarios"},
+		{http.MethodGet, "/api/user-scenarios"},
+		{http.MethodGet, "/api/user-scenarios/some-slug"},
+		{http.MethodPut, "/api/user-scenarios/some-slug"},
+		{http.MethodDelete, "/api/user-scenarios/some-slug"},
+	} {
+		t.Run(p.method+" "+p.path, func(t *testing.T) {
+			rec := request(t, h, p.method, p.path, userToken)
+			if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+				t.Errorf("status = %d, a valid token must pass the auth gate", rec.Code)
+			}
+		})
+	}
+
+	// The curated public read at /api/scenarios/{slug} must still answer
+	// unauthenticated, proving /api/user-scenarios did not shadow it.
+	rec := request(t, h, http.MethodGet, "/api/scenarios/ca-hsr", "")
+	if rec.Code != http.StatusOK {
+		t.Errorf("public curated read status = %d, want 200", rec.Code)
+	}
+}
+
+func TestPublicReadRoutesStayOpen(t *testing.T) {
+	h := newTestServer(t, newStubDeps())
+
+	for _, path := range []string{"/healthz", "/api/scenarios", "/api/scenarios/ca-hsr"} {
+		t.Run(path, func(t *testing.T) {
+			rec := request(t, h, http.MethodGet, path, "")
+			if rec.Code != http.StatusOK {
+				t.Errorf("status = %d, want 200 without a token", rec.Code)
+			}
+		})
+	}
+}
+
+func TestRouteReadEndpointStaysOpenWithoutAToken(t *testing.T) {
+	h := newTestServer(t, newStubDeps())
+
+	rec := request(t, h, http.MethodGet, "/api/routes/no-such-route", "")
+	if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+		t.Errorf("status = %d, route read must not require auth", rec.Code)
+	}
+	// stubAuthDeps has no routes, so an anonymous caller should see the
+	// ordinary not-found response rather than an auth rejection.
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 for an unknown slug", rec.Code)
+	}
+}
+
+func TestRouteListEndpointStaysOpenWithoutAToken(t *testing.T) {
+	h := newTestServer(t, newStubDeps())
+
+	rec := request(t, h, http.MethodGet, "/api/routes", "")
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 without a token; body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSnapStopsEndpointStaysOpenWithoutAToken(t *testing.T) {
+	h := newTestServer(t, newStubDeps())
+
+	rec := request(t, h, http.MethodPost, "/api/routes/no-such-route/snap-stops", "",
+		`{"stops":[{"lat":37.79,"lng":-122.4}]}`)
+	if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+		t.Errorf("status = %d, the snap preview must not require auth", rec.Code)
+	}
+	// stubAuthDeps has no routes, so an anonymous caller should see the
+	// ordinary not-found response rather than an auth rejection or a 405.
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 for an unknown slug", rec.Code)
+	}
+}
+
+func TestGraphEndpointStaysOpenWithoutAToken(t *testing.T) {
+	h := newTestServer(t, newStubDeps())
+
+	rec := request(t, h, http.MethodGet, "/api/scenarios/ca-hsr/graph", "")
+	if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+		t.Errorf("status = %d, the compiled graph read must not require auth", rec.Code)
+	}
+	// stubAuthDeps has no succeeded jobs, so this is "not compiled yet", not an
+	// auth rejection.
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 with nothing compiled yet", rec.Code)
+	}
+}
+
+func TestPrerenderedIsochroneReadsStayOpenWithoutAToken(t *testing.T) {
+	h := newTestServer(t, newStubDeps())
+
+	for _, path := range []string{
+		"/api/scenarios/ca-hsr/prerendered-isochrones",
+		"/api/prerendered-isochrones/some-id",
+	} {
+		t.Run(path, func(t *testing.T) {
+			rec := request(t, h, http.MethodGet, path, "")
+			if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+				t.Errorf("status = %d, the prerendered isochrone reads must not require auth", rec.Code)
+			}
+			// stubAuthDeps knows no scenarios and no entries, so an anonymous
+			// caller should see a plain not-found rather than an auth rejection.
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("status = %d, want 404 with nothing stored", rec.Code)
+			}
+		})
+	}
+}
+
+func TestAuthRoutesReportUnavailableWithoutADatabase(t *testing.T) {
+	h := newTestServer(t, nil)
+
+	for _, p := range []struct{ method, path string }{
+		{http.MethodPost, "/api/auth/login"},
+		{http.MethodGet, "/api/auth/tokens/some-token"},
+		{http.MethodPost, "/api/auth/tokens/some-token"},
+		{http.MethodGet, "/api/auth/me"},
+		{http.MethodPatch, "/api/auth/me"},
+		{http.MethodPost, "/api/auth/password"},
+		{http.MethodPost, "/api/auth/sessions/revoke-all"},
+		{http.MethodPost, "/api/admin/users"},
+		{http.MethodGet, "/api/me/scenarios"},
+		{http.MethodPost, "/api/scenarios/ca-hsr/compile"},
+		{http.MethodGet, "/api/jobs/some-id"},
+		{http.MethodPost, "/api/user-scenarios"},
+		{http.MethodGet, "/api/user-scenarios"},
+		{http.MethodGet, "/api/user-scenarios/some-slug"},
+		// The 503 list is matched by path, and "/api/services/" is a subtree
+		// pattern — so a nested service route is covered without its own entry.
+		// Asserted rather than assumed, since the failure mode is a silent 404.
+		{http.MethodGet, "/api/services/some-slug/graph"},
+		{http.MethodPost, "/api/services/some-slug/isochrone"},
+		{http.MethodPut, "/api/services/some-slug/publication"},
+		{http.MethodDelete, "/api/services/some-slug/publication"},
+		{http.MethodGet, "/api/services/some-slug/publication"},
+		{http.MethodPost, "/api/services/some-slug/publication/isochrone"},
+		{http.MethodPost, "/api/services/some-slug/handovers"},
+		{http.MethodGet, "/api/me/handovers"},
+		{http.MethodPost, "/api/handovers/some-id/cancel"},
+		{http.MethodPost, "/api/handovers/some-id/decline"},
+		{http.MethodPost, "/api/handovers/some-id/accept"},
+		{http.MethodGet, "/api/internal/worker"},
+	} {
+		t.Run(p.method+" "+p.path, func(t *testing.T) {
+			rec := request(t, h, p.method, p.path, adminToken)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("status = %d, want 503 with no database configured", rec.Code)
+			}
+		})
+	}
+
+	// The public read path must still work in database-less local dev.
+	if rec := request(t, h, http.MethodGet, "/api/scenarios", ""); rec.Code != http.StatusOK {
+		t.Errorf("public route status = %d, want 200 without a database", rec.Code)
+	}
+
+	// Route reads live in Postgres, so without a database they must say so
+	// plainly too, rather than 404ing as if the endpoint didn't exist.
+	if rec := request(t, h, http.MethodGet, "/api/routes/ca-hsr-trunk", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("route read status = %d, want 503 with no database configured", rec.Code)
+	}
+
+	// The collection is checked separately from the slug read above: it is a
+	// distinct registration, for the reason given at registerRouteRoutes.
+	if rec := request(t, h, http.MethodGet, "/api/routes", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("route list status = %d, want 503 with no database configured", rec.Code)
+	}
+
+	// The snap preview reads the same Postgres-backed geometry, so it must
+	// answer 503 too rather than 404 as if it were never deployed.
+	if rec := request(t, h, http.MethodPost, "/api/routes/ca-hsr-trunk/snap-stops", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("snap-stops status = %d, want 503 with no database configured", rec.Code)
+	}
+
+	// The compiled graph is likewise Postgres-backed and unauthenticated, so
+	// it needs its own database-less check independent of the auth-gated loop
+	// above.
+	if rec := request(t, h, http.MethodGet, "/api/scenarios/ca-hsr/graph", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("graph read status = %d, want 503 with no database configured", rec.Code)
+	}
+
+	// Publications live only in Postgres, and the index is public, so it is
+	// checked anonymously here rather than in the auth-gated loop above.
+	if rec := request(t, h, http.MethodGet, "/api/published-services", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("published index status = %d, want 503 with no database configured", rec.Code)
+	}
+
+	// Prerendered isochrones live only in Postgres. Their database-less
+	// patterns are registered without a method, so the admin POST at the
+	// collection path is covered by the same entry as the GET — asserted
+	// rather than assumed, since the failure mode is a silent 404.
+	for _, p := range []struct{ method, path string }{
+		{http.MethodGet, "/api/scenarios/ca-hsr/prerendered-isochrones"},
+		{http.MethodPost, "/api/scenarios/ca-hsr/prerendered-isochrones"},
+		{http.MethodGet, "/api/prerendered-isochrones/some-id"},
+	} {
+		if rec := request(t, h, p.method, p.path, adminToken); rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("%s %s status = %d, want 503 with no database configured",
+				p.method, p.path, rec.Code)
+		}
+	}
+}
+
+func TestWorkerRoutesRequireTheWorkerToken(t *testing.T) {
+	h := newTestServer(t, newStubDeps())
+
+	paths := []struct{ method, path, body string }{
+		{http.MethodGet, "/api/internal/worker", ""},
+		{http.MethodPost, "/api/internal/routing-jobs/some-id/running", ""},
+		{http.MethodPost, "/api/internal/routing-jobs/some-id/succeeded", `{"result":{}}`},
+		{http.MethodPost, "/api/internal/routing-jobs/some-id/failed", `{"error":"x"}`},
+		{http.MethodPost, "/api/internal/isochrone-cache/lookup", `{"keys":[]}`},
+		{http.MethodPost, "/api/internal/isochrone-cache", `{"entries":[]}`},
+	}
+
+	for _, p := range paths {
+		t.Run("no token "+p.method+" "+p.path, func(t *testing.T) {
+			rec := request(t, h, p.method, p.path, "", p.body)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want 401 without a token", rec.Code)
+			}
+		})
+		t.Run("user token "+p.method+" "+p.path, func(t *testing.T) {
+			rec := request(t, h, p.method, p.path, userToken, p.body)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want 401 with a user session token", rec.Code)
+			}
+		})
+		t.Run("worker token "+p.method+" "+p.path, func(t *testing.T) {
+			rec := request(t, h, p.method, p.path, workerToken, p.body)
+			if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+				t.Errorf("status = %d, the worker token must be accepted", rec.Code)
+			}
+			if rec.Code == http.StatusNotFound {
+				t.Errorf("status = 404; the route is not registered")
+			}
+		})
+	}
+}
+
+func TestWorkerRoutesUnavailableWithoutATokenConfigured(t *testing.T) {
+	store, err := transit.NewStore(transit.DefaultBoardingWaitPolicy())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	cfg := config.Config{Port: "8080", SessionTTL: time.Hour} // no WorkerToken
+	h := New(cfg, store, newStubDeps(), &routing.FakePublisher{}, compile.NewRunner(nil, cfg.BoardingWait, nil), logger.Discard(), nil, nil).Handler
+
+	rec := request(t, h, http.MethodGet, "/api/internal/worker", workerToken)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 when WORKER_TOKEN is unset", rec.Code)
+	}
+}

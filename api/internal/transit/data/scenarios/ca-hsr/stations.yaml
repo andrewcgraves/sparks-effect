@@ -1,0 +1,190 @@
+# Station coordinates are the planned HSR stop locations per official CAHSR/Wikipedia sources.
+# Source: Wikipedia station articles (citing CAHSR EIR/EIS filings, CEQA notices, and
+# official CAHSR Business Plan station maps). Coordinates cross-checked against
+# CEQA project notices (e.g. 36°56′11″N 119°59′11″W for Madera per ceqanet.lci.ca.gov/2023110616)
+# and Wikipedia infobox coordinates for each station.
+# Phase 1 stations (SF–Anaheim) and the Brightline West spur stations (Victor Valley,
+# Las Vegas) are all active; the spur joins Phase 1 at the shared Palmdale stop.
+# platform_height: high = level boarding with Siemens Venture EMU trainsets.
+
+- id: "00000000-0000-4005-8001-000000000001"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "sf"
+  name: "San Francisco (Transbay)"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-122.397, 37.790]
+
+- id: "00000000-0000-4005-8001-000000000002"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "millbrae"
+  name: "Millbrae"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-122.387, 37.600]
+
+- id: "00000000-0000-4005-8001-000000000003"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "san-jose"
+  name: "San Jose (Diridon)"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-121.903, 37.330]
+
+- id: "00000000-0000-4005-8001-000000000004"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "gilroy"
+  name: "Gilroy"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-121.567, 37.004]
+
+- id: "00000000-0000-4005-8001-000000000005"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "merced"
+  name: "Merced"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-120.491, 37.302]
+
+# routing_location is a provisional stand-in the routing worker centres this
+# station's isochrones on instead of `location` (SPA-258, audited in SPA-244).
+# The pin is the proposed Avenue 13 station site, which OpenStreetMap knows
+# only as farm tracks: a 10-minute auto isochrone centred on it covers
+# 0.59 km², against 81 km² at Fresno. The value below is Santa Fe Drive, the
+# mapped arterial ~360 m west at the same latitude — approximate by design,
+# not a survey point. See migration 00023 for the full reasoning, and remove
+# it once the built station's own street network is mapped.
+- id: "00000000-0000-4005-8001-000000000006"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "madera"
+  name: "Madera"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-119.986, 36.936]
+  routing_location:
+    type: Point
+    coordinates: [-119.99, 36.936]
+
+- id: "00000000-0000-4005-8001-000000000007"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "fresno"
+  name: "Fresno"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-119.794, 36.733]
+
+# routing_location, same provisional stand-in as madera above (SPA-258). The
+# pin sits on the planned Hanford Viaduct, whose OSM neighbourhood is farm
+# tracks: 8.8 km² for a 10-minute auto isochrone. The value below is ~720 m
+# east, on the mapped road grid. See migration 00023.
+- id: "00000000-0000-4005-8001-000000000008"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "kings-tulare"
+  name: "Kings/Tulare (Hanford)"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-119.592, 36.335]
+  routing_location:
+    type: Point
+    coordinates: [-119.584, 36.335]
+
+# routing_location, same provisional stand-in as madera above (SPA-258). The
+# pin snaps onto a `railway=proposed` HSR node rather than a street, giving
+# 5.5 km² for a 10-minute auto isochrone. The value below is ~220 m south, on
+# the surrounding F Street / Golden State street grid. `location` stays on the
+# EIR-cleared F Street site — the 2026 business plan's interim 7th Standard
+# Road stop is a separate `location` question. See migration 00023.
+- id: "00000000-0000-4005-8001-000000000009"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "bakersfield"
+  name: "Bakersfield"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-119.022, 35.391]
+  routing_location:
+    type: Point
+    coordinates: [-119.022, 35.389]
+
+- id: "00000000-0000-4005-8001-00000000000a"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "palmdale"
+  name: "Palmdale"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-118.119, 34.591]
+
+# Brightline West spur — branches off Phase 1 at Palmdale, above.
+# Victor Valley is an in-line station in the I-15 median at Dale Evans Parkway
+# (exit 161), the site FRA cleared in 2023 — not Apple Valley town centre, which
+# is where this used to sit and is 16 km off the corridor the trains run in.
+- id: "00000000-0000-4005-8001-00000000000b"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "victor-valley"
+  name: "Victor Valley (Apple Valley)"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-117.218, 34.6443]
+
+- id: "00000000-0000-4005-8001-00000000000c"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "burbank-airport"
+  name: "Burbank Airport"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-118.353, 34.202]
+
+- id: "00000000-0000-4005-8001-00000000000d"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "los-angeles"
+  name: "Los Angeles (Union Station)"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-118.235, 34.055]
+
+- id: "00000000-0000-4005-8001-00000000000e"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "anaheim"
+  name: "Anaheim (ARTIC)"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-117.878, 33.803]
+
+# Brightline West spur terminus. Enterprise, NV — the FRA-cleared south Strip
+# site between Blue Diamond Rd and Warm Springs Rd — not the Las Vegas
+# city-centroid geocode this used to carry, which was 13.8 km off (SPA-222).
+#
+# routing_location is a separate, provisional stand-in the routing worker's
+# egress isochrone reads instead of `location` (SPA-234): the terminus site is
+# still in civil-construction phase and has no pedestrian network OpenStreetMap
+# can see yet, so Valhalla rejects a pedestrian isochrone centred on `location`
+# itself ("Locations are in unconnected regions"). The value is Las Vegas Blvd
+# S at this latitude, on the block the site fronts — a densely mapped,
+# unambiguously connected arterial — not a survey point; see migration 00016
+# for the full reasoning. Remove it once the built station's own pedestrian
+# network exists and is mapped.
+- id: "00000000-0000-4005-8001-00000000000f"
+  scenario_id: "00000000-0000-4001-8001-000000000001"
+  slug: "las-vegas"
+  name: "Las Vegas"
+  platform_height: "high"
+  location:
+    type: Point
+    coordinates: [-115.1778, 36.0545]
+  routing_location:
+    type: Point
+    coordinates: [-115.1706, 36.0545]

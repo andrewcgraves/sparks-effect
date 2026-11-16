@@ -1,0 +1,893 @@
+# sparks-effect-api
+
+Go REST API for the Sparks Effect project. It serves scenario seed data,
+compiles it into transit graphs, and hands multimodal isochrone requests to the
+routing worker over a queue.
+
+There is no GTFS in this stack. Travel times come from a **TransitGraph**
+compiled from the scenario's seed data and persisted as a compile job's result;
+an isochrone is plotted over the graph that job produced.
+
+The API does not compute isochrones. Valhalla runs ClusterIP-only on the home
+cluster with no ingress, so nothing deployed elsewhere can reach it — the queue
+is the only transport, and the routing fan-out executes inside the cluster in a
+separate repository (SPA-182). This repository's job is to resolve a request
+down to one immutable compiled graph and publish it.
+
+## Pipeline
+
+```
+seed YAML (domain model + segment times)
+        │
+        ▼
+Compile() → TransitGraph, stored as a succeeded compile job
+  • per-service edges (run seconds + dwell)
+  • boarding wait from BOARDING_WAIT_POLICY (default none → 0)
+  • nodes (position + names) so the graph plots on its own
+        │
+        ▼
+POST /api/isochrone  →  202 + routing job (200 + an earlier one, on a repeat)
+  • resolves auth, ownership, target slug, and the stale-graph check
+  • answers a repeat with the earlier succeeded job, publishing nothing
+  • otherwise publishes { graph, lat, lng, budget_mins, mode } with publisher confirms
+        │
+        ▼
+routing worker (separate repo, inside the cluster)
+  • Valhalla: access matrix + origin/egress isochrones
+  • TransitGraph: Dijkstra over union of service edges (seconds)
+  • records the result through authenticated /api/internal/... endpoints
+        │
+        ▼
+GET /api/routing-jobs/{id}  →  status, then the result
+```
+
+Runtime unit of truth is **seconds** (`Edge.Seconds`, `WaitSecs`).
+HTTP fields that are already minute-labeled
+(`budget_mins`, `access_mins`, `remaining_mins`) stay as-is on the wire.
+
+`BOARDING_WAIT_POLICY` is one of `none` (the default), `half_headway`,
+`full_headway`, or `fixed` with `BOARDING_WAIT_FIXED_SECS`. A malformed or
+incomplete setting falls back to `none` rather than refusing to boot: a typo
+should cost a wait, never a deployment, and never charge one nobody asked for.
+Per-service and per-scenario overrides (SPA-237) are set on create/update via
+`boarding_wait` and win in that order over the global default. Service reads
+report the resolved wait as `boarding_wait_policy`, `boarding_wait_secs`, and
+`boarding_wait_source` (`service` / `scenario` / `global`), so a client never
+re-derives `min(headway)/2` itself.
+
+### The queue contract
+
+The message types live in the nested
+[`sparks-effect-contract`](contract/) module (`routing`, `transit`, `store`) —
+see [ADR-0003](docs/adr/0003-shared-contract-module.md). The queue-message
+golden lives in the contract module and at
+`internal/routing/testdata/message.golden.json` so the worker's
+`check-contract` keeps working.
+
+The worker-store HTTP envelope is a second contract of the same kind:
+`IsochroneKey`, `CachedIsochrone`, and the request/response wrappers the
+worker posts to `/api/internal/...`. A renamed JSON tag decodes as its
+zero value — every cache lookup misses, the response is still `200 OK`,
+and there is no error anywhere to find it by. That envelope is pinned by
+`contract/store/testdata/worker-store.golden.json` and
+`internal/handler/testdata/worker-store.golden.json`. `departs_on` and
+`budget_mins` are `omitempty` on the wire; the fixture keeps both non-empty so
+neither the SPA-269 nor the SPA-326 field can hide.
+
+`make check-contract` (and a CI job of the same name) still fetches the
+worker's copies on `main` and diffs both fixtures; it is not part of
+`make dev-workflow` because it needs the network. A prose copy of a
+fixture is a third copy and goes stale.
+
+The graph travels inline — a few kilobytes for CA HSR, roughly 30 KB for a large
+authored scenario — so the worker needs no database of its own. Publisher
+confirms are required: without them the API could insert a routing job, fail to
+publish, and strand it in `queued` while a client polls work no worker will ever
+see. On a failed confirm the job is marked failed immediately and the caller
+gets a 502 carrying the `publish_failed` code.
+
+The worker does not connect to Postgres (SPA-273). Job transitions and the
+egress-polygon cache go through `/api/internal/...`, gated by `WORKER_TOKEN`
+(a shared bearer secret, not a user session). Unset, those routes answer 503
+rather than being left unauthenticated. Deploy this side before the worker:
+its startup ping is `GET /api/internal/worker`. Transit cache rows also carry
+`departs_on` (SPA-269) and `budget_mins` (SPA-326); walk/bike/drive omit both,
+and both are NULL in the table for those modes. Below the contour ceiling the
+budget and the contour together fix when the rider left the station, which the
+date alone does not — see the worker README's "Caching egress polygons" and
+migration `00029`'s header for the deploy order.
+
+A cache write that collides with an existing row replaces it only when the
+incoming polygon is usable and either the stored one is not (the worker
+discards it on read) or the incoming `tileset_at` is newer — a NULL stamp loses
+to a real one (SPA-328). Otherwise the conflict is a silent no-op, so a
+synthetic or stale-tileset worker cannot overwrite a good row, and a bad row is
+no longer recomputed and dropped on every request. The "usable" test is the
+worker's `isochrone.usable` re-expressed as jsonb in
+`internal/persistence/postgres/worker.go`; nothing fails if the two drift.
+
+A cache lookup returns each row's `tileset_at` beside its geometry (omitted
+when NULL), and the worker treats a row whose stamp is not the tileset Valhalla
+is serving now as a miss (SPA-325). Together with the write guard above, a map
+cycle needs no purge: each stale row is recomputed once and replaced. The
+worker README records how it treats a NULL stamp. An older worker ignores the
+added field, so deploy this side first.
+
+The internal endpoints cap their bodies like every other handler (SPA-332),
+answering an oversized one `413` with `request body too large`: 8 MiB for a
+job's result and for a cache put, 1 MiB for a lookup, 64 KiB for a failure.
+A lookup or put also carries at most 1000 keys or entries, and more is a `400`
+naming the limit. The worker treats a refused lookup as a miss and a refused
+put as an unwritten row, so neither changes a job's outcome. A refused result
+does, which is why its cap is generous: the largest real chain
+(`internal/handler/testdata/cache-put-sj-240-bike.json` and its result,
+`chain-result-sj-240-bike.json`) sits under a sixteenth of it. A put is all or nothing:
+one rejected entry loses the whole batch, on purpose.
+
+Every isochrone request's `budget_mins` must be between 1 and 300. Above the
+worker's 320-minute contour ceiling the chain clamps its contours, and 300
+keeps every request below it while leaving room above the site's largest
+preset, 240.
+
+Travel mode is stored in the domain's own vocabulary — `walk` / `bike` /
+`drive` / `transit` ([CONTEXT.md](CONTEXT.md#travel-mode-vs-costing)). "Costing"
+is Valhalla's word for the same concept and stays at the worker's client
+boundary, which is also where `transit` becomes Valhalla's `multimodal`
+(SPA-246). A Postgres CHECK holds the same set (migration 00021), so a mode the
+API would refuse is not storable either.
+
+### Capping the backlog
+
+Every isochrone endpoint enqueues onto one queue that one worker consumes
+serially, so nothing but a ceiling bounds how much work can be waiting. Since
+SPA-219 an enqueue is refused with `429` and the `backlog_full` code, plus a
+`Retry-After`, once `MAX_INFLIGHT_ISOCHRONES` routing jobs are already queued or
+running (default 20; `0` disables the cap). The refusal happens before the
+request body is read and before any graph is fetched, so a flood costs one
+indexed `count` each rather than an ever-growing queue that legitimate requests
+wait behind.
+
+The signal is the count of unfinished `routing_jobs` rather than the broker's
+queue depth: the rows are the record this API already writes on that path, and
+they also count a job the worker has picked up but not finished. Only jobs
+younger than `handler.RoutingJobStaleAfter` count, which is what keeps a dead
+worker's abandoned rows from wedging the cap shut forever — and is why recovery
+needs nothing: the count falls as the worker drains, or as jobs age out.
+
+The ceiling is per deployment, not per caller. That is deliberate: bounding
+total work is what it is for. Per-caller fairness is a separate check, below.
+Since SPA-357 anyone on the internet can spend it, through a publication's
+isochrone as well as `POST /api/isochrone`, so an anonymous flood fills the
+same backlog an owner's draft isochrone waits on; the per-IP limit below is
+what keeps one caller from doing that alone.
+
+### Reusing a previous job
+
+Since SPA-331 an isochrone request that repeats one already answered is
+answered with that earlier routing job: `200` with the succeeded job, no new
+row, no queue message, nothing counted against the backlog. A repeat means the
+same compiled graph, mode, budget and owner, at an origin equal to five decimal
+places, and the earlier result still fresh: not past the service date the
+worker computed it for (`reusable_until`), and cut from the newest tileset any
+job has reported (`tileset_at`). The rules and their reasoning are in migration
+`00034`; the word is defined in [`CONTEXT.md`](CONTEXT.md).
+
+The backlog cap above still runs first, so at a full backlog a repeat is
+refused with `429` like any other request.
+
+### Per-caller rate limits
+
+The expensive POST routes also carry an in-process token bucket (SPA-220),
+keyed by client IP and, when a session is present, user id. The client IP is
+taken from `X-Forwarded-For` by skipping `TRUSTED_PROXY_COUNT` hops from the
+right of every `X-Forwarded-For` value plus `RemoteAddr` (the TCP peer). A
+spoofed leftmost entry cannot pick the bucket; too high a count walks into
+those spoofed values — if buckets look shared across users, try 2, do not
+keep raising. Do not switch to leftmost `X-Forwarded-For`: Railway's hop
+count has drifted (a CDN/Fastly hop may appear; `X-Real-IP` is documented
+but has been the Fastly POP), and leftmost is client-controlled.
+
+Railway sits behind one reverse-proxy hop; the production `Load()` default
+is therefore 1. `0` ignores the header and uses `RemoteAddr` only — the
+right setting for a process that is not behind a proxy (set
+`TRUSTED_PROXY_COUNT=0` locally). When the count is at least 1 and
+`X-Forwarded-For` is empty, a valid `X-Real-IP` is used as a single hop; it
+is ignored when `X-Forwarded-For` is present.
+
+A refused request answers `429` with the `rate_limited` code and `Retry-After`.
+The four policies, overridable by env, are disabled only by `PER_MIN=0`
+(a zero burst is ignored and keeps the default burst):
+
+| Policy | Routes | Default |
+| --- | --- | --- |
+| Isochrone | All `POST .../isochrone` (one shared limiter) | 10/min, burst 5 |
+| Snap-stops | `POST /api/routes/{slug}/snap-stops` | 30/min, burst 10 |
+| Login | `POST /api/auth/login`, `GET`/`POST /api/auth/tokens/{token}` and `POST /api/auth/password` (one shared limiter) | 5/min, burst 5 |
+| Compile | All three compile POSTs (one shared limiter) | 10/min, burst 3 |
+
+Ordinary CRUD, routing-job polling, public scenario/graph reads, `/healthz`,
+`/readyz`, `/api/routing/status`, and `/api/internal/*` are not limited here.
+
+### Polling a routing job
+
+`GET /api/routing-jobs/{id}` returns the job's status and, once succeeded, its
+result. A job with **no owner** came from the public `POST /api/isochrone` or from a
+publication's `POST /api/services/{slug}/publication/isochrone`, and is
+readable by anyone holding its id — a v4 UUID, unguessable. An **owned** job,
+from one of the authored isochrones, answers 404 to anyone but its owner or an
+admin, so a caller cannot probe which job ids exist.
+
+While the job is `queued`, the response also carries `queue_position`: the
+number of in-flight jobs created before it, so `0` means it is next (SPA-437).
+It is absent once the job is `running` or finished, and absent if the count
+could not be read. It is counted on each poll, not stored.
+
+### Routing status
+
+`GET /api/routing/status` says whether live plotting is working, so the
+website can warn a visitor before they wait out the 120 s deadline (SPA-442).
+It answers `offline` once the worker has been silent for 2 minutes, whether or
+not anyone has asked for a splash zone (SPA-503): the worker heartbeats every
+30 s as a single replica that never scales to zero, so a live one is never that
+quiet.
+It is public and cached for ten seconds:
+
+```json
+{"status": "ok", "oldest_queued_secs": 0, "inflight": 0}
+```
+
+`inflight` and `oldest_queued_secs` count routing jobs younger than
+`handler.RoutingJobStaleAfter`, as the backlog cap does. `status` is one of the
+three [routing statuses](CONTEXT.md#routing-status). Worker contact is any
+authenticated `/api/internal/*` request, which the worker's 30 s heartbeat to
+`GET /api/internal/worker` guarantees while it is up. Contact is held in this
+process's memory, so a restart starts the clock again (a fresh process reads
+`ok` for its first 2 minutes) and a second replica would not see the first
+one's contact.
+
+## Seed data
+
+Scenarios live under `internal/transit/data/scenarios/<slug>/` and are embedded
+into the binary. Each scenario directory contains:
+
+| File | Role |
+| --- | --- |
+| `scenario.yaml` | Scenario metadata |
+| `vehicle_types.yaml` | Rolling stock (speed, accel, dwell level/step) |
+| `routes.yaml` | Alignments (geometry + mode) |
+| `stations.yaml` | Stations (slug, location, platform height) |
+| `services.yaml` | Stopping patterns, frequency windows, vehicle |
+| `segment_run_times.yaml` | Adjacent segment run times (compiler input) |
+
+Until the editor exists, these YAML files are the authoring interface.
+
+### Segment times
+
+`segment_run_times.yaml` holds **run time** only (`run_seconds`; train in
+motion). Dwell is resolved separately at compile time from vehicle × platform
+height (or a per-stop override) and folded into `Edge.Seconds`. `DwellS` is
+the dwell *part* of `Seconds`, not an extra addend. See **Dwell** (and **Run
+time** for the seed-field semantics) in [`CONTEXT.md`](CONTEXT.md).
+
+### Provenance tiers
+
+Services carry a provenance tier that gates which editor levers are honest. The
+three tiers, and the trap that `travel_time_sets.provenance` is a different
+free-form field, are defined under **Provenance tier** in
+[`CONTEXT.md`](CONTEXT.md). CA HSR seed services are `calibrated`.
+
+## Branching and releases
+
+One trunk: `main`. Branch from it, PR into it. Production runs an image promoted
+from the Actions tab — see [`docs/releases.md`](docs/releases.md). Linear
+records which issues landed on staging vs production from those same publishes
+and tags.
+
+## Requirements
+
+- [Go](https://go.dev/dl/) 1.26.10+
+- [Docker](https://www.docker.com/) (optional; for containerized runs and the
+  database integration tests — podman also works)
+- `golangci-lint` (installed automatically by `make lint` if missing)
+
+## Getting started
+
+Clone the repo, set up your local environment, and run:
+
+```sh
+cp .env.example .env
+# Optionally set AMQP_URL to enable the isochrone endpoints
+make run
+```
+
+This builds the binary to `bin/sparks-effect-api` and starts it, listening on
+`:8080` by default. The server loads `.env` automatically on startup if the
+file exists — variables already set in the shell take precedence. Override the
+port with `PORT` in `.env` or your shell:
+
+```sh
+PORT=9090 make run
+```
+
+Check it's up:
+
+```sh
+curl localhost:8080/healthz
+```
+
+`/healthz` is liveness: it answers `{"status":"ok"}` whenever the process is
+serving. `/readyz` is readiness: it pings Postgres and the broker (concurrently,
+within about a second) and answers 200 with `{"postgres":"ok","amqp":"ok"}`,
+or 503 naming whichever is `"unavailable"`. A component the deployment runs
+without — no `DATABASE_URL` or no `AMQP_URL` — reads `"disabled"` and does not
+fail the check, so a local run with neither answers 200. Both probes log at
+debug, not info.
+
+## Compression and caching
+
+JSON bodies of 1 KB or more are gzipped for clients that send
+`Accept-Encoding: gzip`, except under `/api/internal/`, which is the worker's
+contract and stays uncompressed. Expect about 3.5–4× on geometry-heavy bodies
+(publications, alignments, prerendered isochrones), since full-precision
+coordinates do not compress much, and 5–8× on the rest.
+
+Every response is `Cache-Control: private, no-store` unless it is one of the
+identity-free public reads, which answer
+`public, max-age=60, stale-while-revalidate=600` with a strong `ETag` and
+honour `If-None-Match` with `304`:
+
+| Read | The tag changes when |
+|------|----------------------|
+| `GET /api/scenarios`, `/api/scenarios/{slug}` and its `routes`, `services`, `stations`, `travel-times` | the build or the boarding-wait policy changes |
+| `GET /api/services/{slug}/publication` | it is republished (new pin, new `published_at`) or its author is renamed |
+| `GET /api/prerendered-isochrones/{id}` | the row's `updated_at` moves, or it becomes outdated |
+| `GET /api/scenarios/{slug}/prerendered-isochrones`, `GET /api/published-services` | the body does (the tag is a hash of it) |
+
+A gzipped body carries its tag with `-gzip` inside the quotes, since a strong
+tag names exact bytes. Either copy revalidates with its own tag.
+
+Every tag also folds in the commit the image was built from (CI passes it as the
+`BUILD_SHA` build argument), so after a deploy that changes a response's shape,
+no client is told by a `304` to keep the old body. A binary built without it, such as `make run`,
+uses a per-process value, so its tags last only until it restarts. The OptionalAuth
+reads (`GET /api/routes/{slug}`, `GET /api/scenarios/{slug}/graph`,
+`GET /api/routing-jobs/{id}`) answer per caller, so they stay private.
+
+## CORS
+
+Cross-origin requests are allowed from the project's own frontends, always and
+regardless of any flag:
+
+- `https://sparks-effect.app` and any subdomain of it (`https://dev.sparks-effect.app`,
+  and whatever comes next — the whole domain matches, so a new subdomain needs
+  no code change)
+- `https://sparks-effect-website.vercel.app`, the production Vercel alias
+- Vercel preview deployments on the `andrewcgraves-projects` team
+
+Everything else is refused. The match is HTTPS-only and requires a real
+subdomain boundary, so a lookalike such as `notsparks-effect.app` does not get
+in.
+
+## Local SPA testing (CORS)
+
+When running the Vue frontend locally (e.g. `npm run dev` on `http://localhost:5173`), the browser will block cross-origin requests unless CORS headers are present. Enable them for localhost origins only:
+
+```sh
+ALLOW_LOCALHOST_CORS=true make run
+```
+
+Or add `ALLOW_LOCALHOST_CORS=true` to `.env`. The flag is **off by default** and must never be set in production — it only allows `localhost` and `127.0.0.1` origins, never a wildcard.
+
+## Logging
+
+Every log line is a single JSON object — timestamp, level, message, and
+whatever structured fields the call site attaches — written to stderr, so it
+can be forwarded to Grafana through Alloy without scraping free text.
+
+`LOG_LEVEL` sets the minimum level logged: `debug`, `info`, `warn`, or `error`
+(case-insensitive). Unset or unrecognised defaults to `info`. `VERBOSE=true`
+is a back-compat alias for `LOG_LEVEL=debug`.
+
+At debug level the server additionally logs:
+
+- Each isochrone request's `lat`, `lng`, `budget_mins`, `mode`, and
+  `scenario_slug`
+- Each routing job as it is published, with the queue it went to and its
+  trace id.
+- When a seeded scenario compile is skipped on boot because it is already
+  compiled.
+
+Every request also gets one `info`-level access log line with its method,
+path, status, duration, and trace id, and every internal error is logged with
+the full error value before it is mapped to a 502 or 500 response.
+
+```sh
+LOG_LEVEL=debug make run
+```
+
+### Trace ids
+
+Every request carries a trace id, exposed via the `X-Trace-Id` header: if the
+caller (the website) sends one, the API uses it; if not, the API mints one and
+echoes it back in the response header. The id is attached to that request's
+own log lines and forwarded to the routing worker as `trace_id` on the queue
+message for any isochrone the request enqueues, so one request's logs can be
+followed across both services in Grafana.
+
+Sample request for San Jose downtown, walk 90 min, ca-hsr scenario. It answers
+202 with a routing job; poll that job for the result. Sent again, it answers 200
+with the same, already succeeded, job.
+
+```sh
+JOB=$(curl -s -X POST http://localhost:8080/api/isochrone \
+  -H 'Content-Type: application/json' \
+  -d '{"lat":37.3382,"lng":-121.8863,"budget_mins":90,"mode":"walk","scenario_slug":"ca-hsr"}' \
+  | jq -r .id)
+
+curl -s "http://localhost:8080/api/routing-jobs/$JOB" | jq '{status, error}'
+```
+
+## Metrics
+
+The API pushes OpenTelemetry metrics over OTLP/HTTP to the same Grafana Cloud
+stack as the cluster (SPA-433). It is pushed rather than scraped because the
+API runs on Railway, outside the cluster Alloy scrapes. Every 60 s, and once
+more on shutdown.
+
+| Series in Grafana | Labels | Recorded |
+|---|---|---|
+| `http_requests_total` | `route`, `method`, `status_class` | every request |
+| `http_request_duration_seconds` (histogram) | `route` | every request |
+| `compile_jobs_total` | `kind`, `outcome` (`succeeded`, `failed`, `error`) | each compile job |
+| `compile_duration_seconds` (histogram) | `kind` | each compile job |
+| `isochrone_backlog_inflight` (gauge) | — | each isochrone enqueue the backlog cap counts |
+| `backlog_full_total` | — | each `backlog_full` 429 |
+| `rate_limited_total` | `limiter` (`isochrone`, `snap_stops`, `login`, `compile`) | each `rate_limited` 429 |
+
+Labels are kept bounded because the free-tier active-series budget is tight
+(SPA-296). `route` is the mux pattern a request matched (`/api/scenarios/{slug}`),
+never the path it asked for, and `unmatched` when it matched none. `method` is
+one of the standard methods or `other`. `kind` is a known compile job kind or
+`other`. The instruments are named without `_total` or a unit suffix, because
+Grafana Cloud's OTLP ingest adds both.
+
+Export is configured entirely by the standard OpenTelemetry variables, which the
+exporter reads itself:
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod-us-west-0.grafana.net/otlp
+OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64 of instance-id:token>"
+OTEL_RESOURCE_ATTRIBUTES=service.namespace=staging
+```
+
+Grafana Cloud's OpenTelemetry card (stack → Configure) produces the first two.
+The service name defaults to `sparks-effect-api`, and Grafana derives `job` from
+the namespace and name, so the setting above makes it
+`job="staging/sparks-effect-api"`. The namespace is what keeps staging and
+production apart, both on dashboards and in the alert rules, which group by
+`job`. Use `service.namespace` rather than `deployment.environment`, because
+Grafana Cloud does not reliably put the latter on every series.
+
+With no endpoint set, nothing is exported and boot logs one `info` line saying
+so. That is the local default. An allowed-origin CORS preflight is answered
+before the mux, so it counts under `route="unmatched"` alongside real 404s.
+
+## Error reports
+
+Every internal error (each 500 answered through `writeInternalError`, a session
+lookup the auth middleware could not complete, a routing job the broker would
+not take, and any handler panic) is sent to Grafana Cloud as an OTLP log record
+(SPA-380), over the same gateway and with the same `OTEL_EXPORTER_OTLP_*`
+credentials as the metrics above. 4xx answers are the caller's mistake and are
+never reported. A panic is answered with a 500 rather than a dropped connection.
+
+Each record is `ERROR` severity, body `internal error`, and carries:
+
+| Attribute | Value |
+|---|---|
+| `trace_id` | the request's `X-Trace-Id`, so it links to the access log and the worker's logs |
+| `route` | the mux pattern matched, `GET /api/auth/me` |
+| `op` | what the handler was doing |
+| `exception.message` | the error text, with any `Bearer <token>` redacted |
+| `exception.type`, `exception.stacktrace` | `panic` and its stack, for a panic only |
+
+The resource carries `service.name=sparks-effect-api`, `service.namespace` from
+`OTEL_RESOURCE_ATTRIBUTES` (so staging and production stay apart, as for
+metrics), and `service.version`, the commit the image was built from. CI passes
+it as the `BUILD_SHA` build arg, and production re-tags the same image, so it
+keeps the SHA. Nothing from the request itself (headers, body) is attached.
+
+In Grafana they are in Loki:
+
+```logql
+{service_name="sparks-effect-api", service_namespace="production"} | severity_text="ERROR"
+```
+
+and the alert is a Loki rule on `count_over_time` of that query over 5m being
+above 0. With no endpoint set, nothing is sent, and boot logs one `info` line
+saying so.
+
+## Persistence
+
+Domain data (scenarios, routes, stations, vehicle types, services, jobs, users)
+is stored in Postgres via `pgx/v5` (pure Go — the `CGO_ENABLED=0` static
+build is preserved), with geometry stored as GeoJSON in `jsonb` columns and
+native `uuid`/`timestamptz`/`boolean` types throughout. Handlers depend on
+narrow store interfaces; boot-time load and seed talk to `transit.StoreSource`,
+`transit.SeedSink`, and `transit.SeedReconciler`. `postgres.Repo` satisfies all
+of them.
+
+- **Connection:** set `DATABASE_URL` (Railway injects this via its private
+  network). Cap the pool with `DATABASE_MAX_CONNS`. When `DATABASE_URL` is unset,
+  the server falls back to the read-only embedded YAML store, so the scenario
+  reads work without a database — but the isochrone routes answer `503`, since a
+  graph is identified by the compile job that produced it and there are no jobs
+  without a database. They answer `503` without `AMQP_URL` too: with no queue to
+  publish to there is no isochrone to be had.
+- **Migrations:** plain-SQL [`goose`](https://github.com/pressly/goose)
+  migrations in `internal/persistence/postgres/migrations/`, embedded into the
+  binary and run automatically on boot.
+- **Seed:** on first boot against an empty database, the embedded `ca-hsr` seed
+  data is written through `SeedSink` and then compiled, leaving a succeeded
+  compile job whose result is the scenario's graph — no manual step, no admin
+  credentials. On every boot `ReconcileSeed` upserts embedded YAML rows whose
+  content no longer matches what is stored, scoped to seeded scenarios, so a
+  YAML correction reaches a deployed database without a migration. A boot that
+  finds a graph already matching its source rows leaves it alone, so restarting
+  is not a recompile.
+
+## Authentication
+
+The API is **invite-only**: there is no signup route. Accounts exist only
+because an admin created them, and the first admin comes from the environment.
+
+Authentication is bearer-token based. `POST /api/auth/login` returns a token
+that clients send as `Authorization: Bearer <token>`. Tokens are opaque and
+stored server-side (only as a SHA-256 hash) rather than being JWTs, so logout
+genuinely revokes them and there is no signing key to manage. Passwords are
+bcrypt-hashed. Sessions expire after `SESSION_TTL_HOURS` (default 24).
+
+Authentication requires `DATABASE_URL`; with the read-only embedded store the
+auth endpoints answer `503` rather than pretending to work.
+
+### Invite and reset links
+
+An admin never chooses another person's password (SPA-387).
+`POST /api/admin/invites` with `{email, name, is_admin}` creates the account
+with no usable password and answers `{user, url}`.
+`POST /api/admin/users/{id}/reset-link` answers `{url}`. The admin sends the
+link however they like; there is no email delivery.
+
+The link is `<WEBSITE_URL>/set-password?token=<token>`. `WEBSITE_URL` defaults
+to `https://sparks-effect.app`. The page reads the token with
+`GET /api/auth/tokens/{token}` (`{purpose, email, expires_at}`) and submits the
+new password to `POST /api/auth/tokens/{token}` with `{password}`. That checks
+the password policy, sets the password, signs out every existing session, and
+answers exactly what login does.
+
+- An invite lasts 7 days; a reset link lasts 1 hour.
+- A link works once. Issuing a reset link revokes the account's earlier unused
+  one, and redeeming any link revokes every other unused link for the account.
+- A used, expired, unknown, or disabled-account link all answer the same `404`.
+- Only the SHA-256 hash of the token is stored, in `account_tokens`, as with
+  sessions.
+- Both token routes share the login rate limiter's bucket.
+
+`POST /api/admin/users`, which takes the password in the request, stays for
+scripts.
+
+### Two scenario models
+
+*Scenario* and *service* each name two models: the seeded world model
+(`Scenario`, `Service`) and the authored counterparts (`UserScenario`,
+`UserService`). `/api/me` is the owner-scoped view of the seeded types, not
+the authored ones. The authored surface is `/api/user-scenarios` and
+`/api/services`. `/api/me/services` returns **Services**; `/api/services`
+returns **UserServices**. Both collections are owner-scoped; the model is
+different. The `/api/me` prefix is not the split. See
+[CONTEXT.md](CONTEXT.md#the-one-that-catches-everyone-two-scenarios-two-services)
+for the map.
+
+### Authenticated endpoints
+
+This is the owner-scoped and admin-gated surface, plus login and the
+OptionalAuth snap-stops row — not a full route list, and not the public
+scenario/route reads or `/api/internal/*`.
+
+| Endpoint | Access | Purpose |
+| --- | --- | --- |
+| `POST /api/auth/login` | public | Exchange email + password for a token |
+| `GET /api/auth/tokens/{token}` | public | Read an invite or reset link: purpose, email, expiry |
+| `POST /api/auth/tokens/{token}` | public | Set the password from a link and sign in |
+| `POST /api/auth/logout` | authenticated | Revoke the presented token |
+| `GET /api/auth/me` | authenticated | The caller's identity and admin flag |
+| `PATCH /api/auth/me` | authenticated | Set the caller's display name (`{name}`, 1–80 characters after trimming); nothing else on the account changes |
+| `POST /api/auth/password` | authenticated | Change the caller's password (`{current_password, new_password}`): `401` on a wrong current password, `422` `validation` on a weak new one, `409` if a concurrent change or revocation got there first. Revokes every other session; the presenting one keeps working |
+| `POST /api/auth/sessions/revoke-all` | authenticated | Revoke every session the caller has, the presenting one included. `204` |
+| `GET /api/me/scenarios` | authenticated | Seeded Scenarios the caller owns |
+| `GET /api/me/services` | authenticated | Seeded Services the caller owns, not UserServices |
+| `POST /api/me/routes` | authenticated | Author an alignment of your own |
+| `GET`/`PUT`/`DELETE /api/me/routes/{slug}` | authenticated | Read, edit, or remove one |
+| `POST /api/routes/{slug}/snap-stops` | optional | Project stop coordinates onto a route's alignment; public for curated routes, owner-scoped for owned drafts |
+| `POST /api/me/scenarios` | authenticated | Author a seeded scenario of your own |
+| `GET`/`PUT`/`DELETE /api/me/scenarios/{slug}` | authenticated | Read, edit, or remove one |
+| `GET`/`POST /api/me/scenarios/{slug}/stations` | authenticated | Its stations |
+| `PUT`/`DELETE /api/me/scenarios/{slug}/stations/{stationSlug}` | authenticated | Edit or remove one |
+| `GET`/`PUT /api/me/scenarios/{slug}/travel-times` | authenticated | Its segment run times, read and replaced whole |
+| `POST /api/me/services` | authenticated | Author a seeded service inside a scenario you own |
+| `GET`/`PUT`/`DELETE /api/me/services/{id}` | authenticated | Read, edit, or remove one |
+| `POST /api/services/{slug}/handovers` | authenticated | Offer your service to another account by `to_email`. 202 with the same body whether or not the address is an active account, and nothing recorded when it is not; 422 to the owner, 409 while one is pending |
+| `GET /api/me/handovers` | authenticated | Your pending handovers, `{incoming, outgoing}`, with the service and the other party's display name |
+| `POST /api/handovers/{id}/cancel` | authenticated | Withdraw a pending offer you sent |
+| `POST /api/handovers/{id}/decline` | authenticated | Refuse a pending offer sent to you |
+| `POST /api/handovers/{id}/accept` | authenticated | Take ownership of a service offered to you, with its compile jobs and publication, in one transaction. 409 `service_in_scenarios` (detail lists the slugs) while the sender's scenarios still include it; 409 if the offer has closed or expired, or the sender no longer owns the service |
+| `POST /api/admin/users` | admin | Provision an account with a password (for scripts) |
+| `POST /api/admin/invites` | admin | Create an account and return its one-time invite link |
+| `POST /api/admin/users/{id}/reset-link` | admin | Return a one-time password-reset link |
+| `GET /api/admin/users` | admin | Every account, oldest first, with `disabled_at` and how many UserServices it authored (`service_count`) and has published (`published_count`) |
+| `PATCH /api/admin/users/{id}` | admin | Set `is_admin` and/or `disabled`; disabling revokes the account's sessions. An admin demoting or disabling themselves gets 409 |
+| `POST /api/admin/routes` | admin | Ingest a curated alignment |
+| `POST /api/admin/retention` | admin | Dry-run (empty body or `{"apply":false}`) or apply (`{"apply":true}`) isochrone-cache and routing-job-result retention. See [`docs/retention.md`](docs/retention.md) |
+| `PUT /api/admin/services/{slug}/owner` | admin | Move a service to the account named by `user_id` with no offer, for an owner who has left or is disabled. The same move as an accept, with any pending offer cancelled, recorded as an accepted handover carrying the admin's id in `forced_by`. 422 for an unknown or disabled account or the current owner; 409 `service_in_scenarios` like an accept |
+| `POST /api/scenarios/{slug}/prerendered-isochrones` | admin | Curate a ready-to-display isochrone for a scenario |
+
+### Owning the seeded models
+
+Scenarios, routes, stations, and services all carry a nullable `owner_id`. No
+owner means **curated**: the seeded ca-hsr baseline and the admin-ingested
+alignments, served by the public reads and writable only by an admin. An owner
+means someone authored it, and it is theirs.
+
+Authoring the **seeded** models works through `/api/me`, and an owned scenario
+is a real one — give it routes, stations, and segment run times and it compiles
+through the same path the baseline does, via
+`POST /api/scenarios/{slug}/compile`. It just never appears on a public
+surface. The authored `UserScenario` / `UserService` surface is a different
+model; see [Two scenario models](#two-scenario-models).
+
+One invariant holds that together: **a scenario and all of its children share
+one owner** ([CONTEXT.md](CONTEXT.md#seeded--curated--authored--owned)). The
+create and update handlers enforce it by refusing to attach a child to a
+scenario the caller does not own.
+
+That invariant is why containment is cheap. Only two reads filter on ownership —
+`ListCuratedScenarios` and `ListCuratedRouteSummaries`, named for what they
+return so the contract is visible at the call site. Everything scenario-scoped
+stays unfiltered, because scoping to a scenario has already scoped to its owner.
+`LoadStore` and `CompileSeededIfNeeded` read the curated list and nothing else,
+so no owned row is ever loaded into the public store or served by
+`GET /api/scenarios`.
+
+By-slug reads cannot filter — slugs are globally unique across curated and owned
+rows, so minting one has to see the whole namespace — so those paths check
+ownership themselves and the public ones (`GET /api/routes/{slug}`,
+`GET /api/scenarios/{slug}/graph`, `POST /api/isochrone`) sit behind
+`auth.OptionalAuth`: still public for the curated data they exist for, while an
+owner reaches their own draft and everyone else gets a 404 rather than
+confirmation that the slug exists.
+
+The existing `GET /api/scenarios/...` reads stay public — they serve curated
+data and are unauthenticated by design. That includes the two prerendered
+isochrone reads, `GET /api/scenarios/{slug}/prerendered-isochrones` (metadata
+only) and `GET /api/prerendered-isochrones/{id}` (with its payload); only the
+write above is gated, which is why it appears in the table despite not living
+under `/api/admin/`.
+
+### The published index
+
+`GET /api/published-services` lists every published `UserService` as a card:
+`slug`, `name`, `subtext`, `description`, `author_name` and `published_at`,
+by first publication, newest first, with slug breaking a tie. `published_at`
+is the latest publish, the same time the publication itself shows, and
+`author_name` is the owner's current display name (see
+[Byline](CONTEXT.md#seeded--curated--authored--owned)). Republishing keeps a service's place, so a
+paged walk never skips one (migration 00033). It is unauthenticated, and the
+answer is the same for every caller, so an owner does not see their own
+unpublished drafts there either
+([ADR-0005](docs/adr/0005-publishing-an-authored-service.md)). The prose is the
+publication's frozen copy, so a draft edit does not show until it is
+republished. `ListPublishedServiceSummaries` selects neither the stops or
+vehicle documents nor the publication's routes, nor anything about the owner
+but their name, and migration 00033 indexes
+`first_published_at` for its sort.
+
+It pages with a keyset cursor (SPA-434). `?limit=` asks for up to that many
+cards (default 50, capped at 100; anything that is not a positive integer is a
+`400`), and `?cursor=` continues after the page whose `next_cursor` it is; an
+empty cursor is the first page. Either parameter switches the response to
+`{"items": [...], "next_cursor": "..." | null}`, and `next_cursor` is `null` on
+the last page. The cursor is opaque URL-safe base64 of the last card's
+first-publish time and slug, so it depends on nothing about the caller and the
+pages stay cacheable; a malformed one is a `400`. A service published after a
+walk starts lands on page one, ahead of the cursor, and that walk does not see
+it.
+
+With neither parameter the endpoint still answers the bare array of every card,
+for websites built before SPA-434. It goes once the website's production tag
+reads pages.
+
+It is not `GET /api/services`, which stays the caller's own drafts. Curated
+scenarios stay at `GET /api/scenarios`: the two models differ, so a page that
+lists both calls both and merges them.
+
+### Bootstrapping the first admin
+
+Set both variables and boot once; the account is created if that email does not
+already exist, and is never overwritten on later boots (so leaving the variables
+in place cannot silently reset a password). The password must be at least 12
+characters, at most 72 bytes, not the same as the email, and not a common
+password, and a weak value fails the boot that would create the account.
+Existing accounts are left unchanged.
+
+```sh
+BOOTSTRAP_ADMIN_EMAIL=you@example.com
+BOOTSTRAP_ADMIN_PASSWORD=<a strong password>
+```
+
+Everyone else is then invited through `POST /api/admin/invites` (see
+[Invite and reset links](#invite-and-reset-links)), or provisioned with a
+password through `POST /api/admin/users`.
+
+### Authorization
+
+Five rules, all enforced server-side:
+
+- **Admin gating** — `RequireAdmin` protects account provisioning and management and is the
+  gate route-write endpoints register behind.
+- **Ownership** — `auth.CanAccess` is the single ownership predicate: admins
+  reach everything, other users reach only rows they own, and unowned rows (the
+  curated seed data) are admin-only. Owner-scoped reads resolve ownership in
+  SQL, so rows the caller does not own are never loaded — and scoping always
+  comes from the token's identity, never from a client-supplied parameter.
+- **Referencing** — `auth.CanReference` is its counterpart, and the two answer
+  differently for the same unowned row. A curated alignment is a public building
+  block anyone may point a service at, but admin-only to *mutate*. So
+  referencing a route uses `CanReference`; authoring into a scenario uses
+  `CanAccess`, because adding to a scenario is changing it.
+- **Publication** — the one public read of an authored service.
+  `GET /api/services/{slug}/publication` has no auth middleware at all and
+  reads the snapshot in `service_publications`, plus two things joined through
+  the draft row that no edit can change: its slug, and its owner's current
+  display name (`author_name`). So it answers everyone alike, owner included,
+  and never carries an unpublished edit, the owner's email or their id. An unpublished slug gets the same 404
+  as an unknown one, both before the first publish and after an unpublish.
+  `POST /api/services/{slug}/publication/isochrone` plots over it the same
+  way: no auth middleware, the same 404, and only the pinned compile job's
+  graph. It never checks staleness — a pin cannot stop matching itself — and
+  never compiles, and its routing job is **ownerless whoever asks**, owner
+  included, so the anonymous reader who enqueued it can poll it back. It sits
+  behind the shared isochrone rate limit and backlog cap like every other
+  isochrone. Publishing opens nothing else: the draft read, its graph, its
+  isochrone, compile and every write keep `CanAccess`, so a signed-in stranger
+  still gets 404 there and an anonymous caller 401. The draft isochrone keeps
+  plotting the owner's live graph and answering 409 `stale_graph`. See
+  [ADR-0005](docs/adr/0005-publishing-an-authored-service.md).
+- **Handover** — offering a service goes through `CanAccess` like any other
+  write, so an admin may offer one on the owner's behalf (the owner stays the
+  sender). Deciding does not: only the sender may cancel and only the
+  recipient may accept or decline, and everyone else, an admin included, gets
+  404. The offer answers 202 with one body whether or not `to_email` belongs
+  to an active account, so it cannot be used to discover who has one. A
+  pending offer past `expires_at` (14 days) reads as expired and can no
+  longer be cancelled, declined or accepted.
+- **Accepting a handover** moves the service in one transaction, with the
+  offer and the service rows locked, so two accepts of one offer succeed
+  exactly once. What moves: `user_services.owner_id`, and `owner_id` on the
+  service's compile `jobs` (the recipient polls `GET /api/jobs/{id}` on it).
+  What stays put: `service_publications` is keyed by the service and has no
+  owner, so the public page keeps answering identically; `routing_jobs` are
+  short-lived and left alone. A route the recipient cannot reference (owned,
+  and not by them) is **copied** to the recipient — new id and slug, same
+  geometry and segments, no scenario — and the service repointed; the
+  sender's route is never moved because they may use it elsewhere. A service
+  still in any of the sender's scenarios is **refused** with 409
+  `service_in_scenarios` listing the slugs: every member of a scenario must
+  belong to its owner, interchange pairs name the service's stops, and
+  silently editing the sender's scenarios is not something an accept does.
+  The sender removes it first and the same offer then goes through.
+- **An admin can move a service without an offer** (SPA-390), through
+  `PUT /api/admin/services/{slug}/owner` with `{user_id}`, for an owner who
+  has left, whose account is disabled, or who was the wrong person. It is the
+  same move as an accept, in `Repo.TransferUserService`, with the same
+  refusals (`service_in_scenarios`; a disabled account or the current owner
+  as the new owner), so no path around the handover rules exists. Any
+  pending offer on the service is cancelled in the same transaction, so its
+  recipient cannot later accept a service that has already moved, and the
+  move is recorded as an `accepted` row in `service_handovers` from the old
+  owner to the new with the admin's id in `forced_by`. The row answers the
+  call; it never lists under `/api/me/handovers`, which shows pending offers
+  only.
+
+### Database integration tests
+
+Integration tests need a throwaway Postgres. They skip automatically when
+`TEST_DATABASE_URL` (or `DATABASE_URL`) is unset, so `make test` stays green
+without a database; in CI a missing URL is a hard failure instead of a silent
+skip. Run them locally with one command (starts a container, runs the suite,
+tears it down):
+
+```sh
+make itest
+```
+
+Or manage the containers yourself:
+
+```sh
+make db-up            # start throwaway Postgres (postgres:16)
+make mq-up            # start throwaway RabbitMQ (rabbitmq:4-alpine)
+make test-integration # run the full suite against both
+make mq-down
+make db-down
+```
+
+There are two backing services because there are two things a fake cannot
+prove: that the schema is what the worker will find, and that a publish is
+actually confirmed by a broker. Both sets of tests skip themselves when their
+URL is unset, so `make test` stays green with neither running — except in CI,
+where a missing URL is a hard failure so a misconfigured pipeline cannot pass by
+silently skipping.
+
+Both the Makefile targets and CI use the same images and settings, so local and
+CI environments match. Use `make db-up DOCKER=podman` to use podman.
+
+## Development
+
+| Command                 | Description                                          |
+| ----------------------- | ---------------------------------------------------- |
+| `make test`             | Run the suite (integration tests skip without their services) |
+| `make itest`            | Start Postgres + RabbitMQ, run the full suite, tear them down |
+| `make test-integration` | Run the suite against `TEST_DATABASE_URL` and `TEST_AMQP_URL` |
+| `make db-up`/`db-down`  | Start / remove the throwaway Postgres container      |
+| `make mq-up`/`mq-down`  | Start / remove the throwaway RabbitMQ container      |
+| `make build`            | Build the binary to `bin/`                           |
+| `make run`              | Build and run the API locally                        |
+| `make lint`             | Run `golangci-lint`                                  |
+| `make vet`              | Run `go vet`                                         |
+| `make vulncheck`        | Run `govulncheck` over both modules (needs network)  |
+| `make check-contract`   | Diff the golden fixtures against the worker           |
+| `make dev-workflow`     | Run test, vet, lint, and build — full verification   |
+| `make tidy`             | Sync `go.mod`/`go.sum` with imports                  |
+| `make clean`            | Remove build output                                  |
+
+## Docker
+
+Build and run the API in a container:
+
+```sh
+docker build -t sparks-effect-api .
+docker run -p 8080:8080 sparks-effect-api
+```
+
+The runtime image is distroless static: non-root (uid 65532), CA certificates included, no shell and no package manager, so `docker exec` and `kubectl exec … sh` into the API container will not work.
+
+## Project layout
+
+```
+cmd/api/                     entrypoint (main.go)
+contract/                    shared API↔worker wire types (nested module)
+internal/config/             environment-based configuration
+internal/server/             HTTP server and route registration
+internal/handler/            HTTP handlers
+internal/auth/               password hashing, session tokens, middleware, ownership rule
+internal/ids/                UUID generation for runtime-created rows
+internal/compile/            in-process compile-job runner (not the routing worker)
+internal/transit/            domain types, TransitGraph compile, seed
+internal/persistence/postgres/  Postgres repository + goose migrations
+internal/routing/            confirm-mode AMQP publisher (message types live in contract/)
+```
+
+## CI
+
+GitHub Actions runs `test`, `vet`, and `lint` on every pull request and on
+pushes to `main` (the nested contract module included), diffs the golden
+fixtures against the worker as its own job (`make check-contract`), then
+builds the binary. The contract job
+needs `GH_CONTRACT_TOKEN` — a PAT that can read
+`sparks-effect-routing-worker` — because that repo is private. A push to
+`main` also builds the Docker image and publishes it to the GitHub
+Container Registry at `ghcr.io/andrewcgraves/sparks-effect-api`, tagged
+`sha-<commit>` (immutable) and `staging` (moving).
+
+Promoting from the Actions tab re-tags that same image as `prd` without
+rebuilding it, so production runs the bytes staging ran. There is no `latest`.
+See [`docs/releases.md`](docs/releases.md).

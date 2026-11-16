@@ -1,0 +1,234 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/andrewcgraves/sparks-effect-api/internal/account"
+	"github.com/andrewcgraves/sparks-effect-api/internal/auth"
+	"github.com/andrewcgraves/sparks-effect-api/internal/compile"
+	"github.com/andrewcgraves/sparks-effect-api/internal/config"
+	"github.com/andrewcgraves/sparks-effect-api/internal/ids"
+	"github.com/andrewcgraves/sparks-effect-api/internal/logger"
+	"github.com/andrewcgraves/sparks-effect-api/internal/persistence/postgres"
+	"github.com/andrewcgraves/sparks-effect-api/internal/routing"
+	"github.com/andrewcgraves/sparks-effect-api/internal/testdb"
+	"github.com/andrewcgraves/sparks-effect-api/internal/transit"
+	"golang.org/x/crypto/bcrypt"
+)
+
+func TestMain(m *testing.M) { testdb.Main(m) }
+
+var testHasher = auth.NewHasher(bcrypt.MinCost)
+
+func integrationServer(t *testing.T) (http.Handler, *postgres.Repo) {
+	t.Helper()
+	return integrationServerCapped(t, 0)
+}
+
+func integrationServerCapped(t *testing.T, maxInFlight int) (http.Handler, *postgres.Repo) {
+	t.Helper()
+	ctx := context.Background()
+
+	// A migrated database of this test's own, rather than a global reset of one
+	// shared with every other test in the repository. See internal/testdb for
+	// why that sharing was what forced `go test -p 1`.
+	repo, err := postgres.Connect(ctx, testdb.Fresh(t), 0)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	t.Cleanup(repo.Close)
+
+	store, err := transit.NewStore(transit.DefaultBoardingWaitPolicy())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	cfg := config.Config{
+		Port:                  "8080",
+		SessionTTL:            time.Hour,
+		MaxInFlightIsochrones: maxInFlight,
+		PasswordHashCost:      testHasher.Cost(),
+	}
+	return New(cfg, store, repo, &routing.FakePublisher{}, compile.NewRunner(repo, cfg.BoardingWait, nil), logger.Discard(), nil, nil).Handler, repo
+}
+
+func provisionAdmin(t *testing.T, repo *postgres.Repo, email, password string) string {
+	t.Helper()
+	hash, err := testHasher.Hash(password)
+	if err != nil {
+		t.Fatalf("Hash: %v", err)
+	}
+	id, err := ids.NewUUID()
+	if err != nil {
+		t.Fatalf("NewUUID: %v", err)
+	}
+	if err := repo.CreateUser(context.Background(), account.User{
+		ID: id, Email: email, Name: "Admin", IsAdmin: true,
+	}, hash); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	return id
+}
+
+func login(t *testing.T, h http.Handler, email, password string) (token string, status int) {
+	t.Helper()
+	body := `{"email":"` + email + `","password":"` + password + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		return "", rec.Code
+	}
+	var resp struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode login response: %v", err)
+	}
+	return resp.Token, rec.Code
+}
+
+func TestIntegration_ProvisionedAccountLogsInAndUsesItsToken(t *testing.T) {
+	h, repo := integrationServer(t)
+	provisionAdmin(t, repo, "admin@example.com", "admin-password")
+
+	if _, status := login(t, h, "admin@example.com", "wrong-password"); status != http.StatusUnauthorized {
+		t.Errorf("bad password: status %d, want 401", status)
+	}
+
+	token, status := login(t, h, "admin@example.com", "admin-password")
+	if status != http.StatusOK {
+		t.Fatalf("login: status %d, want 200", status)
+	}
+
+	rec := request(t, h, http.MethodGet, "/api/auth/me", token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/auth/me: status %d, want 200", rec.Code)
+	}
+	var me account.User
+	if err := json.NewDecoder(rec.Body).Decode(&me); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if me.Email != "admin@example.com" || !me.IsAdmin {
+		t.Errorf("/api/auth/me returned %+v", me)
+	}
+
+	// Logout revokes the token for good.
+	if rec := request(t, h, http.MethodPost, "/api/auth/logout", token); rec.Code != http.StatusNoContent {
+		t.Fatalf("logout: status %d, want 204", rec.Code)
+	}
+	if rec := request(t, h, http.MethodGet, "/api/auth/me", token); rec.Code != http.StatusUnauthorized {
+		t.Errorf("revoked token still works: status %d, want 401", rec.Code)
+	}
+}
+
+func TestIntegration_AdminProvisioningAndGating(t *testing.T) {
+	h, repo := integrationServer(t)
+	provisionAdmin(t, repo, "admin@example.com", "admin-password")
+	adminToken, _ := login(t, h, "admin@example.com", "admin-password")
+
+	body := `{"email":"member@example.com","name":"Member","password":"member-password"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/users", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("admin provisioning: status %d, want 201; body %s", rec.Code, rec.Body.String())
+	}
+
+	memberToken, status := login(t, h, "member@example.com", "member-password")
+	if status != http.StatusOK {
+		t.Fatalf("provisioned member could not log in: status %d", status)
+	}
+
+	// The member must not be able to provision further accounts — this is the
+	// gate that keeps the system invite-only rather than transitively open.
+	req = httptest.NewRequest(http.MethodPost, "/api/admin/users",
+		strings.NewReader(`{"email":"sneaky@example.com","password":"pw"}`))
+	req.Header.Set("Authorization", "Bearer "+memberToken)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("non-admin reached the admin endpoint: status %d, want 403", rec.Code)
+	}
+	if _, _, found, err := repo.GetUserCredentialsByEmail(context.Background(), "sneaky@example.com"); found || err != nil {
+		t.Error("a non-admin managed to provision an account")
+	}
+}
+
+func TestIntegration_OwnershipScopingIsEnforcedServerSide(t *testing.T) {
+	h, repo := integrationServer(t)
+	ctx := context.Background()
+	adminID := provisionAdmin(t, repo, "admin@example.com", "admin-password")
+
+	// Two members, each with one scenario, plus an unowned curated scenario.
+	adminToken, _ := login(t, h, "admin@example.com", "admin-password")
+	memberIDs := map[string]string{}
+	for _, email := range []string{"a@example.com", "b@example.com"} {
+		req := httptest.NewRequest(http.MethodPost, "/api/admin/users",
+			strings.NewReader(`{"email":"`+email+`","password":"their-password"}`))
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("provisioning %s: status %d", email, rec.Code)
+		}
+		var u account.User
+		if err := json.NewDecoder(rec.Body).Decode(&u); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		memberIDs[email] = u.ID
+	}
+
+	idA, idB := memberIDs["a@example.com"], memberIDs["b@example.com"]
+	for _, sc := range []transit.Scenario{
+		{ID: mustUUID(t), Slug: "a-net", Name: "A Net", OwnerID: &idA},
+		{ID: mustUUID(t), Slug: "b-net", Name: "B Net", OwnerID: &idB},
+		{ID: mustUUID(t), Slug: "curated", Name: "Curated"},
+		{ID: mustUUID(t), Slug: "admin-net", Name: "Admin Net", OwnerID: &adminID},
+	} {
+		if err := repo.CreateScenario(ctx, sc); err != nil {
+			t.Fatalf("CreateScenario %s: %v", sc.Slug, err)
+		}
+	}
+
+	tokenA, _ := login(t, h, "a@example.com", "their-password")
+	tokenB, _ := login(t, h, "b@example.com", "their-password")
+
+	assertOwnScenarios := func(token, wantSlug string) {
+		t.Helper()
+		rec := request(t, h, http.MethodGet, "/api/me/scenarios", token)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("/api/me/scenarios: status %d", rec.Code)
+		}
+		var got []transit.Scenario
+		if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(got) != 1 || got[0].Slug != wantSlug {
+			t.Errorf("got %+v, want only %s", got, wantSlug)
+		}
+	}
+
+	assertOwnScenarios(tokenA, "a-net")
+	assertOwnScenarios(tokenB, "b-net")
+	// Being an admin does not turn "my scenarios" into "all scenarios".
+	assertOwnScenarios(adminToken, "admin-net")
+}
+
+func mustUUID(t *testing.T) string {
+	t.Helper()
+	id, err := ids.NewUUID()
+	if err != nil {
+		t.Fatalf("NewUUID: %v", err)
+	}
+	return id
+}

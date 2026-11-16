@@ -1,0 +1,157 @@
+package handler
+
+import (
+	"net/http"
+
+	"github.com/andrewcgraves/sparks-effect-api/internal/transit"
+)
+
+type scenarioListItem struct {
+	ID          string `json:"id"`
+	Slug        string `json:"slug"`
+	Name        string `json:"name"`
+	Subtext     string `json:"subtext"`
+	Description string `json:"description"`
+}
+
+type vehicleTypeSummary struct {
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Propulsion  string  `json:"propulsion"`
+	MaxSpeedKMH float64 `json:"max_speed_kmh"`
+}
+
+type serviceSummary struct {
+	ID               string                    `json:"id"`
+	RouteID          string                    `json:"route_id"`
+	Name             string                    `json:"name"`
+	VehicleType      vehicleTypeSummary        `json:"vehicle_type"`
+	Direction        string                    `json:"direction"`
+	Provenance       string                    `json:"provenance"`
+	StopCount        int                       `json:"stop_count"`
+	FrequencyWindows []transit.FrequencyWindow `json:"frequency_windows"`
+}
+
+type scenarioDetail struct {
+	ID          string            `json:"id"`
+	Slug        string            `json:"slug"`
+	Name        string            `json:"name"`
+	Subtext     string            `json:"subtext"`
+	PlotLabel   string            `json:"plot_label,omitempty"`
+	Description string            `json:"description"`
+	Routes      []transit.Route   `json:"routes"`
+	Stations    []transit.Station `json:"stations"`
+	Services    []serviceSummary  `json:"services"`
+}
+
+func Scenarios(store *transit.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		all := store.GetScenarios()
+		items := make([]scenarioListItem, 0, len(all))
+		for _, sc := range all {
+			items = append(items, scenarioListItem{
+				ID:          sc.ID,
+				Slug:        sc.Slug,
+				Name:        sc.Name,
+				Subtext:     sc.Subtext,
+				Description: sc.Description,
+			})
+		}
+		writeJSON(w, http.StatusOK, items)
+	}
+}
+
+func ScenarioBySlug(store *transit.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		slug := r.PathValue("slug")
+		sc, ok := store.GetScenarioBySlug(slug)
+		if !ok {
+			writeError(w, http.StatusNotFound, "scenario not found")
+			return
+		}
+
+		routes := store.GetRoutesByScenario(sc.ID)
+		stations := store.GetStationsByScenario(sc.ID)
+		rawServices := store.GetServicesByScenario(sc.ID)
+
+		summaries := make([]serviceSummary, 0, len(rawServices))
+		for _, svc := range rawServices {
+			vt, _ := store.GetVehicleTypeByID(svc.VehicleTypeID)
+			summaries = append(summaries, serviceSummary{
+				ID:      svc.ID,
+				RouteID: svc.RouteID,
+				Name:    svc.Name,
+				VehicleType: vehicleTypeSummary{
+					ID:          vt.ID,
+					Name:        vt.Name,
+					Propulsion:  vt.Propulsion,
+					MaxSpeedKMH: vt.MaxSpeedKMH,
+				},
+				Direction:        svc.Direction,
+				Provenance:       svc.Provenance,
+				StopCount:        len(svc.Stops),
+				FrequencyWindows: svc.FrequencyWindows,
+			})
+		}
+
+		writeJSON(w, http.StatusOK, scenarioDetail{
+			ID:          sc.ID,
+			Slug:        sc.Slug,
+			Name:        sc.Name,
+			Subtext:     sc.Subtext,
+			PlotLabel:   sc.PlotLabel,
+			Description: sc.Description,
+			Routes:      routes,
+			Stations:    stations,
+			Services:    summaries,
+		})
+	}
+}
+
+func ScenarioRoutes(store *transit.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		slug := r.PathValue("slug")
+		sc, ok := store.GetScenarioBySlug(slug)
+		if !ok {
+			writeError(w, http.StatusNotFound, "scenario not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, store.GetRoutesByScenario(sc.ID))
+	}
+}
+
+func ScenarioServices(store *transit.Store, boardingWait transit.BoardingWaitPolicy) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		slug := r.PathValue("slug")
+		sc, ok := store.GetScenarioBySlug(slug)
+		if !ok {
+			writeError(w, http.StatusNotFound, "scenario not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, withBoardingWaits(r.Context(), store.GetServicesByScenario(sc.ID), nil, boardingWait))
+	}
+}
+
+func ScenarioStations(store *transit.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		slug := r.PathValue("slug")
+		sc, ok := store.GetScenarioBySlug(slug)
+		if !ok {
+			writeError(w, http.StatusNotFound, "scenario not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, store.GetStationsByScenario(sc.ID))
+	}
+}
+
+func ScenarioTravelTimes(store *transit.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		slug := r.PathValue("slug")
+		tt, ok := store.GetTravelTimes(slug)
+		if !ok {
+			writeError(w, http.StatusNotFound, "scenario not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, tt)
+	}
+}

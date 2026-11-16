@@ -1,0 +1,655 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/andrewcgraves/sparks-effect-api/internal/account"
+	"github.com/andrewcgraves/sparks-effect-api/internal/auth"
+	"github.com/andrewcgraves/sparks-effect-api/internal/compile"
+	"github.com/andrewcgraves/sparks-effect-api/internal/config"
+	"github.com/andrewcgraves/sparks-effect-api/internal/errorreport"
+	"github.com/andrewcgraves/sparks-effect-api/internal/handler"
+	"github.com/andrewcgraves/sparks-effect-api/internal/httpcache"
+	"github.com/andrewcgraves/sparks-effect-api/internal/metrics"
+	"github.com/andrewcgraves/sparks-effect-api/internal/persistence/postgres"
+	"github.com/andrewcgraves/sparks-effect-api/internal/ratelimit"
+	"github.com/andrewcgraves/sparks-effect-api/internal/routing"
+	"github.com/andrewcgraves/sparks-effect-api/internal/traceid"
+	"github.com/andrewcgraves/sparks-effect-api/internal/transit"
+)
+
+type AuthDeps interface {
+	handler.AuthStore
+	handler.AccountStore
+	handler.UserStore
+	handler.AdminUserStore
+	handler.OwnerStore
+	handler.RouteStore
+	handler.CompileStore
+	handler.ServiceStore
+	handler.ScenarioStore
+	handler.OwnedScenarioStore
+	handler.OwnedStationStore
+	handler.OwnedTravelTimesStore
+	handler.OwnedServiceStore
+	handler.OwnedRouteStore
+	handler.RoutingJobPollStore
+	handler.WorkerStore
+	handler.RoutingBacklogStore
+	handler.PrerenderedStore
+	handler.PublicationStore
+	handler.ServicePublicationStore
+	handler.PublishedServiceStore
+	handler.HandoverStore
+	handler.AdminHandoverStore
+	handler.AccountTokenStore
+	handler.RetentionStore
+	handler.RoutingQueueStore
+	GetSessionUser(ctx context.Context, tokenHash string) (account.User, bool, error)
+}
+
+var _ AuthDeps = (*postgres.Repo)(nil)
+
+// pinger below reads a component it cannot ping as "disabled", so these keep
+// the real ones from quietly dropping out of readiness.
+var (
+	_ handler.Pinger = (*postgres.Repo)(nil)
+	_ handler.Pinger = (*routing.AMQPPublisher)(nil)
+)
+
+func New(cfg config.Config, store *transit.Store, deps AuthDeps, publisher routing.Publisher, compiles *compile.Runner, lg *slog.Logger, m *metrics.Metrics, rep *errorreport.Reporter) *http.Server {
+	h, _ := routes(cfg, store, deps, publisher, compiles, lg, m, rep)
+	return &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		// Headers and body together. The largest body any route accepts is an
+		// 8 MiB route ingest, and the public ones are capped at 4 KiB, so 15 s
+		// only cuts off a client trickling its body in to hold the connection.
+		ReadTimeout: 15 * time.Second,
+		// No handler waits on the worker: isochrones and compiles enqueue and
+		// answer with a job id. The slowest response is a compiled graph or
+		// publication read, a few seconds at worst, so 60 s is headroom for a
+		// slow client downloading it rather than for slow work.
+		WriteTimeout: 60 * time.Second,
+		// Long enough that the SPA's burst of reads on a page reuses one
+		// connection, short enough that abandoned keep-alives are reclaimed.
+		IdleTimeout: 120 * time.Second,
+	}
+}
+
+// Records every pattern it registers, so a test can walk the whole route
+// table rather than a hand-kept copy of it.
+type routeTable struct {
+	*http.ServeMux
+	patterns []string
+}
+
+func (t *routeTable) Handle(pattern string, h http.Handler) {
+	t.patterns = append(t.patterns, pattern)
+	t.ServeMux.Handle(pattern, h)
+}
+
+func (t *routeTable) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Request)) {
+	t.Handle(pattern, http.HandlerFunc(h))
+}
+
+func routes(cfg config.Config, store *transit.Store, deps AuthDeps, publisher routing.Publisher, compiles *compile.Runner,
+	lg *slog.Logger, m *metrics.Metrics, rep *errorreport.Reporter) (http.Handler, []string) {
+	mux := &routeTable{ServeMux: http.NewServeMux()}
+
+	mux.HandleFunc("GET /healthz", handler.Health)
+	// Liveness above stays cheap; readiness asks the database and the broker
+	// (SPA-379). Both bare: a probe carries no identity and must not spend a
+	// rate-limit bucket.
+	mux.HandleFunc("GET /readyz", handler.Ready(pinger(deps), pinger(publisher), lg))
+
+	watch := handler.NewWorkerWatch(time.Now)
+
+	// Public reads: the curated scenario data, unauthenticated by design.
+	//
+	// This is a distinct resource from the owner-scoped UserScenario CRUD
+	// registered below at /api/user-scenarios: these routes read the seeded,
+	// compiled TransitGraph store and must keep answering exactly what they
+	// answer today. Rather than repurpose /api/scenarios/{slug} for both, the
+	// new resource lives at a path of its own — see registerAuthRoutes.
+	//
+	// The store is built once at boot from the seed, so what each of these
+	// answers is fixed for the process: its tag needs only the build, the
+	// path, and the one setting that shapes the bodies.
+	tags := httpcache.NewTagger(cfg.BuildSHA)
+	curatedVersion := fmt.Sprintf("curated %+v", cfg.BoardingWait)
+	curated := func(h http.Handler) http.Handler {
+		return httpcache.PathTagged(tags, curatedVersion, h)
+	}
+	mux.Handle("GET /api/scenarios", curated(handler.Scenarios(store)))
+	mux.Handle("GET /api/scenarios/{slug}", curated(handler.ScenarioBySlug(store)))
+	mux.Handle("GET /api/scenarios/{slug}/routes", curated(handler.ScenarioRoutes(store)))
+	mux.Handle("GET /api/scenarios/{slug}/services", curated(handler.ScenarioServices(store, cfg.BoardingWait)))
+	mux.Handle("GET /api/scenarios/{slug}/stations", curated(handler.ScenarioStations(store)))
+	mux.Handle("GET /api/scenarios/{slug}/travel-times", curated(handler.ScenarioTravelTimes(store)))
+
+	// One cap shared by every isochrone endpoint: they enqueue onto the
+	// same queue for the same single worker, so a per-endpoint ceiling would
+	// bound nothing. Built here rather than at each registration so the
+	// "disabled" warning is logged once (SPA-219).
+	capBacklog := passThrough
+	if deps != nil {
+		capBacklog = handler.CapIsochroneBacklog(deps, cfg.MaxInFlightIsochrones, lg, m)
+	}
+
+	clientIP := ratelimit.ClientIP(cfg.TrustedProxyCount)
+	limitIso := ratelimit.Limit(ratelimit.New(cfg.RateLimitIsochrone.RatePerMinute, cfg.RateLimitIsochrone.Burst), clientIP, m.RateLimited("isochrone"))
+	limitSnap := ratelimit.Limit(ratelimit.New(cfg.RateLimitSnapStops.RatePerMinute, cfg.RateLimitSnapStops.Burst), clientIP, m.RateLimited("snap_stops"))
+	limitLogin := ratelimit.Limit(ratelimit.New(cfg.RateLimitLogin.RatePerMinute, cfg.RateLimitLogin.Burst), clientIP, m.RateLimited("login"))
+	limitCompile := ratelimit.Limit(ratelimit.New(cfg.RateLimitCompile.RatePerMinute, cfg.RateLimitCompile.Burst), clientIP, m.RateLimited("compile"))
+
+	registerRouteRoutes(mux, deps, limitSnap)
+	registerCompileRoutes(mux, deps, publisher, capBacklog, limitIso, lg)
+	registerPrerenderedRoutes(mux, deps, tags)
+	registerPublishedServiceRoutes(mux, deps, tags)
+	registerAuthRoutes(mux, cfg, deps, publisher, compiles, tags, capBacklog, limitLogin, limitIso, limitCompile, lg)
+	registerWorkerRoutes(mux, cfg, deps, watch)
+	registerRoutingStatusRoutes(mux, deps, watch)
+
+	// Private by default, outside cors so a preflight is too: the public reads
+	// opt in themselves, and an authenticated or OptionalAuth answer is never
+	// stored for the next caller.
+	h := httpcache.DefaultPrivate(cors(mux, cfg.AllowLocalhostCORS))
+
+	// traceid.Middleware runs outermost: logRequests reads the trace id it
+	// attaches, and every handler downstream that enqueues routing work
+	// forwards the same id to the worker (see handler.enqueueIsochrone).
+	// The reporter swaps the request's context, so it goes outside
+	// logRequests, which reads r.Pattern back off the request it passed
+	// on; Recover goes inside it, so a panic's 500 is logged and counted.
+	return traceid.Middleware(rep.Middleware(logRequests(lg, m, errorreport.Recover(compressJSON(h))))), mux.patterns
+}
+
+func registerRouteRoutes(mux *routeTable, deps AuthDeps, limitSnap func(http.Handler) http.Handler) {
+	if deps == nil {
+		// The collection needs its own entry alongside the subtree: /api/routes/
+		// does not serve /api/routes, it makes the mux answer that path with a
+		// 307 to the trailing-slash form. Without this the list would redirect
+		// rather than report itself unavailable.
+		mux.HandleFunc("/api/routes", noDatabase("route storage is unavailable"))
+		mux.HandleFunc("/api/routes/", noDatabase("route storage is unavailable"))
+		return
+	}
+	// The list filters in SQL, so it needs no identity: ListCuratedRouteSummaries
+	// never loads an owned row.
+	mux.HandleFunc("GET /api/routes", handler.Routes(deps))
+
+	// The two by-slug paths take OptionalAuth rather than nothing. They stay
+	// public — the curated alignments are what they exist to serve — but a
+	// route now has an owner, and without an identity on the context an owner
+	// could not read back their own draft here, while everyone else would be
+	// able to confirm it exists by guessing its slug. Same shape as
+	// GET /api/routing-jobs/{id}, which is public for an unowned job and
+	// owner-scoped for an owned one.
+	optional := auth.OptionalAuth(deps.GetSessionUser)
+	mux.Handle("GET /api/routes/{slug}", optional(handler.RouteBySlug(deps)))
+	mux.Handle("POST /api/routes/{slug}/snap-stops", optional(limitSnap(handler.SnapStops(deps))))
+}
+
+func registerCompileRoutes(mux *routeTable, deps AuthDeps, publisher routing.Publisher,
+	capBacklog, limitIso func(http.Handler) http.Handler, lg *slog.Logger) {
+	if deps == nil {
+		mux.HandleFunc("GET /api/scenarios/{slug}/graph", noDatabase("compiled graph storage is unavailable"))
+		mux.HandleFunc("POST /api/isochrone", noDatabase("compiled graph storage is unavailable"))
+		mux.HandleFunc("GET /api/routing-jobs/{id}", noDatabase("routing job storage is unavailable"))
+		return
+	}
+	// All three are public, and all three take OptionalAuth for the same
+	// reason: a scenario now has an owner, so each has a curated half anyone
+	// may reach and an owned half only its owner may. Requiring auth would
+	// take the seeded data away from the anonymous callers these exist for;
+	// omitting it would hand an owner's compiled graph to anyone with the slug.
+	optional := auth.OptionalAuth(deps.GetSessionUser)
+	mux.Handle("GET /api/scenarios/{slug}/graph", optional(handler.ScenarioGraph(deps)))
+	// Limit sits after OptionalAuth (so a session, when present, keys a
+	// user bucket) and before the backlog cap (cheap in-memory check
+	// before a DB count). The same limiter instance is shared with the
+	// authored isochrone POSTs and the published-service isochrone.
+	mux.Handle("POST /api/isochrone",
+		optional(limitIso(requirePublisher(publisher, capBacklog(handler.Isochrone(deps, publisher, lg))))))
+	mux.Handle("GET /api/routing-jobs/{id}", optional(handler.RoutingJobStatus(deps)))
+}
+
+func registerPrerenderedRoutes(mux *routeTable, deps AuthDeps, tags httpcache.Tagger) {
+	const unavailable = "prerendered isochrone storage is unavailable"
+	if deps == nil {
+		mux.HandleFunc("/api/scenarios/{slug}/prerendered-isochrones", noDatabase(unavailable))
+		mux.HandleFunc("/api/prerendered-isochrones/{id}", noDatabase(unavailable))
+		return
+	}
+	mux.HandleFunc("GET /api/scenarios/{slug}/prerendered-isochrones", handler.PrerenderedIsochrones(deps, tags))
+	mux.HandleFunc("GET /api/prerendered-isochrones/{id}", handler.PrerenderedIsochrone(deps, tags))
+}
+
+func registerPublishedServiceRoutes(mux *routeTable, deps AuthDeps, tags httpcache.Tagger) {
+	if deps == nil {
+		mux.HandleFunc("/api/published-services", noDatabase("publication storage is unavailable"))
+		return
+	}
+	// The public index of published services (SPA-358). A path of its own
+	// rather than a mode of GET /api/services, which lists the caller's own
+	// drafts: a query parameter that changed whose services come back would
+	// make one URL mean two things. Nor /api/services/published, which would
+	// shadow the service whose slug is "published".
+	//
+	// Bare, not OptionalAuth: the answer is the same for every caller, so
+	// there is no identity for it to read. Curated scenarios stay at
+	// GET /api/scenarios; a page that wants both calls both.
+	mux.HandleFunc("GET /api/published-services", handler.PublishedServices(deps, tags))
+}
+
+// A component that cannot be pinged — no database, no broker, or the
+// in-memory FakePublisher — reads as "disabled" rather than failing readiness.
+func pinger(v any) handler.Pinger {
+	p, _ := v.(handler.Pinger)
+	return p
+}
+
+func passThrough(next http.Handler) http.Handler { return next }
+
+func requirePublisher(publisher routing.Publisher, h http.Handler) http.Handler {
+	if publisher == nil {
+		return serviceUnavailable("the routing queue is unavailable: no broker configured")
+	}
+	return h
+}
+
+func registerAuthRoutes(mux *routeTable, cfg config.Config, deps AuthDeps, publisher routing.Publisher, compiles *compile.Runner, tags httpcache.Tagger,
+	capBacklog, limitLogin, limitIso, limitCompile func(http.Handler) http.Handler, lg *slog.Logger) {
+	if deps == nil {
+		for _, pattern := range []string{
+			"/api/auth/login", "/api/auth/logout", "/api/auth/me",
+			"/api/auth/password", "/api/auth/sessions/revoke-all",
+			"/api/auth/tokens/",
+			"/api/me/scenarios", "/api/me/services",
+			// The owner-scoped seeded-model CRUD. Each collection needs its own
+			// entry alongside its subtree: "/api/me/routes/" does not serve
+			// "/api/me/routes", it makes the mux answer that path with a 307 to
+			// the trailing-slash form — so without both, the list would redirect
+			// rather than report itself unavailable. The two entries above are
+			// exact paths and do not cover their {slug} subtrees either.
+			"/api/me/routes", "/api/me/routes/",
+			"/api/me/scenarios/", "/api/me/services/",
+			"/api/admin/",
+			"/api/scenarios/{slug}/compile", "/api/jobs/{id}",
+			"/api/services", "/api/services/",
+			"/api/user-scenarios", "/api/user-scenarios/",
+			"/api/me/handovers", "/api/handovers/",
+		} {
+			mux.HandleFunc(pattern, noDatabase("authentication is unavailable"))
+		}
+		return
+	}
+
+	authenticated := auth.RequireAuth(deps.GetSessionUser)
+	adminOnly := auth.RequireAdmin(deps.GetSessionUser)
+
+	// One hasher for every password path. Login's constant-time padding has to
+	// spend the same work provisioning does, so they must not be built with
+	// different costs. cfg.PasswordHashCost is zero everywhere but the tests,
+	// where it is bcrypt.MinCost.
+	hasher := auth.NewHasher(cfg.PasswordHashCost)
+
+	// Public. There is deliberately no registration endpoint — accounts come
+	// from an admin, by invite or POST /api/admin/users.
+	mux.Handle("POST /api/auth/login", limitLogin(handler.Login(deps, cfg.SessionTTL, hasher)))
+	// Invite and reset links (SPA-387). Behind the login limiter, and the same
+	// instance of it: redeeming a link is signing in by another route, so a
+	// caller gets one budget for guessing credentials, not two.
+	mux.Handle("GET /api/auth/tokens/{token}", limitLogin(handler.AccountToken(deps)))
+	mux.Handle("POST /api/auth/tokens/{token}", limitLogin(handler.RedeemAccountToken(deps, cfg.SessionTTL, hasher)))
+
+	// Authenticated.
+	mux.Handle("POST /api/auth/logout", authenticated(handler.Logout(deps)))
+	mux.Handle("GET /api/auth/me", authenticated(handler.Me()))
+	mux.Handle("PATCH /api/auth/me", authenticated(handler.UpdateMe(deps)))
+	// Shares login's limiter instance, not just its policy: each attempt runs
+	// bcrypt, and a separate bucket would double a caller's guessing allowance.
+	mux.Handle("POST /api/auth/password", authenticated(limitLogin(handler.ChangePassword(deps, hasher))))
+	mux.Handle("POST /api/auth/sessions/revoke-all", authenticated(handler.RevokeAllSessions(deps)))
+	mux.Handle("GET /api/me/scenarios", authenticated(handler.MyScenarios(deps)))
+	mux.Handle("GET /api/me/services", authenticated(handler.MyServices(deps, cfg.BoardingWait)))
+	// Async compile jobs: any authenticated caller may trigger a compile or
+	// poll a job. JobStatus enforces ownership itself (see its doc comment),
+	// since "not found" there means something different from "not admin".
+	mux.Handle("POST /api/scenarios/{slug}/compile", authenticated(limitCompile(handler.CompileScenario(deps, compiles))))
+	mux.Handle("GET /api/jobs/{id}", authenticated(handler.JobStatus(deps)))
+
+	// Owner-scoped CRUD over the seeded route model. Distinct from the public
+	// /api/routes reads registered in registerRouteRoutes: those serve the
+	// curated alignments anyone may pick from, while these are a caller's own
+	// drafts, so they sit behind the auth gate rather than beside them.
+	//
+	// /api/me is where the owner-scoped view of the seeded models already
+	// lives — GET /api/me/scenarios and /api/me/services predate this — so the
+	// ownership scope is in the path where a reader sees it.
+	mux.Handle("POST /api/me/routes", authenticated(handler.CreateOwnedRoute(deps)))
+	mux.Handle("GET /api/me/routes", authenticated(handler.MyRoutes(deps)))
+	mux.Handle("GET /api/me/routes/{slug}", authenticated(handler.GetOwnedRoute(deps)))
+	mux.Handle("PUT /api/me/routes/{slug}", authenticated(handler.UpdateOwnedRoute(deps)))
+	mux.Handle("DELETE /api/me/routes/{slug}", authenticated(handler.DeleteOwnedRoute(deps)))
+
+	// Owner-scoped CRUD over the seeded scenario model. The list read at
+	// GET /api/me/scenarios is registered above and predates the writes.
+	//
+	// Distinct from /api/user-scenarios, which curates a set of UserService
+	// ids: this is a scenario in the seeded sense — it holds its own routes,
+	// stations, segments, and services, and compiles through the same path the
+	// ca-hsr baseline does.
+	mux.Handle("POST /api/me/scenarios", authenticated(handler.CreateOwnedScenario(deps)))
+	mux.Handle("GET /api/me/scenarios/{slug}", authenticated(handler.GetOwnedScenario(deps)))
+	mux.Handle("PUT /api/me/scenarios/{slug}", authenticated(handler.UpdateOwnedScenario(deps)))
+	mux.Handle("DELETE /api/me/scenarios/{slug}", authenticated(handler.DeleteOwnedScenario(deps)))
+
+	// A scenario's stations, and the segment run times between them. Together
+	// with its routes and services these are what make an owned scenario
+	// compilable — without stations there is nothing for a service to stop at,
+	// and without segments the compiler has no path to place those stops on.
+	//
+	// Stations are addressed by (scenario, slug) because stations.slug is
+	// unique per scenario rather than globally.
+	mux.Handle("GET /api/me/scenarios/{slug}/stations", authenticated(handler.ListOwnedStations(deps)))
+	mux.Handle("POST /api/me/scenarios/{slug}/stations", authenticated(handler.CreateOwnedStation(deps)))
+	mux.Handle("PUT /api/me/scenarios/{slug}/stations/{stationSlug}", authenticated(handler.UpdateOwnedStation(deps)))
+	mux.Handle("DELETE /api/me/scenarios/{slug}/stations/{stationSlug}", authenticated(handler.DeleteOwnedStation(deps)))
+
+	// Travel times are written as a whole set rather than per segment: a
+	// segment has no identity a client can address, and the set is meaningful
+	// only entire — the compiler walks it as one graph.
+	mux.Handle("GET /api/me/scenarios/{slug}/travel-times", authenticated(handler.GetOwnedTravelTimes(deps)))
+	mux.Handle("PUT /api/me/scenarios/{slug}/travel-times", authenticated(handler.ReplaceOwnedTravelTimes(deps)))
+
+	// Owner-scoped CRUD over the seeded service model. Addressed by id, not
+	// slug: the services table has no slug column, which removes slug minting
+	// from this model entirely.
+	//
+	// Distinct from /api/services, which is the self-contained UserService with
+	// its own inline vehicle and embedded stops. These are seeded services:
+	// they reference a scenario's stations and the shared vehicle-type catalog,
+	// and compile through the same path the ca-hsr baseline does.
+	mux.Handle("POST /api/me/services", authenticated(handler.CreateOwnedService(deps, cfg.BoardingWait)))
+	mux.Handle("GET /api/me/services/{id}", authenticated(handler.GetOwnedService(deps, cfg.BoardingWait)))
+	mux.Handle("PUT /api/me/services/{id}", authenticated(handler.UpdateOwnedService(deps, cfg.BoardingWait)))
+	mux.Handle("DELETE /api/me/services/{id}", authenticated(handler.DeleteOwnedService(deps)))
+
+	// User-authored services: owner-scoped CRUD. Reads are owner-scoped too —
+	// unlike the curated scenario data these are a user's own drafts, so they
+	// sit behind the same gate as the writes rather than the public reads.
+	mux.Handle("POST /api/services", authenticated(handler.CreateService(deps, cfg.BoardingWait)))
+	mux.Handle("GET /api/services", authenticated(handler.MyUserServices(deps, cfg.BoardingWait)))
+	mux.Handle("GET /api/services/{slug}", authenticated(handler.GetService(deps, cfg.BoardingWait)))
+	mux.Handle("PUT /api/services/{slug}", authenticated(handler.UpdateService(deps, cfg.BoardingWait)))
+	mux.Handle("DELETE /api/services/{slug}", authenticated(handler.DeleteService(deps)))
+	// Compiling a single service is the degenerate scenario compile; owner-scoped
+	// like the rest of the authored surface.
+	mux.Handle("POST /api/services/{slug}/compile", authenticated(limitCompile(handler.CompileUserService(deps, compiles))))
+	// Read that compile back, and plot over it, without wrapping the service in
+	// a scenario first (SPA-140). Twins of the /api/user-scenarios pair below,
+	// owner-scoped identically. The database-less 503 list above needs no entry
+	// for either: "/api/services/" is a subtree pattern and already covers them.
+	mux.Handle("GET /api/services/{slug}/graph", authenticated(handler.UserServiceGraph(deps)))
+	mux.Handle("POST /api/services/{slug}/isochrone",
+		authenticated(limitIso(requirePublisher(publisher,
+			capBacklog(handler.UserServiceIsochrone(deps, publisher, lg, cfg.BoardingWait))))))
+	// Publish pins the owner's latest non-stale compile and freezes the
+	// snapshot. Unpublish deletes it.
+	mux.Handle("PUT /api/services/{slug}/publication", authenticated(handler.PublishService(deps, cfg.BoardingWait)))
+	mux.Handle("DELETE /api/services/{slug}/publication", authenticated(handler.UnpublishService(deps)))
+	// The public read of that snapshot. It and the isochrone below are the
+	// only routes under /api/services that take no identity — not even
+	// OptionalAuth, because their answer must not depend on who asks
+	// (ADR-0005). The draft reads, its isochrone and the compile above stay
+	// authenticated: publishing opens this resource, not those. The
+	// database-less 503 comes from the "/api/services/" entry.
+	mux.Handle("GET /api/services/{slug}/publication", handler.GetServicePublication(deps, tags))
+	// Plot over that snapshot (SPA-357): the pinned graph only, and an
+	// ownerless routing job whoever asks, so the reader who enqueued it can
+	// poll it back without a session. Bare for the same reason as the read
+	// above; the IP bucket is the whole of its rate limit. It spends the same
+	// per-deployment backlog as every other isochrone, now on behalf of anyone
+	// on the internet, which is what SPA-220's limiter stands in front of.
+	mux.Handle("POST /api/services/{slug}/publication/isochrone",
+		limitIso(requirePublisher(publisher,
+			capBacklog(handler.PublicationIsochrone(deps, publisher, lg)))))
+
+	// Handing a service over to another account (SPA-388). The offer answers
+	// 202 with one body whether or not the address is an account, so it
+	// cannot be used to probe for them. Only the sender may cancel and only
+	// the recipient may accept or decline; anyone else, an admin included,
+	// gets 404. Accepting (SPA-389) moves the service, its compile jobs and
+	// its publication in one transaction, and is refused with 409
+	// service_in_scenarios while the sender's scenarios still list it. The
+	// database-less 503 for the offer comes from the "/api/services/" entry.
+	mux.Handle("POST /api/services/{slug}/handovers", authenticated(handler.OfferHandover(deps)))
+	mux.Handle("GET /api/me/handovers", authenticated(handler.MyHandovers(deps)))
+	mux.Handle("POST /api/handovers/{id}/cancel", authenticated(handler.CancelHandover(deps)))
+	mux.Handle("POST /api/handovers/{id}/decline", authenticated(handler.DeclineHandover(deps)))
+	mux.Handle("POST /api/handovers/{id}/accept", authenticated(handler.AcceptHandover(deps)))
+
+	// User-owned scenarios: owner-scoped CRUD over a curated set of UserService
+	// ids. Named /api/user-scenarios, distinct from the public /api/scenarios
+	// collection above, so the existing curated read path is untouched rather
+	// than repurposed or ambiguously overloaded.
+	mux.Handle("POST /api/user-scenarios", authenticated(handler.CreateUserScenario(deps, cfg.BoardingWait)))
+	mux.Handle("GET /api/user-scenarios", authenticated(handler.MyUserScenarios(deps, cfg.BoardingWait)))
+	mux.Handle("GET /api/user-scenarios/{slug}", authenticated(handler.GetUserScenario(deps, cfg.BoardingWait)))
+	mux.Handle("PUT /api/user-scenarios/{slug}", authenticated(handler.UpdateUserScenario(deps, cfg.BoardingWait)))
+	mux.Handle("DELETE /api/user-scenarios/{slug}", authenticated(handler.DeleteUserScenario(deps)))
+	// Compile a user scenario's curated members into one graph, then read it back
+	// by slug. Both owner-scoped, unlike the public seeded /api/scenarios/{slug}/graph.
+	mux.Handle("POST /api/user-scenarios/{slug}/compile", authenticated(limitCompile(handler.CompileUserScenario(deps, compiles))))
+	mux.Handle("GET /api/user-scenarios/{slug}/graph", authenticated(handler.UserScenarioGraph(deps)))
+	// The user-authored counterpart to POST /api/isochrone (SPA-83): computes
+	// over the scenario's compiled graph rather than the seeded store, and
+	// answers 409 with a distinct code when that graph is stale (SPA-116).
+	mux.Handle("POST /api/user-scenarios/{slug}/isochrone",
+		authenticated(limitIso(requirePublisher(publisher,
+			capBacklog(handler.UserScenarioIsochrone(deps, publisher, lg, cfg.BoardingWait))))))
+
+	// Admin-only.
+	mux.Handle("POST /api/admin/users", adminOnly(handler.CreateUser(deps, hasher)))
+	mux.Handle("GET /api/admin/users", adminOnly(handler.ListUsers(deps)))
+	mux.Handle("PATCH /api/admin/users/{id}", adminOnly(handler.PatchUser(deps)))
+	mux.Handle("POST /api/admin/invites", adminOnly(handler.CreateInvite(deps, cfg.WebsiteURL)))
+	mux.Handle("POST /api/admin/users/{id}/reset-link", adminOnly(handler.CreateResetLink(deps, cfg.WebsiteURL)))
+	mux.Handle("POST /api/admin/routes", adminOnly(handler.CreateRoute(deps)))
+	// A human dry-runs this against production and then sends apply. It does
+	// not run at boot: DeleteExpiredSessions can, because a missed session
+	// prune is harmless, and a missed dry-run here is not.
+	mux.Handle("POST /api/admin/retention", adminOnly(handler.Retention(deps)))
+	// Moves a service to a named account with no offer (SPA-390), for an
+	// owner who has left or is disabled. The same move as an accept, plus the
+	// cancel of any pending offer, recorded as an accepted handover with the
+	// admin's id on it. The database-less 503 comes from the "/api/admin/"
+	// entry above.
+	mux.Handle("PUT /api/admin/services/{slug}/owner", adminOnly(handler.ForceHandover(deps)))
+	// Curating a prerendered isochrone is editorial content on a public page,
+	// so it sits behind the same admin gate — even though it hangs off the
+	// public /api/scenarios path rather than /api/admin. Its two sibling reads
+	// are registered in registerPrerenderedRoutes; the database-less 503 for
+	// this path comes from there too, so the list above needs no entry.
+	mux.Handle("POST /api/scenarios/{slug}/prerendered-isochrones",
+		adminOnly(handler.CreatePrerenderedIsochrone(deps)))
+}
+
+// Bare, like /readyz: the website asks on behalf of every visitor, and the
+// answer carries no job, origin or owner, so there is nothing to scope.
+func registerRoutingStatusRoutes(mux *routeTable, deps AuthDeps, watch *handler.WorkerWatch) {
+	if deps == nil {
+		mux.HandleFunc("GET /api/routing/status", noDatabase("routing status is unavailable"))
+		return
+	}
+	mux.HandleFunc("GET /api/routing/status", handler.RoutingStatus(deps, watch))
+}
+
+func registerWorkerRoutes(mux *routeTable, cfg config.Config, deps AuthDeps, watch *handler.WorkerWatch) {
+	const unavailable = "worker API is unavailable"
+	if deps == nil {
+		mux.HandleFunc("/api/internal/", noDatabase(unavailable))
+		return
+	}
+	if cfg.WorkerToken == "" {
+		mux.HandleFunc("/api/internal/", serviceUnavailable(unavailable+": no WORKER_TOKEN configured"))
+		return
+	}
+	// Contact is recorded inside the token check: a request anyone could send
+	// is no proof the worker is alive.
+	requireWorker := auth.RequireWorkerToken(cfg.WorkerToken)
+	gate := func(h http.Handler) http.Handler { return requireWorker(watch.RecordContact(h)) }
+	mux.Handle("GET /api/internal/worker", gate(handler.WorkerReady()))
+	mux.Handle("POST /api/internal/routing-jobs/{id}/running", gate(handler.WorkerMarkRunning(deps)))
+	mux.Handle("POST /api/internal/routing-jobs/{id}/succeeded", gate(handler.WorkerMarkSucceeded(deps)))
+	mux.Handle("POST /api/internal/routing-jobs/{id}/failed", gate(handler.WorkerMarkFailed(deps)))
+	mux.Handle("POST /api/internal/isochrone-cache/lookup", gate(handler.WorkerCacheLookup(deps)))
+	mux.Handle("POST /api/internal/isochrone-cache", gate(handler.WorkerCachePut(deps)))
+}
+
+func noDatabase(what string) http.HandlerFunc {
+	return serviceUnavailable(what + ": no database configured")
+}
+
+func serviceUnavailable(msg string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		body := `{"error":"` + msg + `"}` + "\n"
+		if _, err := w.Write([]byte(body)); err != nil {
+			slog.ErrorContext(r.Context(), "server: failed to write response", "error", err)
+		}
+	}
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(status int) {
+	s.status = status
+	s.ResponseWriter.WriteHeader(status)
+}
+
+func logRequests(lg *slog.Logger, m *metrics.Metrics, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(rec, r)
+		elapsed := time.Since(start)
+
+		// The mux sets r.Pattern on this same request: cors passes it through
+		// unchanged, and nothing between here and the mux calls WithContext.
+		// An unmatched path leaves it empty.
+		m.Request(r.Context(), r.Pattern, r.Method, rec.status, elapsed)
+
+		// Probes are polled on a timer by the platform and uptime monitors;
+		// at info they would drown the requests worth reading.
+		level := slog.LevelInfo
+		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+			level = slog.LevelDebug
+		}
+		trace, _ := traceid.FromContext(r.Context())
+		lg.Log(r.Context(), level, "request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", rec.status,
+			"duration_ms", elapsed.Milliseconds(),
+			"trace_id", trace,
+		)
+	})
+}
+
+var allowedOrigins = map[string]bool{
+	"https://sparks-effect-website.vercel.app": true,
+}
+
+const vercelPreviewHost = "andrewcgraves-projects.vercel.app"
+
+const sparksEffectHost = "sparks-effect.app"
+
+func cors(next http.Handler, allowLocalhost bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Whether or not this origin is allowed, or there is one: the answer
+		// differs by Origin either way, and a shared cache must key on it.
+		w.Header().Add("Vary", "Origin")
+		origin := r.Header.Get("Origin")
+		if originAllowed(origin, allowLocalhost) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Trace-Id")
+			// Response headers a browser client may read. Without this the
+			// Retry-After on a capped isochrone's 429 (SPA-219) is invisible
+			// to the SPA, which is the one caller it is written for.
+			w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
+
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func originAllowed(origin string, allowLocalhost bool) bool {
+	if origin == "" {
+		return false
+	}
+	if allowedOrigins[origin] || isSparksEffectOrigin(origin) || isVercelPreviewOrigin(origin) {
+		return true
+	}
+	return allowLocalhost && isLocalhostOrigin(origin)
+}
+
+func isSparksEffectOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "https" || u.User != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == sparksEffectHost || strings.HasSuffix(host, "."+sparksEffectHost)
+}
+
+func isVercelPreviewOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "https" || u.User != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return false
+	}
+	if host == vercelPreviewHost {
+		return true
+	}
+	return strings.HasSuffix(host, "."+vercelPreviewHost) ||
+		strings.HasSuffix(host, "-"+vercelPreviewHost)
+}
+
+func isLocalhostOrigin(origin string) bool {
+	if origin == "" {
+		return false
+	}
+	host := origin
+	if i := strings.Index(origin, "://"); i >= 0 {
+		host = origin[i+3:]
+	}
+	return strings.HasPrefix(host, "localhost") || strings.HasPrefix(host, "127.0.0.1")
+}

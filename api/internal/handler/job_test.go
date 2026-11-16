@@ -1,0 +1,659 @@
+package handler_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/andrewcgraves/sparks-effect-api/internal/account"
+	"github.com/andrewcgraves/sparks-effect-api/internal/auth"
+	"github.com/andrewcgraves/sparks-effect-api/internal/compile"
+	"github.com/andrewcgraves/sparks-effect-api/internal/handler"
+	"github.com/andrewcgraves/sparks-effect-api/internal/transit"
+)
+
+type fakeCompileStore struct {
+	mu             sync.Mutex
+	scenarios      map[string]transit.Scenario
+	jobs           map[string]transit.Job
+	userServices   map[string]transit.UserService
+	userScenarios  map[string]transit.UserScenario
+	routes         []transit.Route
+	stations       []transit.Station
+	services       []transit.Service
+	vehicleTypes   []transit.VehicleType
+	travelTimes    map[string]transit.TravelTimes
+	createJobErr   error
+	getScenarioErr error
+	getJobErr      error
+	getGraphErr    error
+	completed      chan transit.Job
+	// Runs just before FailInterruptedJob writes, to land a finish in the
+	// window between JobStatus's read and its write.
+	beforeFail func()
+}
+
+func (f *fakeCompileStore) FailInterruptedJob(_ context.Context, id, errMsg string) (bool, error) {
+	if f.beforeFail != nil {
+		f.beforeFail()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	j, ok := f.jobs[id]
+	if !ok || (j.Status != transit.JobStatusQueued && j.Status != transit.JobStatusRunning) {
+		return false, nil
+	}
+	j.Status, j.Error = transit.JobStatusFailed, errMsg
+	f.jobs[id] = j
+	return true, nil
+}
+
+func newFakeCompileStore() *fakeCompileStore {
+	return &fakeCompileStore{
+		scenarios: map[string]transit.Scenario{
+			"scenario-a": {ID: "sc-a", Slug: "scenario-a", Name: "Scenario A"},
+		},
+		jobs:          map[string]transit.Job{},
+		userServices:  map[string]transit.UserService{},
+		userScenarios: map[string]transit.UserScenario{},
+		completed:     make(chan transit.Job, 10),
+	}
+}
+
+func (f *fakeCompileStore) compilableFixture() {
+	f.routes = []transit.Route{{
+		ID:   "rt-1",
+		Slug: "rt-1",
+		Geometry: transit.GeoLineString{
+			Type:        "LineString",
+			Coordinates: [][]float64{{0, 0}, {1, 0}},
+		},
+	}}
+	f.stations = []transit.Station{
+		{ID: "st-a", Slug: "a", Location: transit.GeoPoint{Coordinates: []float64{0, 0}}, PlatformHeight: "low"},
+		{ID: "st-b", Slug: "b", Location: transit.GeoPoint{Coordinates: []float64{1, 0}}, PlatformHeight: "high"},
+	}
+	f.services = []transit.Service{{
+		ID: "svc-1", RouteID: "rt-1", VehicleTypeID: "vt-1", Active: true,
+		Stops: []transit.ServiceStop{
+			{StationID: "st-a", Sequence: 1},
+			{StationID: "st-b", Sequence: 2},
+		},
+	}}
+	f.vehicleTypes = []transit.VehicleType{{
+		ID: "vt-1", MaxSpeedKMH: 36, AccelerationMS2: 1, DecelerationMS2: 1,
+		FloorHeight: "high", DwellLevelS: 30, DwellStepS: 60,
+	}}
+	// A seeded scenario compiles from its calibrated run times, so the fixture
+	// is only compilable with them present.
+	f.travelTimes = map[string]transit.TravelTimes{
+		"scenario-a": {ScenarioSlug: "scenario-a", Segments: []transit.SegmentTime{
+			{FromSlug: "a", ToSlug: "b", RunSeconds: 600, RouteID: "rt-1"},
+		}},
+	}
+}
+
+func (f *fakeCompileStore) compilableUserFixture(ownerID string) (svcID, scenarioID string) {
+	f.routes = append(f.routes, transit.Route{
+		ID:   "rt-user",
+		Slug: "rt-user",
+		Geometry: transit.GeoLineString{
+			Type:        "LineString",
+			Coordinates: [][]float64{{0, 0}, {0, 1}},
+		},
+	})
+	svc := transit.UserService{
+		ID: "usvc-1", Slug: "line-a", RouteID: "rt-user", OwnerID: ownerID,
+		Vehicle: transit.VehicleParams{MaxSpeedKMH: 36, AccelerationMS2: 1, DecelerationMS2: 1, DwellS: 30},
+		Stops: []transit.ServiceStopPoint{
+			{Name: "A", Lat: 0, Lng: 0, Seq: 0, Slug: "line-a--a"},
+			{Name: "B", Lat: 1, Lng: 0, Seq: 1, Slug: "line-a--b"},
+		},
+	}
+	f.userServices[svc.Slug] = svc
+	sc := transit.UserScenario{ID: "uscn-1", Slug: "trip", OwnerID: ownerID, ServiceIDs: []string{svc.ID}}
+	f.userScenarios[sc.Slug] = sc
+	return svc.ID, sc.ID
+}
+
+func (f *fakeCompileStore) GetTravelTimes(_ context.Context, scenarioSlug string) (transit.TravelTimes, bool, error) {
+	tt, ok := f.travelTimes[scenarioSlug]
+	return tt, ok, nil
+}
+
+func (f *fakeCompileStore) GetScenarioByID(_ context.Context, id string) (transit.Scenario, bool, error) {
+	if f.getScenarioErr != nil {
+		return transit.Scenario{}, false, f.getScenarioErr
+	}
+	for _, sc := range f.scenarios {
+		if sc.ID == id {
+			return sc, true, nil
+		}
+	}
+	return transit.Scenario{}, false, nil
+}
+
+func (f *fakeCompileStore) GetScenarioBySlug(_ context.Context, slug string) (transit.Scenario, bool, error) {
+	if f.getScenarioErr != nil {
+		return transit.Scenario{}, false, f.getScenarioErr
+	}
+	sc, ok := f.scenarios[slug]
+	return sc, ok, nil
+}
+
+func (f *fakeCompileStore) CreateJob(_ context.Context, j transit.Job) error {
+	if f.createJobErr != nil {
+		return f.createJobErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.jobs[j.ID] = j
+	return nil
+}
+
+func (f *fakeCompileStore) GetJobByID(_ context.Context, id string) (transit.Job, bool, error) {
+	if f.getJobErr != nil {
+		return transit.Job{}, false, f.getJobErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	j, ok := f.jobs[id]
+	return j, ok, nil
+}
+
+func (f *fakeCompileStore) GetLatestSucceededJob(_ context.Context, scenarioSlug, kind string) (transit.Job, bool, error) {
+	if f.getGraphErr != nil {
+		return transit.Job{}, false, f.getGraphErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	sc, ok := f.scenarios[scenarioSlug]
+	if !ok {
+		return transit.Job{}, false, nil
+	}
+	var latest transit.Job
+	found := false
+	for _, j := range f.jobs {
+		if j.ScenarioID == nil || *j.ScenarioID != sc.ID {
+			continue
+		}
+		if j.Kind != kind || j.Status != transit.JobStatusSucceeded {
+			continue
+		}
+		if !found || j.CreatedAt.After(latest.CreatedAt) {
+			latest, found = j, true
+		}
+	}
+	return latest, found, nil
+}
+
+func (f *fakeCompileStore) ListRoutesByScenario(_ context.Context, _ string) ([]transit.Route, error) {
+	return f.routes, nil
+}
+
+func (f *fakeCompileStore) ListStationsByScenario(_ context.Context, _ string) ([]transit.Station, error) {
+	return f.stations, nil
+}
+
+func (f *fakeCompileStore) ListServicesByScenario(_ context.Context, _ string) ([]transit.Service, error) {
+	return f.services, nil
+}
+
+func (f *fakeCompileStore) ListVehicleTypes(_ context.Context) ([]transit.VehicleType, error) {
+	return f.vehicleTypes, nil
+}
+
+func (f *fakeCompileStore) UpdateJobStatus(_ context.Context, id, status, errMsg string) error {
+	f.mu.Lock()
+	j, ok := f.jobs[id]
+	if !ok {
+		f.mu.Unlock()
+		return errors.New("job not found")
+	}
+	j.Status, j.Error = status, errMsg
+	f.jobs[id] = j
+	f.mu.Unlock()
+	if status == transit.JobStatusFailed {
+		f.completed <- j
+	}
+	return nil
+}
+
+func (f *fakeCompileStore) CompleteJob(_ context.Context, id string, result transit.TransitGraph, compiledServiceIDs []string) error {
+	f.mu.Lock()
+	j, ok := f.jobs[id]
+	if !ok {
+		f.mu.Unlock()
+		return errors.New("job not found")
+	}
+	j.Status, j.Result, j.CompiledServiceIDs = transit.JobStatusSucceeded, &result, compiledServiceIDs
+	f.jobs[id] = j
+	f.mu.Unlock()
+	f.completed <- j
+	return nil
+}
+
+// --- User-authored compile surface (SPA-106). ---
+
+func (f *fakeCompileStore) GetUserServiceBySlug(_ context.Context, slug string) (transit.UserService, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	svc, ok := f.userServices[slug]
+	return svc, ok, nil
+}
+
+func (f *fakeCompileStore) GetUserScenarioBySlug(_ context.Context, slug string) (transit.UserScenario, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	sc, ok := f.userScenarios[slug]
+	return sc, ok, nil
+}
+
+func (f *fakeCompileStore) GetUserServiceByID(_ context.Context, id string) (transit.UserService, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, svc := range f.userServices {
+		if svc.ID == id {
+			return svc, true, nil
+		}
+	}
+	return transit.UserService{}, false, nil
+}
+
+func (f *fakeCompileStore) GetUserScenarioByID(_ context.Context, id string) (transit.UserScenario, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, sc := range f.userScenarios {
+		if sc.ID == id {
+			return sc, true, nil
+		}
+	}
+	return transit.UserScenario{}, false, nil
+}
+
+func (f *fakeCompileStore) ListUserServicesByIDs(_ context.Context, ids []string) ([]transit.UserService, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	var out []transit.UserService
+	for _, svc := range f.userServices {
+		if want[svc.ID] {
+			out = append(out, svc)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeCompileStore) ListRoutesByIDs(_ context.Context, ids []string) ([]transit.Route, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	var out []transit.Route
+	for _, rt := range f.routes {
+		if want[rt.ID] {
+			out = append(out, rt)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeCompileStore) GetLatestSucceededUserScenarioJob(_ context.Context, slug string) (transit.Job, bool, error) {
+	if f.getGraphErr != nil {
+		return transit.Job{}, false, f.getGraphErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	sc, ok := f.userScenarios[slug]
+	if !ok {
+		return transit.Job{}, false, nil
+	}
+	var latest transit.Job
+	found := false
+	for _, j := range f.jobs {
+		if j.UserScenarioID == nil || *j.UserScenarioID != sc.ID {
+			continue
+		}
+		if j.Kind != transit.JobKindCompileUserScenario || j.Status != transit.JobStatusSucceeded {
+			continue
+		}
+		if !found || j.CreatedAt.After(latest.CreatedAt) {
+			latest, found = j, true
+		}
+	}
+	return latest, found, nil
+}
+
+func (f *fakeCompileStore) GetLatestSucceededUserServiceJob(_ context.Context, slug string) (transit.Job, bool, error) {
+	if f.getGraphErr != nil {
+		return transit.Job{}, false, f.getGraphErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	svc, ok := f.userServices[slug]
+	if !ok {
+		return transit.Job{}, false, nil
+	}
+	var latest transit.Job
+	found := false
+	for _, j := range f.jobs {
+		if j.UserServiceID == nil || *j.UserServiceID != svc.ID {
+			continue
+		}
+		if j.Kind != transit.JobKindCompileUserService || j.Status != transit.JobStatusSucceeded {
+			continue
+		}
+		if !found || j.CreatedAt.After(latest.CreatedAt) {
+			latest, found = j, true
+		}
+	}
+	return latest, found, nil
+}
+
+func (f *fakeCompileStore) waitForCompletion(t *testing.T) transit.Job {
+	t.Helper()
+	select {
+	case j := <-f.completed:
+		return j
+	case <-time.After(2 * time.Second):
+		t.Fatal("compile did not complete in time")
+		return transit.Job{}
+	}
+}
+
+func postAs(t *testing.T, h http.Handler, path, pathValueName, pathValue string, user account.User) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, nil)
+	req.SetPathValue(pathValueName, pathValue)
+	req = req.WithContext(auth.WithUser(req.Context(), user))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func getWithPathValueAs(t *testing.T, h http.Handler, path, pathValueName, pathValue string, user *account.User) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.SetPathValue(pathValueName, pathValue)
+	if user != nil {
+		req = req.WithContext(auth.WithUser(req.Context(), *user))
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestCompileScenarioReturnsQueuedJobAndCompilesAsync(t *testing.T) {
+	store := newFakeCompileStore()
+	store.compilableFixture()
+
+	rec := postAs(t, handler.CompileScenario(store, compile.NewRunner(store, transit.DefaultBoardingWaitPolicy(), nil)), "/api/scenarios/scenario-a/compile", "slug", "scenario-a",
+		account.User{ID: "user-1"})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body %s", rec.Code, rec.Body.String())
+	}
+
+	var job transit.Job
+	if err := json.NewDecoder(rec.Body).Decode(&job); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if job.ID == "" {
+		t.Error("job has no id")
+	}
+	if job.Status != transit.JobStatusQueued {
+		t.Errorf("status = %q, want queued", job.Status)
+	}
+	if job.ScenarioID == nil || *job.ScenarioID != "sc-a" {
+		t.Errorf("scenario_id = %v, want sc-a", job.ScenarioID)
+	}
+	if job.OwnerID == nil || *job.OwnerID != "user-1" {
+		t.Errorf("owner_id = %v, want user-1", job.OwnerID)
+	}
+
+	completed := store.waitForCompletion(t)
+	if completed.Status != transit.JobStatusSucceeded {
+		t.Fatalf("completed status = %q, want succeeded", completed.Status)
+	}
+	if completed.Result == nil || len(completed.Result.Services) != 1 || completed.Result.Services[0].ServiceID != "svc-1" {
+		t.Errorf("completed result = %+v, want one compiled ServiceGraph for svc-1", completed.Result)
+	}
+}
+
+func TestCompileScenarioFailsJobOnBadScenarioData(t *testing.T) {
+	store := newFakeCompileStore()
+	store.compilableFixture()
+	store.services[0].VehicleTypeID = "no-such-vehicle-type"
+
+	rec := postAs(t, handler.CompileScenario(store, compile.NewRunner(store, transit.DefaultBoardingWaitPolicy(), nil)), "/api/scenarios/scenario-a/compile", "slug", "scenario-a",
+		account.User{ID: "user-1"})
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body %s", rec.Code, rec.Body.String())
+	}
+
+	completed := store.waitForCompletion(t)
+	if completed.Status != transit.JobStatusFailed {
+		t.Fatalf("completed status = %q, want failed", completed.Status)
+	}
+	if completed.Error == "" {
+		t.Error("failed job has no error message")
+	}
+}
+
+func TestCompileScenarioRequiresAuth(t *testing.T) {
+	store := newFakeCompileStore()
+	req := httptest.NewRequest(http.MethodPost, "/api/scenarios/scenario-a/compile", nil)
+	req.SetPathValue("slug", "scenario-a")
+	rec := httptest.NewRecorder()
+	handler.CompileScenario(store, compile.NewRunner(store, transit.DefaultBoardingWaitPolicy(), nil)).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestCompileScenarioUnknownSlugIsNotFound(t *testing.T) {
+	store := newFakeCompileStore()
+	rec := postAs(t, handler.CompileScenario(store, compile.NewRunner(store, transit.DefaultBoardingWaitPolicy(), nil)), "/api/scenarios/no-such-scenario/compile", "slug", "no-such-scenario",
+		account.User{ID: "user-1"})
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestCompileScenarioReportsStorageFailure(t *testing.T) {
+	store := newFakeCompileStore()
+	store.createJobErr = errors.New("database is down")
+
+	rec := postAs(t, handler.CompileScenario(store, compile.NewRunner(store, transit.DefaultBoardingWaitPolicy(), nil)), "/api/scenarios/scenario-a/compile", "slug", "scenario-a",
+		account.User{ID: "user-1"})
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "database is down") {
+		t.Errorf("internal error leaked to client: %s", rec.Body.String())
+	}
+}
+
+func TestJobStatusReturnsJobForItsOwner(t *testing.T) {
+	store := newFakeCompileStore()
+	owner := "user-1"
+	store.jobs["job-1"] = transit.Job{ID: "job-1", Kind: "compile", Status: transit.JobStatusRunning, OwnerID: &owner, CreatedAt: time.Now()}
+
+	user := account.User{ID: "user-1"}
+	rec := getWithPathValueAs(t, handler.JobStatus(store), "/api/jobs/job-1", "id", "job-1", &user)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	var got transit.Job
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Status != transit.JobStatusRunning {
+		t.Errorf("status = %q, want running", got.Status)
+	}
+}
+
+func TestJobStatusFailsACompileJobLeftUnfinishedPastTheBound(t *testing.T) {
+	for _, status := range []string{transit.JobStatusQueued, transit.JobStatusRunning} {
+		t.Run(status, func(t *testing.T) {
+			store := newFakeCompileStore()
+			owner := "user-1"
+			store.jobs["job-1"] = transit.Job{ID: "job-1", Kind: transit.JobKindCompileUserService, Status: status,
+				OwnerID: &owner, CreatedAt: time.Now().Add(-2 * handler.CompileJobInterruptedAfter)}
+
+			user := account.User{ID: owner}
+			for _, read := range []string{"first", "second"} {
+				rec := getWithPathValueAs(t, handler.JobStatus(store), "/api/jobs/job-1", "id", "job-1", &user)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("%s read: status = %d, want 200; body %s", read, rec.Code, rec.Body.String())
+				}
+				var got transit.Job
+				if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if got.Status != transit.JobStatusFailed || got.Error == "" {
+					t.Errorf("%s read: job = %s/%q, want failed with a message", read, got.Status, got.Error)
+				}
+			}
+		})
+	}
+}
+
+func TestJobStatusKeepsACompileThatFinishesBetweenItsReadAndItsWrite(t *testing.T) {
+	store := newFakeCompileStore()
+	owner := "user-1"
+	store.jobs["job-1"] = transit.Job{ID: "job-1", Kind: transit.JobKindCompileUserService, Status: transit.JobStatusRunning,
+		OwnerID: &owner, CreatedAt: time.Now().Add(-2 * handler.CompileJobInterruptedAfter)}
+	store.beforeFail = func() {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		j := store.jobs["job-1"]
+		j.Status = transit.JobStatusSucceeded
+		store.jobs["job-1"] = j
+	}
+
+	user := account.User{ID: owner}
+	rec := getWithPathValueAs(t, handler.JobStatus(store), "/api/jobs/job-1", "id", "job-1", &user)
+	var got transit.Job
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Status != transit.JobStatusSucceeded {
+		t.Errorf("response status = %q, want the succeeded the compile reached", got.Status)
+	}
+	if stored := store.jobs["job-1"]; stored.Status != transit.JobStatusSucceeded {
+		t.Errorf("stored status = %q, want succeeded left alone", stored.Status)
+	}
+}
+
+func TestJobStatusNeverRewritesAFinishedCompileJob(t *testing.T) {
+	store := newFakeCompileStore()
+	owner := "user-1"
+	store.jobs["job-1"] = transit.Job{ID: "job-1", Kind: transit.JobKindCompileUserService, Status: transit.JobStatusSucceeded,
+		OwnerID: &owner, CreatedAt: time.Now().Add(-2 * handler.CompileJobInterruptedAfter)}
+
+	user := account.User{ID: owner}
+	rec := getWithPathValueAs(t, handler.JobStatus(store), "/api/jobs/job-1", "id", "job-1", &user)
+	var got transit.Job
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Status != transit.JobStatusSucceeded {
+		t.Errorf("status = %q, want succeeded left alone", got.Status)
+	}
+}
+
+func TestJobStatusHidesOtherUsersJobsAsNotFound(t *testing.T) {
+	store := newFakeCompileStore()
+	owner := "user-2"
+	store.jobs["job-1"] = transit.Job{ID: "job-1", Kind: "compile", Status: transit.JobStatusRunning, OwnerID: &owner}
+
+	user := account.User{ID: "user-1"}
+	rec := getWithPathValueAs(t, handler.JobStatus(store), "/api/jobs/job-1", "id", "job-1", &user)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestJobStatusAdminCanViewAnyJob(t *testing.T) {
+	store := newFakeCompileStore()
+	owner := "user-2"
+	store.jobs["job-1"] = transit.Job{ID: "job-1", Kind: "compile", Status: transit.JobStatusRunning, OwnerID: &owner, CreatedAt: time.Now()}
+
+	admin := account.User{ID: "admin-1", IsAdmin: true}
+	rec := getWithPathValueAs(t, handler.JobStatus(store), "/api/jobs/job-1", "id", "job-1", &admin)
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+}
+
+func TestJobStatusUnknownIDIsNotFound(t *testing.T) {
+	store := newFakeCompileStore()
+	user := account.User{ID: "user-1"}
+	rec := getWithPathValueAs(t, handler.JobStatus(store), "/api/jobs/no-such-job", "id", "no-such-job", &user)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestJobStatusRequiresAuth(t *testing.T) {
+	store := newFakeCompileStore()
+	rec := getWithPathValueAs(t, handler.JobStatus(store), "/api/jobs/job-1", "id", "job-1", nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+}
+
+func TestScenarioGraphReturnsCompiledResult(t *testing.T) {
+	store := newFakeCompileStore()
+	scenarioID := "sc-a"
+	store.jobs["job-1"] = transit.Job{
+		ID: "job-1", Kind: transit.JobKindCompileScenario, Status: transit.JobStatusSucceeded,
+		ScenarioID: &scenarioID,
+		Result:     &transit.TransitGraph{Services: []transit.ServiceGraph{{ServiceID: "svc-1"}}},
+	}
+
+	rec := getWithPathValueAs(t, handler.ScenarioGraph(store), "/api/scenarios/scenario-a/graph", "slug", "scenario-a", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	var got transit.TransitGraph
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got.Services) != 1 || got.Services[0].ServiceID != "svc-1" {
+		t.Errorf("got = %+v, want the stored graph", got)
+	}
+}
+
+func TestScenarioGraphNotYetCompiledIsNotFound(t *testing.T) {
+	store := newFakeCompileStore()
+	rec := getWithPathValueAs(t, handler.ScenarioGraph(store), "/api/scenarios/scenario-a/graph", "slug", "scenario-a", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestScenarioGraphReportsStorageFailure(t *testing.T) {
+	store := newFakeCompileStore()
+	store.getGraphErr = errors.New("database is down")
+
+	rec := getWithPathValueAs(t, handler.ScenarioGraph(store), "/api/scenarios/scenario-a/graph", "slug", "scenario-a", nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "database is down") {
+		t.Errorf("internal error leaked to client: %s", rec.Body.String())
+	}
+}

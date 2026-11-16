@@ -1,0 +1,1043 @@
+package postgres
+
+import (
+	"context"
+	"embed"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/andrewcgraves/sparks-effect-api/internal/account"
+	"github.com/andrewcgraves/sparks-effect-api/internal/transit"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
+)
+
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+type Repo struct {
+	pool *pgxpool.Pool
+}
+
+var (
+	_ transit.StoreSource    = (*Repo)(nil)
+	_ transit.SeedSink       = (*Repo)(nil)
+	_ transit.SeedReconciler = (*Repo)(nil)
+)
+
+func Connect(ctx context.Context, databaseURL string, maxConns int) (*Repo, error) {
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parsing DATABASE_URL: %w", err)
+	}
+	if maxConns > 0 {
+		cfg.MaxConns = int32(maxConns)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: creating pool: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("postgres: ping: %w", err)
+	}
+	return &Repo{pool: pool}, nil
+}
+
+func (r *Repo) Close() { r.pool.Close() }
+
+func (r *Repo) Ping(ctx context.Context) error {
+	if err := r.pool.Ping(ctx); err != nil {
+		return fmt.Errorf("postgres: ping: %w", err)
+	}
+	return nil
+}
+
+func Migrate(ctx context.Context, databaseURL string) error {
+	cfg, err := pgx.ParseConfig(databaseURL)
+	if err != nil {
+		return fmt.Errorf("postgres: parsing DATABASE_URL for migrations: %w", err)
+	}
+	db := stdlib.OpenDB(*cfg)
+	defer func() { _ = db.Close() }()
+
+	goose.SetBaseFS(migrationsFS)
+	if err := goose.SetDialect("postgres"); err != nil {
+		return fmt.Errorf("postgres: setting goose dialect: %w", err)
+	}
+	if err := goose.UpContext(ctx, db, "migrations"); err != nil {
+		return fmt.Errorf("postgres: running migrations: %w", err)
+	}
+	return nil
+}
+
+// --- Scenarios ---
+
+func (r *Repo) CreateScenario(ctx context.Context, sc transit.Scenario) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO scenarios (id, slug, name, subtext, plot_label, description, owner_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		sc.ID, sc.Slug, sc.Name, sc.Subtext, sc.PlotLabel, sc.Description, sc.OwnerID)
+	return wrap("CreateScenario", err)
+}
+
+func (r *Repo) GetScenarioByID(ctx context.Context, id string) (transit.Scenario, bool, error) {
+	var sc transit.Scenario
+	err := r.pool.QueryRow(ctx,
+		`SELECT `+scenarioColumns+` FROM scenarios WHERE id = $1`,
+		id).Scan(&sc.ID, &sc.Slug, &sc.Name, &sc.Subtext, &sc.PlotLabel, &sc.Description, &sc.OwnerID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return transit.Scenario{}, false, nil
+	}
+	if err != nil {
+		return transit.Scenario{}, false, wrap("GetScenarioByID", err)
+	}
+	return sc, true, nil
+}
+
+func (r *Repo) GetScenarioBySlug(ctx context.Context, slug string) (transit.Scenario, bool, error) {
+	var sc transit.Scenario
+	err := r.pool.QueryRow(ctx,
+		`SELECT `+scenarioColumns+` FROM scenarios WHERE slug = $1`,
+		slug).Scan(&sc.ID, &sc.Slug, &sc.Name, &sc.Subtext, &sc.PlotLabel, &sc.Description, &sc.OwnerID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return transit.Scenario{}, false, nil
+	}
+	if err != nil {
+		return transit.Scenario{}, false, wrap("GetScenarioBySlug", err)
+	}
+	return sc, true, nil
+}
+
+func (r *Repo) ListCuratedScenarios(ctx context.Context) ([]transit.Scenario, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+scenarioColumns+` FROM scenarios WHERE owner_id IS NULL ORDER BY slug`)
+	if err != nil {
+		return nil, wrap("ListCuratedScenarios", err)
+	}
+	return scanScenarios(rows, "ListCuratedScenarios")
+}
+
+func (r *Repo) ListScenariosByOwner(ctx context.Context, ownerID string) ([]transit.Scenario, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+scenarioColumns+` FROM scenarios WHERE owner_id = $1 ORDER BY slug`, ownerID)
+	if err != nil {
+		return nil, wrap("ListScenariosByOwner", err)
+	}
+	return scanScenarios(rows, "ListScenariosByOwner")
+}
+
+const scenarioColumns = `id, slug, name, subtext, plot_label, description, owner_id`
+
+func scanScenarios(rows pgx.Rows, op string) ([]transit.Scenario, error) {
+	defer rows.Close()
+
+	var out []transit.Scenario
+	for rows.Next() {
+		var sc transit.Scenario
+		if err := rows.Scan(&sc.ID, &sc.Slug, &sc.Name, &sc.Subtext, &sc.PlotLabel, &sc.Description, &sc.OwnerID); err != nil {
+			return nil, wrap(op+" scan", err)
+		}
+		out = append(out, sc)
+	}
+	return out, wrap(op+" rows", rows.Err())
+}
+
+// --- Routes ---
+
+const routeColumns = `id, scenario_id, owner_id, slug, name, description, mode,
+	geometry, bidirectional, segments`
+
+func (r *Repo) CreateRoute(ctx context.Context, rt transit.Route) error {
+	// segments is NOT NULL, so a route with no authored physics stores an empty
+	// array rather than NULL — the two would otherwise read back differently.
+	segments := rt.Segments
+	if segments == nil {
+		segments = []transit.RouteSegment{}
+	}
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO routes
+		   (id, scenario_id, owner_id, slug, name, description, mode,
+		    geometry, bidirectional, segments)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		rt.ID, rt.ScenarioID, rt.OwnerID, rt.Slug, rt.Name, rt.Description, rt.Mode,
+		rt.Geometry, rt.Bidirectional, segments)
+	return wrap("CreateRoute", err)
+}
+
+func (r *Repo) GetRouteBySlug(ctx context.Context, slug string) (transit.Route, bool, error) {
+	row := r.pool.QueryRow(ctx,
+		`SELECT `+routeColumns+` FROM routes WHERE slug = $1`, slug)
+
+	rt, err := scanRoute(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return transit.Route{}, false, nil
+	}
+	if err != nil {
+		return transit.Route{}, false, wrap("GetRouteBySlug", err)
+	}
+	return rt, true, nil
+}
+
+func (r *Repo) ListCuratedRouteSummaries(ctx context.Context) ([]transit.RouteSummary, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+routeSummaryColumns+` FROM routes WHERE owner_id IS NULL ORDER BY slug`)
+	if err != nil {
+		return nil, wrap("ListCuratedRouteSummaries", err)
+	}
+	return scanRouteSummaries(rows, "ListCuratedRouteSummaries")
+}
+
+func (r *Repo) ListRouteSummariesByOwner(ctx context.Context, ownerID string) ([]transit.RouteSummary, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+routeSummaryColumns+` FROM routes WHERE owner_id = $1 ORDER BY slug`, ownerID)
+	if err != nil {
+		return nil, wrap("ListRouteSummariesByOwner", err)
+	}
+	return scanRouteSummaries(rows, "ListRouteSummariesByOwner")
+}
+
+const routeSummaryColumns = `slug, name, description, mode`
+
+func scanRouteSummaries(rows pgx.Rows, op string) ([]transit.RouteSummary, error) {
+	defer rows.Close()
+
+	var out []transit.RouteSummary
+	for rows.Next() {
+		var rs transit.RouteSummary
+		if err := rows.Scan(&rs.Slug, &rs.Name, &rs.Description, &rs.Mode); err != nil {
+			return nil, wrap(op+" scan", err)
+		}
+		out = append(out, rs)
+	}
+	return out, wrap(op+" rows", rows.Err())
+}
+
+func (r *Repo) ListRoutesByScenario(ctx context.Context, scenarioID string) ([]transit.Route, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+routeColumns+` FROM routes WHERE scenario_id = $1 ORDER BY id`, scenarioID)
+	if err != nil {
+		return nil, wrap("ListRoutesByScenario", err)
+	}
+	defer rows.Close()
+
+	var out []transit.Route
+	for rows.Next() {
+		rt, err := scanRoute(rows)
+		if err != nil {
+			return nil, wrap("ListRoutesByScenario scan", err)
+		}
+		out = append(out, rt)
+	}
+	return out, wrap("ListRoutesByScenario rows", rows.Err())
+}
+
+func (r *Repo) ListRoutesByIDs(ctx context.Context, ids []string) ([]transit.Route, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	// id::text = ANY($1): route ids come from a uuid FK so are well-formed, but
+	// matching on text keeps this consistent with the other id-set readers and
+	// costs nothing here.
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+routeColumns+` FROM routes WHERE id::text = ANY($1) ORDER BY id`, ids)
+	if err != nil {
+		return nil, wrap("ListRoutesByIDs", err)
+	}
+	defer rows.Close()
+
+	var out []transit.Route
+	for rows.Next() {
+		rt, err := scanRoute(rows)
+		if err != nil {
+			return nil, wrap("ListRoutesByIDs scan", err)
+		}
+		out = append(out, rt)
+	}
+	return out, wrap("ListRoutesByIDs rows", rows.Err())
+}
+
+func scanRoute(row pgx.Row) (transit.Route, error) {
+	var rt transit.Route
+	err := row.Scan(&rt.ID, &rt.ScenarioID, &rt.OwnerID, &rt.Slug, &rt.Name,
+		&rt.Description, &rt.Mode, &rt.Geometry, &rt.Bidirectional, &rt.Segments)
+	return rt, err
+}
+
+// --- Stations ---
+
+const stationColumns = `id, scenario_id, owner_id, slug, name, location,
+	routing_location, platform_height`
+
+func (r *Repo) CreateStation(ctx context.Context, st transit.Station) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO stations
+		   (id, scenario_id, owner_id, slug, name, location, routing_location, platform_height)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		st.ID, st.ScenarioID, st.OwnerID, st.Slug, st.Name, st.Location,
+		st.RoutingLocation, st.PlatformHeight)
+	return wrap("CreateStation", err)
+}
+
+func (r *Repo) ListStationsByScenario(ctx context.Context, scenarioID string) ([]transit.Station, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+stationColumns+` FROM stations WHERE scenario_id = $1 ORDER BY slug`, scenarioID)
+	if err != nil {
+		return nil, wrap("ListStationsByScenario", err)
+	}
+	return scanStations(rows, "ListStationsByScenario")
+}
+
+func scanStations(rows pgx.Rows, op string) ([]transit.Station, error) {
+	defer rows.Close()
+
+	var out []transit.Station
+	for rows.Next() {
+		var st transit.Station
+		if err := rows.Scan(&st.ID, &st.ScenarioID, &st.OwnerID, &st.Slug, &st.Name,
+			&st.Location, &st.RoutingLocation, &st.PlatformHeight); err != nil {
+			return nil, wrap(op+" scan", err)
+		}
+		out = append(out, st)
+	}
+	return out, wrap(op+" rows", rows.Err())
+}
+
+// --- Vehicle types ---
+
+func (r *Repo) CreateVehicleType(ctx context.Context, vt transit.VehicleType) error {
+	// Idempotent on ID: the same vehicle type may be seeded by multiple scenarios.
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO vehicle_types
+		   (id, name, propulsion, max_speed_kmh, acceleration_ms2, deceleration_ms2,
+		    floor_height, dwell_level_s, dwell_step_s)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		 ON CONFLICT (id) DO NOTHING`,
+		vt.ID, vt.Name, vt.Propulsion, vt.MaxSpeedKMH, vt.AccelerationMS2,
+		vt.DecelerationMS2, vt.FloorHeight, vt.DwellLevelS, vt.DwellStepS)
+	return wrap("CreateVehicleType", err)
+}
+
+func (r *Repo) ListVehicleTypes(ctx context.Context) ([]transit.VehicleType, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, name, propulsion, max_speed_kmh, acceleration_ms2, deceleration_ms2,
+		        floor_height, dwell_level_s, dwell_step_s
+		 FROM vehicle_types ORDER BY id`)
+	if err != nil {
+		return nil, wrap("ListVehicleTypes", err)
+	}
+	defer rows.Close()
+
+	var out []transit.VehicleType
+	for rows.Next() {
+		var vt transit.VehicleType
+		if err := rows.Scan(&vt.ID, &vt.Name, &vt.Propulsion, &vt.MaxSpeedKMH,
+			&vt.AccelerationMS2, &vt.DecelerationMS2, &vt.FloorHeight,
+			&vt.DwellLevelS, &vt.DwellStepS); err != nil {
+			return nil, wrap("ListVehicleTypes scan", err)
+		}
+		out = append(out, vt)
+	}
+	return out, wrap("ListVehicleTypes rows", rows.Err())
+}
+
+// --- Services (with embedded stops and frequency windows) ---
+
+func (r *Repo) CreateService(ctx context.Context, svc transit.Service) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return wrap("CreateService begin", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	kind, secs := boardingWaitArgs(svc.BoardingWait)
+	_, err = tx.Exec(ctx,
+		`INSERT INTO services
+		   (id, scenario_id, route_id, vehicle_type_id, name, direction, active, provenance, owner_id,
+		    boarding_wait_policy, boarding_wait_fixed_secs)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		svc.ID, svc.ScenarioID, svc.RouteID, svc.VehicleTypeID, svc.Name,
+		svc.Direction, svc.Active, svc.Provenance, svc.OwnerID, kind, secs)
+	if err != nil {
+		return wrap("CreateService", err)
+	}
+
+	if err := insertServiceChildren(ctx, tx, svc); err != nil {
+		return err
+	}
+
+	return wrap("CreateService commit", tx.Commit(ctx))
+}
+
+func (r *Repo) ListServicesByScenario(ctx context.Context, scenarioID string) ([]transit.Service, error) {
+	return r.listServicesBy(ctx, "ListServicesByScenario", "scenario_id", scenarioID)
+}
+
+func (r *Repo) ListServicesByOwner(ctx context.Context, ownerID string) ([]transit.Service, error) {
+	return r.listServicesBy(ctx, "ListServicesByOwner", "owner_id", ownerID)
+}
+
+func (r *Repo) listServicesBy(ctx context.Context, op, column, value string) ([]transit.Service, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, scenario_id, route_id, vehicle_type_id, name, direction, active, provenance, owner_id,
+		        boarding_wait_policy, boarding_wait_fixed_secs
+		 FROM services WHERE `+column+` = $1 ORDER BY id`, value)
+	if err != nil {
+		return nil, wrap(op, err)
+	}
+	defer rows.Close()
+
+	var out []transit.Service
+	for rows.Next() {
+		var (
+			svc  transit.Service
+			kind *string
+			secs *int
+		)
+		if err := rows.Scan(&svc.ID, &svc.ScenarioID, &svc.RouteID, &svc.VehicleTypeID,
+			&svc.Name, &svc.Direction, &svc.Active, &svc.Provenance, &svc.OwnerID,
+			&kind, &secs); err != nil {
+			return nil, wrap(op+" scan", err)
+		}
+		svc.BoardingWait = scanBoardingWait(kind, secs)
+		out = append(out, svc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrap(op+" rows", err)
+	}
+
+	for i := range out {
+		stops, err := r.listServiceStops(ctx, out[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		out[i].Stops = stops
+
+		windows, err := r.listFrequencyWindows(ctx, out[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		out[i].FrequencyWindows = windows
+	}
+	return out, nil
+}
+
+func (r *Repo) listServiceStops(ctx context.Context, serviceID string) ([]transit.ServiceStop, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT station_id, sequence, dwell_s FROM service_stops
+		 WHERE service_id = $1 ORDER BY sequence`, serviceID)
+	if err != nil {
+		return nil, wrap("listServiceStops", err)
+	}
+	defer rows.Close()
+
+	var out []transit.ServiceStop
+	for rows.Next() {
+		var s transit.ServiceStop
+		if err := rows.Scan(&s.StationID, &s.Sequence, &s.DwellS); err != nil {
+			return nil, wrap("listServiceStops scan", err)
+		}
+		out = append(out, s)
+	}
+	return out, wrap("listServiceStops rows", rows.Err())
+}
+
+func (r *Repo) listFrequencyWindows(ctx context.Context, serviceID string) ([]transit.FrequencyWindow, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT start_time, end_time, headway_s FROM frequency_windows
+		 WHERE service_id = $1 ORDER BY start_time`, serviceID)
+	if err != nil {
+		return nil, wrap("listFrequencyWindows", err)
+	}
+	defer rows.Close()
+
+	var out []transit.FrequencyWindow
+	for rows.Next() {
+		var fw transit.FrequencyWindow
+		if err := rows.Scan(&fw.StartTime, &fw.EndTime, &fw.HeadwayS); err != nil {
+			return nil, wrap("listFrequencyWindows scan", err)
+		}
+		out = append(out, fw)
+	}
+	return out, wrap("listFrequencyWindows rows", rows.Err())
+}
+
+// --- Scenario/service curated membership ---
+
+func (r *Repo) AddServiceToScenario(ctx context.Context, scenarioID, serviceID string) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO scenario_service (scenario_id, service_id) VALUES ($1, $2)
+		 ON CONFLICT DO NOTHING`, scenarioID, serviceID)
+	return wrap("AddServiceToScenario", err)
+}
+
+func (r *Repo) ListServiceIDsByScenario(ctx context.Context, scenarioID string) ([]string, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT service_id FROM scenario_service WHERE scenario_id = $1 ORDER BY service_id`, scenarioID)
+	if err != nil {
+		return nil, wrap("ListServiceIDsByScenario", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, wrap("ListServiceIDsByScenario scan", err)
+		}
+		out = append(out, id)
+	}
+	return out, wrap("ListServiceIDsByScenario rows", rows.Err())
+}
+
+// --- Travel times (adjacent segment run times) ---
+
+func (r *Repo) UpsertTravelTimes(ctx context.Context, tt transit.TravelTimes) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return wrap("UpsertTravelTimes begin", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	var scenarioID string
+	err = tx.QueryRow(ctx, `SELECT id FROM scenarios WHERE slug = $1`, tt.ScenarioSlug).Scan(&scenarioID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("postgres: UpsertTravelTimes: unknown scenario slug %q", tt.ScenarioSlug)
+	}
+	if err != nil {
+		return wrap("UpsertTravelTimes resolve scenario", err)
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO travel_time_sets (scenario_id, provenance, source)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (scenario_id) DO UPDATE SET provenance = EXCLUDED.provenance, source = EXCLUDED.source`,
+		scenarioID, tt.Provenance, tt.Source); err != nil {
+		return wrap("UpsertTravelTimes set", err)
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM segments WHERE scenario_id = $1`, scenarioID); err != nil {
+		return wrap("UpsertTravelTimes clear segments", err)
+	}
+	for _, seg := range tt.Segments {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO segments (scenario_id, from_slug, to_slug, run_seconds, reverse_run_seconds, route_id)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
+			scenarioID, seg.FromSlug, seg.ToSlug, seg.RunSeconds, seg.ReverseRunSeconds, seg.RouteID); err != nil {
+			return wrap("UpsertTravelTimes insert segment", err)
+		}
+	}
+
+	return wrap("UpsertTravelTimes commit", tx.Commit(ctx))
+}
+
+func (r *Repo) GetTravelTimes(ctx context.Context, scenarioSlug string) (transit.TravelTimes, bool, error) {
+	var scenarioID string
+	err := r.pool.QueryRow(ctx, `SELECT id FROM scenarios WHERE slug = $1`, scenarioSlug).Scan(&scenarioID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return transit.TravelTimes{}, false, nil
+	}
+	if err != nil {
+		return transit.TravelTimes{}, false, wrap("GetTravelTimes resolve scenario", err)
+	}
+
+	tt := transit.TravelTimes{ScenarioSlug: scenarioSlug}
+	err = r.pool.QueryRow(ctx,
+		`SELECT provenance, source FROM travel_time_sets WHERE scenario_id = $1`, scenarioID).
+		Scan(&tt.Provenance, &tt.Source)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return transit.TravelTimes{}, false, nil
+	}
+	if err != nil {
+		return transit.TravelTimes{}, false, wrap("GetTravelTimes set", err)
+	}
+
+	rows, err := r.pool.Query(ctx,
+		`SELECT from_slug, to_slug, run_seconds, reverse_run_seconds, route_id FROM segments WHERE scenario_id = $1 ORDER BY id`, scenarioID)
+	if err != nil {
+		return transit.TravelTimes{}, false, wrap("GetTravelTimes segments", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var seg transit.SegmentTime
+		if err := rows.Scan(&seg.FromSlug, &seg.ToSlug, &seg.RunSeconds, &seg.ReverseRunSeconds, &seg.RouteID); err != nil {
+			return transit.TravelTimes{}, false, wrap("GetTravelTimes segments scan", err)
+		}
+		tt.Segments = append(tt.Segments, seg)
+	}
+	if err := rows.Err(); err != nil {
+		return transit.TravelTimes{}, false, wrap("GetTravelTimes segments rows", err)
+	}
+	return tt, true, nil
+}
+
+// --- Users ---
+
+func (r *Repo) CreateUser(ctx context.Context, u account.User, passwordHash string) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO users (id, email, name, is_admin, password_hash) VALUES ($1, $2, $3, $4, $5)`,
+		u.ID, u.Email, u.Name, u.IsAdmin, passwordHash)
+	return wrap("CreateUser", err)
+}
+
+func (r *Repo) GetUserCredentialsByEmail(ctx context.Context, email string) (account.User, string, bool, error) {
+	var u account.User
+	var hash string
+	// disabled_at IS NULL so login's unknown-email path (status, body, and
+	// VerifyNothing) is the path a disabled account takes too. A handler check
+	// after found == true would be a different timing path.
+	err := r.pool.QueryRow(ctx,
+		`SELECT `+userColumns+`, password_hash FROM users WHERE email = $1 AND disabled_at IS NULL`, email).
+		Scan(&u.ID, &u.Email, &u.Name, &u.IsAdmin, &u.CreatedAt, &u.UpdatedAt, &u.DisabledAt, &hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return account.User{}, "", false, nil
+	}
+	if err != nil {
+		return account.User{}, "", false, wrap("GetUserCredentialsByEmail", err)
+	}
+	return u, hash, true, nil
+}
+
+const userColumns = `id, email, name, is_admin, created_at, updated_at, disabled_at`
+
+const userColumnsU = `u.id, u.email, u.name, u.is_admin, u.created_at, u.updated_at, u.disabled_at`
+
+func (r *Repo) GetUserByID(ctx context.Context, id string) (account.User, bool, error) {
+	return scanUser(r.pool.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE id = $1`, id))
+}
+
+func (r *Repo) GetUserByEmail(ctx context.Context, email string) (account.User, bool, error) {
+	return scanUser(r.pool.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE email = $1`, email))
+}
+
+func scanUser(row pgx.Row) (account.User, bool, error) {
+	var u account.User
+	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.IsAdmin, &u.CreatedAt, &u.UpdatedAt, &u.DisabledAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return account.User{}, false, nil
+	}
+	if err != nil {
+		return account.User{}, false, wrap("scanUser", err)
+	}
+	return u, true, nil
+}
+
+func (r *Repo) ListUsers(ctx context.Context) ([]account.UserSummary, error) {
+	// The counts cover authored UserServices only: a publication hangs off a
+	// user_services row, so seeded services an account owns are not counted.
+	rows, err := r.pool.Query(ctx,
+		`SELECT u.id, u.email, u.name, u.is_admin, u.created_at, u.disabled_at,
+		        c.service_count, c.published_count
+		   FROM users u
+		  CROSS JOIN LATERAL (
+		        SELECT count(*) AS service_count,
+		               count(p.user_service_id) AS published_count
+		          FROM user_services us
+		          LEFT JOIN service_publications p ON p.user_service_id = us.id
+		         WHERE us.owner_id = u.id
+		  ) c
+		  ORDER BY u.created_at, u.id`)
+	if err != nil {
+		return nil, wrap("ListUsers", err)
+	}
+	defer rows.Close()
+
+	var out []account.UserSummary
+	for rows.Next() {
+		var u account.UserSummary
+		if err := rows.Scan(&u.ID, &u.Email, &u.Name, &u.IsAdmin, &u.CreatedAt, &u.DisabledAt,
+			&u.ServiceCount, &u.PublishedCount); err != nil {
+			return nil, wrap("ListUsers scan", err)
+		}
+		out = append(out, u)
+	}
+	return out, wrap("ListUsers rows", rows.Err())
+}
+
+func (r *Repo) SetUserDisabled(ctx context.Context, id string, disabled bool) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return wrap("SetUserDisabled begin", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	found, err := setUserDisabled(ctx, tx, id, disabled)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("postgres: SetUserDisabled: user %q not found", id)
+	}
+	return wrap("SetUserDisabled commit", tx.Commit(ctx))
+}
+
+func setUserDisabled(ctx context.Context, tx pgx.Tx, id string, disabled bool) (bool, error) {
+	// Sessions are revoked in the caller's transaction, so no request can
+	// authenticate between the flag landing and the sessions going.
+	stmt := `UPDATE users SET disabled_at = NULL, updated_at = now() WHERE id = $1`
+	if disabled {
+		stmt = `UPDATE users SET disabled_at = COALESCE(disabled_at, now()), updated_at = now() WHERE id = $1`
+	}
+	tag, err := tx.Exec(ctx, stmt, id)
+	if err != nil {
+		return false, wrap("SetUserDisabled", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+	if disabled {
+		if _, err := tx.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, id); err != nil {
+			return false, wrap("SetUserDisabled sessions", err)
+		}
+	}
+	return true, nil
+}
+
+func (r *Repo) PatchUser(ctx context.Context, id string, patch account.UserPatch) (account.User, bool, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return account.User{}, false, wrap("PatchUser begin", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	// id::text, as ListUserServicesByIDs does, so a path id that is not a
+	// uuid names no user instead of failing the cast with a 500.
+	err = tx.QueryRow(ctx, `SELECT id FROM users WHERE id::text = $1 FOR UPDATE`, id).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return account.User{}, false, nil
+	}
+	if err != nil {
+		return account.User{}, false, wrap("PatchUser lock", err)
+	}
+
+	if patch.IsAdmin != nil {
+		if _, err := tx.Exec(ctx,
+			`UPDATE users SET is_admin = $2, updated_at = now() WHERE id = $1`, id, *patch.IsAdmin); err != nil {
+			return account.User{}, false, wrap("PatchUser is_admin", err)
+		}
+	}
+	if patch.Disabled != nil {
+		if _, err := setUserDisabled(ctx, tx, id, *patch.Disabled); err != nil {
+			return account.User{}, false, err
+		}
+	}
+	u, found, err := scanUser(tx.QueryRow(ctx, `SELECT `+userColumns+` FROM users WHERE id = $1`, id))
+	if err != nil || !found {
+		return account.User{}, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return account.User{}, false, wrap("PatchUser commit", err)
+	}
+	return u, true, nil
+}
+
+func (r *Repo) UpdateUserName(ctx context.Context, id, name string) (account.User, bool, error) {
+	return scanUser(r.pool.QueryRow(ctx,
+		`UPDATE users SET name = $2, updated_at = now() WHERE id = $1 AND disabled_at IS NULL RETURNING `+userColumns, id, name))
+}
+
+// ChangePassword answers false, changing nothing, when the user is missing or
+// disabled, the stored hash is no longer c.CurrentHash, or the presenting
+// session is gone. The hash update and the revocation of every other session
+// share one transaction, so a stolen session cannot outlive the password
+// change that was meant to end it.
+func (r *Repo) ChangePassword(ctx context.Context, c account.PasswordChange) (bool, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return false, wrap("ChangePassword begin", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE users SET password_hash = $2, updated_at = now()
+		 WHERE id = $1 AND password_hash = $3 AND disabled_at IS NULL
+		   AND EXISTS (SELECT 1 FROM sessions WHERE token_hash = $4 AND user_id = $1 AND expires_at > now())`,
+		c.UserID, c.NewHash, c.CurrentHash, c.KeepTokenHash)
+	if err != nil {
+		return false, wrap("ChangePassword", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2`, c.UserID, c.KeepTokenHash); err != nil {
+		return false, wrap("ChangePassword sessions", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, wrap("ChangePassword commit", err)
+	}
+	return true, nil
+}
+
+// --- Sessions ---
+
+func (r *Repo) CreateSession(ctx context.Context, s account.Session) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, $3)`,
+		s.TokenHash, s.UserID, s.ExpiresAt)
+	return wrap("CreateSession", err)
+}
+
+func (r *Repo) GetSessionUser(ctx context.Context, tokenHash string) (account.User, bool, error) {
+	return scanUser(r.pool.QueryRow(ctx,
+		`SELECT `+userColumnsU+`
+		 FROM sessions s JOIN users u ON u.id = s.user_id
+		 WHERE s.token_hash = $1 AND s.expires_at > now() AND u.disabled_at IS NULL`, tokenHash))
+}
+
+func (r *Repo) DeleteSession(ctx context.Context, tokenHash string) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM sessions WHERE token_hash = $1`, tokenHash)
+	return wrap("DeleteSession", err)
+}
+
+func (r *Repo) DeleteUserSessions(ctx context.Context, userID string) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, userID)
+	return wrap("DeleteUserSessions", err)
+}
+
+func (r *Repo) DeleteExpiredSessions(ctx context.Context) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `DELETE FROM sessions WHERE expires_at <= now()`)
+	if err != nil {
+		return 0, wrap("DeleteExpiredSessions", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// --- Jobs ---
+
+func (r *Repo) CreateJob(ctx context.Context, j transit.Job) error {
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO jobs (id, kind, status, scenario_id, user_scenario_id, user_service_id, owner_id, error)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		j.ID, j.Kind, j.Status, j.ScenarioID, j.UserScenarioID, j.UserServiceID, j.OwnerID, j.Error)
+	return wrap("CreateJob", err)
+}
+
+const jobColumns = `id, kind, status, scenario_id, user_scenario_id, user_service_id,
+	owner_id, error, result, compiled_service_ids, created_at, updated_at`
+
+const jobColumnsQualified = `j.id, j.kind, j.status, j.scenario_id, j.user_scenario_id, j.user_service_id,
+	j.owner_id, j.error, j.result, j.compiled_service_ids, j.created_at, j.updated_at`
+
+func (r *Repo) GetJobByID(ctx context.Context, id string) (transit.Job, bool, error) {
+	return scanJob(r.pool.QueryRow(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id = $1`, id))
+}
+
+func (r *Repo) UpdateJobStatus(ctx context.Context, id, status, errMsg string) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE jobs SET status = $2, error = $3, updated_at = now() WHERE id = $1`,
+		id, status, errMsg)
+	if err != nil {
+		return wrap("UpdateJobStatus", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("postgres: UpdateJobStatus: job %q not found", id)
+	}
+	return nil
+}
+
+func (r *Repo) CompleteJob(ctx context.Context, id string, result transit.TransitGraph, compiledServiceIDs []string) error {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE jobs SET status = $2, error = '', result = $3, compiled_service_ids = $4, updated_at = now() WHERE id = $1`,
+		id, transit.JobStatusSucceeded, result, compiledServiceIDs)
+	if err != nil {
+		return wrap("CompleteJob", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("postgres: CompleteJob: job %q not found", id)
+	}
+	return nil
+}
+
+const interruptedByRestart = "interrupted by restart"
+
+func (r *Repo) FailInterruptedJobs(ctx context.Context) (int64, error) {
+	// Compiles run in-process, so a job still unfinished when a process boots
+	// has no goroutine left to finish it (SPA-431). There is deliberately no
+	// time cutoff: created_at is the database's clock and a boot time would be
+	// the API's, and skew between them misfiles rows. The caller sweeps before
+	// it enqueues anything instead.
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE jobs SET status = $1, error = $2, updated_at = now()
+		 WHERE status = ANY($3)`,
+		transit.JobStatusFailed, interruptedByRestart,
+		[]string{transit.JobStatusQueued, transit.JobStatusRunning})
+	if err != nil {
+		return 0, wrap("FailInterruptedJobs", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+func (r *Repo) FailInterruptedJob(ctx context.Context, id, errMsg string) (bool, error) {
+	// Guarded on the job still being unfinished, so a compile that completes
+	// between the caller's read and this write keeps its result.
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE jobs SET status = $2, error = $3, updated_at = now()
+		 WHERE id = $1 AND status = ANY($4)`,
+		id, transit.JobStatusFailed, errMsg,
+		[]string{transit.JobStatusQueued, transit.JobStatusRunning})
+	if err != nil {
+		return false, wrap("FailInterruptedJob", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (r *Repo) ListJobs(ctx context.Context) ([]transit.Job, error) {
+	rows, err := r.pool.Query(ctx, `SELECT `+jobColumns+` FROM jobs ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, wrap("ListJobs", err)
+	}
+	defer rows.Close()
+
+	var out []transit.Job
+	for rows.Next() {
+		j, err := scanJobRow(rows)
+		if err != nil {
+			return nil, wrap("ListJobs scan", err)
+		}
+		out = append(out, j)
+	}
+	return out, wrap("ListJobs rows", rows.Err())
+}
+
+func (r *Repo) GetLatestSucceededJob(ctx context.Context, scenarioSlug, kind string) (transit.Job, bool, error) {
+	return r.latestSucceededJobBySlug(ctx, "scenarios", "scenario_id", scenarioSlug, kind)
+}
+
+func (r *Repo) GetLatestSucceededUserScenarioJob(ctx context.Context, userScenarioSlug string) (transit.Job, bool, error) {
+	return r.latestSucceededJobBySlug(ctx, "user_scenarios", "user_scenario_id", userScenarioSlug, transit.JobKindCompileUserScenario)
+}
+
+func (r *Repo) GetLatestSucceededUserServiceJob(ctx context.Context, userServiceSlug string) (transit.Job, bool, error) {
+	return r.latestSucceededJobBySlug(ctx, "user_services", "user_service_id", userServiceSlug, transit.JobKindCompileUserService)
+}
+
+func (r *Repo) latestSucceededJobBySlug(ctx context.Context, targetTable, fkColumn, slug, kind string) (transit.Job, bool, error) {
+	row := r.pool.QueryRow(ctx,
+		`SELECT `+jobColumnsQualified+`
+		 FROM jobs j JOIN `+targetTable+` t ON t.id = j.`+fkColumn+`
+		 WHERE t.slug = $1 AND j.kind = $2 AND j.status = $3
+		 ORDER BY j.created_at DESC, j.id DESC LIMIT 1`,
+		slug, kind, transit.JobStatusSucceeded)
+	return scanJob(row)
+}
+
+func scanJob(row pgx.Row) (transit.Job, bool, error) {
+	var j transit.Job
+	err := scanJobInto(row, &j)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return transit.Job{}, false, nil
+	}
+	if err != nil {
+		return transit.Job{}, false, wrap("scanJob", err)
+	}
+	return j, true, nil
+}
+
+func scanJobRow(rows pgx.Rows) (transit.Job, error) {
+	var j transit.Job
+	err := scanJobInto(rows, &j)
+	return j, err
+}
+
+func scanJobInto(row pgx.Row, j *transit.Job) error {
+	return row.Scan(&j.ID, &j.Kind, &j.Status, &j.ScenarioID, &j.UserScenarioID, &j.UserServiceID,
+		&j.OwnerID, &j.Error, &j.Result, &j.CompiledServiceIDs, &j.CreatedAt, &j.UpdatedAt)
+}
+
+const routingJobColumns = `id, status, compile_job_id, owner_id, lat, lng,
+	budget_mins, mode, result, error, created_at, updated_at`
+
+func (r *Repo) CreateRoutingJob(ctx context.Context, j *transit.RoutingJob) error {
+	err := r.pool.QueryRow(ctx,
+		`INSERT INTO routing_jobs (id, status, compile_job_id, owner_id, lat, lng, budget_mins, mode)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		 RETURNING created_at, updated_at`,
+		j.ID, j.Status, j.CompileJobID, j.OwnerID, j.Lat, j.Lng, j.BudgetMins, string(j.Mode),
+	).Scan(&j.CreatedAt, &j.UpdatedAt)
+	return wrap("CreateRoutingJob", err)
+}
+
+func (r *Repo) GetRoutingJobByID(ctx context.Context, id string) (transit.RoutingJob, bool, error) {
+	return r.queryRoutingJob(ctx, "GetRoutingJobByID",
+		`SELECT `+routingJobColumns+` FROM routing_jobs WHERE id = $1`, id)
+}
+
+// The key, quantisation and freshness rules are migration 00034's. The
+// round(..., 5) expressions and the status literal must match
+// routing_jobs_reuse_idx for the index to serve this.
+func (r *Repo) FindReusableRoutingJob(ctx context.Context, want transit.RoutingJob) (transit.RoutingJob, bool, error) {
+	return r.queryRoutingJob(ctx, "FindReusableRoutingJob", findReusableRoutingJobSQL,
+		want.CompileJobID, string(want.Mode), want.BudgetMins, want.Lat, want.Lng, want.OwnerID)
+}
+
+const findReusableRoutingJobSQL = `SELECT ` + routingJobColumns + `
+		   FROM routing_jobs
+		  WHERE status = 'succeeded'
+		    AND compile_job_id = $1
+		    AND mode = $2
+		    AND budget_mins = $3
+		    AND round(lat::numeric, 5) = round($4::float8::numeric, 5)
+		    AND round(lng::numeric, 5) = round($5::float8::numeric, 5)
+		    AND owner_id IS NOT DISTINCT FROM $6::uuid
+		    AND (reusable_until IS NULL OR reusable_until > now())
+		    AND tileset_at = (SELECT max(tileset_at) FROM routing_jobs WHERE status = 'succeeded')
+		  ORDER BY updated_at DESC
+		  LIMIT 1`
+
+func (r *Repo) queryRoutingJob(ctx context.Context, op, sql string, args ...any) (transit.RoutingJob, bool, error) {
+	var j transit.RoutingJob
+	err := r.pool.QueryRow(ctx, sql, args...).
+		Scan(&j.ID, &j.Status, &j.CompileJobID, &j.OwnerID, &j.Lat, &j.Lng,
+			&j.BudgetMins, &j.Mode, &j.Result, &j.Error, &j.CreatedAt, &j.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return transit.RoutingJob{}, false, nil
+	}
+	if err != nil {
+		return transit.RoutingJob{}, false, wrap(op, err)
+	}
+	return j, true, nil
+}
+
+func (r *Repo) CountInFlightRoutingJobs(ctx context.Context, within time.Duration) (int, error) {
+	return r.countInFlightRoutingJobs(ctx, "CountInFlightRoutingJobs", within, nil)
+}
+
+func (r *Repo) CountInFlightRoutingJobsBefore(ctx context.Context, createdAt time.Time, within time.Duration) (int, error) {
+	return r.countInFlightRoutingJobs(ctx, "CountInFlightRoutingJobsBefore", within, &createdAt)
+}
+
+// A nil before counts the whole backlog; otherwise only the jobs created
+// earlier, which is a queued job's queue position.
+func (r *Repo) countInFlightRoutingJobs(ctx context.Context, op string, within time.Duration, before *time.Time) (int, error) {
+	var n int
+	err := r.pool.QueryRow(ctx,
+		`SELECT count(*) FROM routing_jobs
+		 WHERE status = ANY($1) AND created_at > $2
+		   AND ($3::timestamptz IS NULL OR created_at < $3)`,
+		[]string{transit.JobStatusQueued, transit.JobStatusRunning},
+		time.Now().Add(-within),
+		before,
+	).Scan(&n)
+	if err != nil {
+		return 0, wrap(op, err)
+	}
+	return n, nil
+}
+
+func (r *Repo) FailRoutingJob(ctx context.Context, id, errMsg string) error {
+	return r.execRoutingJob(ctx, "FailRoutingJob", id,
+		`UPDATE routing_jobs SET status = $2, error = $3, updated_at = now() WHERE id = $1`,
+		id, transit.JobStatusFailed, errMsg)
+}
+
+func wrap(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("postgres: %s: %w", op, err)
+}
