@@ -492,6 +492,16 @@ chainer therefore:
    station are not clipped. The docs-renamed key
    `multimodal_start_end_max_distance` is ignored by the costing engine
    and must not be sent (SPA-297).
+5. Sends `costing_options.transit` with `use_bus`, `use_rail` and
+   `use_transfers` at 0.5 and `transfer_penalty` at 0. Valhalla returns the
+   cheapest path by cost, not the fastest, and its defaults rank rail far
+   above buses and price each transfer at about 14 minutes. At 0.5 every
+   factor normalises to 1.0, so cost tracks elapsed time and an isochrone is
+   drawn from the fastest route: a Richmond District pin rides the 38R in 40
+   minutes rather than the N Judah in 62 (SPA-559). Costing options are not
+   part of the egress cache key, so polygons cut under the old costing stay
+   live until a tileset rebuild changes `tileset_at`; ship this ahead of a
+   tile cycle (SPA-558's) so that rebuild clears them.
 
 ### The departure clock
 
