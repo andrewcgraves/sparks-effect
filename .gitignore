@@ -1,0 +1,16 @@
+# Each service has its own .gitignore. This one covers what can land anywhere.
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Core dumps (they contain process memory)
+core
+core.[0-9]*
+
+# Agent worktrees and local settings
+.claude/worktrees/
+.claude/settings.local.json
+
+.DS_Store

@@ -1,0 +1,79 @@
+# Weekly update PRs (SPA-435). Minor and patch updates are grouped into one PR
+# per ecosystem and service; a major update gets a PR of its own, because that
+# is where breaking changes live. Nothing auto-merges: every PR goes through CI
+# and a human, the same as any other change to main.
+#
+# Each service has its own entries so that an update PR only touches that
+# service's directory and only runs that service's workflow.
+version: 2
+updates:
+  # --- api/ ---------------------------------------------------------------
+  # api/contract is a module of its own, and Dependabot only reads the go.mod
+  # in the directories it is given.
+  - package-ecosystem: gomod
+    directories: [/api, /api/contract]
+    schedule:
+      interval: weekly
+    groups:
+      api-gomod-minor-patch:
+        update-types: [minor, patch]
+
+  # Both stages of the Dockerfile: the golang build image and the
+  # digest-pinned distroless runtime image.
+  - package-ecosystem: docker
+    directory: /api
+    schedule:
+      interval: weekly
+    # The golang build image's minor is the Go version, which moves together
+    # with go.mod, not on its own in a grouped PR.
+    ignore:
+      - dependency-name: golang
+        update-types: [version-update:semver-minor, version-update:semver-major]
+    groups:
+      api-docker-minor-patch:
+        update-types: [minor, patch]
+
+  # --- worker/ ------------------------------------------------------------
+  - package-ecosystem: gomod
+    directory: /worker
+    schedule:
+      interval: weekly
+    groups:
+      worker-gomod-minor-patch:
+        update-types: [minor, patch]
+
+  # Both stages of the Dockerfile: the golang build image and the alpine
+  # runtime image.
+  - package-ecosystem: docker
+    directory: /worker
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: golang
+        update-types: [version-update:semver-minor, version-update:semver-major]
+    groups:
+      worker-docker-minor-patch:
+        update-types: [minor, patch]
+
+  # --- website/ -----------------------------------------------------------
+  - package-ecosystem: npm
+    directory: /website
+    schedule:
+      interval: weekly
+    groups:
+      website-npm-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      # typescript-eslint@8 peers typescript <6.1, so a TypeScript major PR
+      # cannot install (SPA-472). Lift this once typescript-eslint supports 7.
+      - dependency-name: typescript
+        update-types: [version-update:semver-major]
+
+  # --- workflows, shared by all three services ----------------------------
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
