@@ -1,0 +1,260 @@
+name: API
+
+# The API's CI. It runs for changes under `api/`, to the worker's golden
+# fixtures (the contract job diffs them against the API's copies) and to this
+# file, so a website or worker change does not pay for the API's suite.
+#
+# The same path list appears three times: both triggers below and the
+# `Resolve the image commit` step of the publish job. `api-release.yml` holds
+# a fourth copy. Change them together — the release finds an image by asking
+# git for the last commit that touched these paths.
+#
+# Tags are deliberately not a trigger here: a release promotes an image this
+# workflow already built and tested on `main`, and rebuilding it would defeat
+# that. See `api-release.yml`.
+on:
+  push:
+    branches: [main]
+    paths:
+      - api/**
+      - worker/internal/routing/testdata/**
+      - worker/internal/store/testdata/**
+      - .github/workflows/api.yml
+  pull_request:
+    paths:
+      - api/**
+      - worker/internal/routing/testdata/**
+      - worker/internal/store/testdata/**
+      - .github/workflows/api.yml
+  # Run from `main`, this publishes like a push does. It is how a commit whose
+  # push did not publish (the staging gate was still off, or the push's net
+  # diff left the paths above untouched) gets its image.
+  workflow_dispatch:
+
+# Nothing here writes to the repository. A pull request from a fork gets this
+# read-only token and no secrets; the jobs that need more ask for it.
+permissions:
+  contents: read
+
+env:
+  # The package name predates the monorepo and Railway pins `:staging` and
+  # `:prd` on it, so it is spelled out rather than derived from
+  # `github.repository`.
+  IMAGE: ghcr.io/andrewcgraves/sparks-effect-api
+
+defaults:
+  run:
+    working-directory: api
+
+jobs:
+  check:
+    name: Test, lint, vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The exact patch comes from go.mod's `go` directive, which is the floor
+      # every toolchain must meet. It moves together with the Dockerfile's
+      # golang image.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: api/go.mod
+          cache-dependency-path: api/go.sum
+
+      # `make itest` brings up a throwaway Postgres and RabbitMQ (via the same
+      # Makefile targets used locally), runs the full suite with both sets of
+      # integration tests enabled, then tears the containers down — DRY across
+      # local and CI.
+      #
+      # CI is set on GitHub Actions, and the integration suites treat a missing
+      # TEST_DATABASE_URL / TEST_AMQP_URL as a hard failure when it is present,
+      # so a broken service here fails the job rather than silently skipping.
+      - name: Test (with Postgres and RabbitMQ integration)
+        run: make itest
+
+      - name: Vet
+        run: make vet
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+          working-directory: api
+
+      - name: Lint contract
+        run: golangci-lint run ./...
+        working-directory: api/contract
+
+      - name: Vulnerability scan
+        run: make vulncheck
+
+  # The golden fixtures are duplicated in `worker/`. Drift is a contract
+  # break, not a test failure — keep this job separate so a red light reads as
+  # "the contract moved" rather than "a test broke".
+  # A human remembering to copy a file across two trees is not an invariant.
+  contract:
+    name: API↔worker contract
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # No setup-go and no network: check-contract is a diff between two
+      # directories of the same checkout.
+      - name: Diff golden fixtures against the worker
+        run: make check-contract
+
+  build:
+    name: Build
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: api/go.mod
+          cache-dependency-path: api/go.sum
+
+      - name: Build
+        run: make build
+
+  # Never runs for a pull request, so a fork cannot reach the registry.
+  # STAGING_DEPLOY_ENABLED is a repository variable and the cutover switch:
+  # until it is 'true' this job and the one below are skipped, and nothing is
+  # published or written to Linear.
+  publish:
+    name: Publish Docker image
+    needs: [check, build]
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.STAGING_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The step below walks history to name the image.
+          fetch-depth: 0
+
+      # A push only starts this workflow when it touches the API's paths, so
+      # not every commit on `main` has an image. `api-release.yml` finds the
+      # image for a tag with this same command, and tagging the image with its
+      # answer here is what makes the two agree: usually that is this commit,
+      # but not when the last commit of a push left the paths alone, and not on
+      # a manual run. Nothing under the paths changed in between, so the build
+      # context is the same either way.
+      #
+      # --first-parent keeps the answer on `main` itself rather than on a
+      # merged branch, whose commits were never built.
+      - name: Resolve the image commit
+        id: src
+        run: |
+          set -euo pipefail
+          sha="$(git rev-list -1 --first-parent "$GITHUB_SHA" -- \
+            api \
+            worker/internal/routing/testdata \
+            worker/internal/store/testdata \
+            .github/workflows/api.yml)"
+          if [[ -z "$sha" ]]; then
+            echo "::error::no commit at or before $GITHUB_SHA touches the API's paths"
+            exit 1
+          fi
+          {
+            echo "sha=$sha"
+            echo "short=${sha:0:7}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          # `sha-<commit>` is the promotable artifact: immutable, and what
+          # `api-release.yml` re-tags as `:prd` when a release tag resolves to
+          # this commit. `staging` is a moving tag for whatever the trunk last
+          # built. No `latest` — a moving tag something deploys from is how
+          # production drifts with nobody choosing to move it.
+          tags: |
+            type=sha
+            type=raw,value=sha-${{ steps.src.outputs.short }}
+            type=raw,value=staging
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: api
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+
+  # Staging is whatever `main` last published. Linear's staging pipeline is a
+  # separate stream from production because the two environments can (and do)
+  # hold different commits at the same time — see api/docs/releases.md.
+  linear-staging:
+    name: Record staging release in Linear
+    needs: [check, build, publish]
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.STAGING_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # linear-release-action scans commits since the last Linear release,
+          # which needs the full history.
+          fetch-depth: 0
+
+      # Secrets cannot be referenced in `if:` (GitHub treats that as a
+      # workflow-file error), so the empty check lives in a shell step and
+      # gates the action via an output, same idea as RAILWAY_TOKEN.
+      - name: Check for the staging pipeline key
+        id: linear
+        env:
+          LINEAR_ACCESS_KEY_STAGING: ${{ secrets.API_LINEAR_ACCESS_KEY_STAGING }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${LINEAR_ACCESS_KEY_STAGING:-}" ]]; then
+            echo "::notice::API_LINEAR_ACCESS_KEY_STAGING is not set — create the 'API staging' pipeline in Linear and add its access key as this repository secret"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # install.sh inside linear-release-action downloads its CLI with a bare
+      # curl and no retry, so a single connection reset from github.com fails
+      # the job (curl exit 35). curl reads $CURL_HOME/.curlrc before its own
+      # arguments, and the action's composite steps inherit $GITHUB_ENV, so
+      # this makes every curl in the action retry without forking it.
+      - name: Retry the Linear CLI download on transient network errors
+        if: steps.linear.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'retry = 5' 'retry-all-errors' 'retry-delay = 3' 'retry-max-time = 120' \
+            > "$RUNNER_TEMP/.curlrc"
+          echo "CURL_HOME=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Sync Linear staging release
+        if: steps.linear.outputs.configured == 'true'
+        uses: linear/linear-release-action@v0
+        with:
+          access_key: ${{ secrets.API_LINEAR_ACCESS_KEY_STAGING }}
+          # Only commits that touched the API belong to this pipeline; the
+          # worker and the website record their own.
+          include_paths: "api/**"
+          links: |
+            CI run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Image=https://github.com/users/andrewcgraves/packages/container/package/sparks-effect-api

@@ -10,7 +10,7 @@ Valhalla runs ClusterIP-only on the home cluster with no ingress, so
 only transport between them, which means the routing fan-out has to execute
 inside the cluster. This worker is that execution.
 
-The two repositories share **no Go code**. What they share is one message body
+The two services share **no Go code**. What they share is one message body
 and the authenticated HTTP contract this worker uses to write results back:
 
 ```
@@ -31,11 +31,12 @@ The queue-message contract is pinned by `internal/routing/testdata/message.golde
 and the worker-store HTTP envelope by `internal/store/testdata/worker-store.golden.json`
 — the same files, byte for byte, that the API asserts it produces. Nothing else
 stops the two hand-maintained copies of the structs drifting apart, so
-`make check-contract` fetches the API's copies and diffs them, and CI runs it on
-every push. That check can go red without anything here changing: the API
-merging a new field is enough, and means this side has a fixture to copy in and
-a struct to update. The API's contract job curls these paths; a missing file
-here 404s that job rather than reporting drift.
+`make check-contract` diffs them against the API's copies in `../api`, and CI
+runs it on every push that touches the worker or the API's fixtures. It is a
+local diff, so a change to the contract has to land on both sides in the same
+pull request: a new field means a fixture to copy across and a struct to
+update. The API's contract job reads these paths; a missing file here fails
+that job.
 
 ## What it owns
 
@@ -211,15 +212,15 @@ puts the original bytes back unchanged, so the counter would never advance.
 ## Branching and releases
 
 One trunk: `main`. Branch from it, PR into it. Staging follows `main`: every
-push publishes `sha-<commit>` and moves `:staging`, and CI redeploys the
-`routing-worker-staging` Railway service in the same run. Production is
-promoted by tag, the same way as the API and the website: push a `vX.Y.Z` tag
-on a commit that is already on `main`, and the **Release** workflow re-tags
-that commit's existing image as `:prd` (nothing is rebuilt) and redeploys
-`routing-worker`.
+push that changes the worker publishes `sha-<commit>` and moves `:staging`, and
+CI redeploys the `routing-worker-staging` Railway service in the same run.
+Production is promoted by tag, the same way as the API and the website: push a
+`worker/vX.Y.Z` tag on a commit that is already on `main`, and the **Worker
+release** workflow re-tags the existing image of the worker at that commit as
+`:prd` (nothing is rebuilt) and redeploys `routing-worker`.
 
-To roll back, release an older tag: Actions → Release → Run workflow → pass
-the tag. See [`docs/releases.md`](docs/releases.md).
+To roll back, release an older tag: Actions → Worker release → Run workflow →
+pass the tag. See [`docs/releases.md`](docs/releases.md).
 
 ## Running it
 
@@ -368,21 +369,21 @@ changes.
 make dev-workflow    # test, vet, lint, build — run this before pushing
 make check-config    # Validate() against .env; no AMQP/API/Valhalla
 make itest           # throwaway RabbitMQ, full integration suite, teardown
-make check-contract  # diff the golden fixtures against sparks-effect-api
+make check-contract  # diff the golden fixtures against ../api
 ```
 
-`check-contract` is not part of `dev-workflow` because it needs the network and
-nothing else in that target does. CI runs it as a job of its own.
+`check-contract` is not part of `dev-workflow` because it reads the API's tree
+and nothing else in that target does. CI runs it as a job of its own.
 
 Integration tests skip themselves unless `TEST_AMQP_URL` is set, so `make test`
 stays green with nothing running. Under CI a missing URL is a hard failure
 instead, so a broken broker fails the job rather than silently skipping.
 
-The throwaway broker listens on 5673 — one above the API repo's 5672 — so both
-repositories' test stacks can be up at once without either connecting to the
+The throwaway broker listens on 5673 — one above the API's 5672 — so both
+services' test stacks can be up at once without either connecting to the
 other's. Job writes and the egress cache are exercised against an in-process
-stand-in for the API's worker endpoints; there is no throwaway Postgres in
-this repository.
+stand-in for the API's worker endpoints; there is no throwaway Postgres for
+the worker.
 
 ## Schema ownership
 
@@ -390,7 +391,7 @@ this repository.
 sequence. Both want real foreign keys into `users` and `jobs`, and a foreign key
 cannot cross a schema owned by a different migration sequence.
 
-This repository therefore runs no migrations, connects to no database, and
+The worker therefore runs no migrations, connects to no database, and
 should not gain either: a second goose sequence against the same database
 would be two tools racing to own one `schema_migrations` table, and a
 `DATABASE_URL` on this worker is how the database used to be reachable from
@@ -545,7 +546,7 @@ speed on a healthy tileset (SPA-335) and so cannot fail cleanly.
 
 This suite is part of the post-cycle procedure, not CI — it needs a real
 tileset. kustomize-config's `make verify-cycle` port-forwards the Valhalla
-Service and runs `make acceptance` from a checkout of this repository after
+Service and runs `make acceptance` from the `worker/` directory of a checkout of this repository after
 its in-pod checks; a failure there is a failed cycle (SPA-339).
 
 On Railway, Valhalla has no public address and Railway's SSH refuses a bare
@@ -583,7 +584,7 @@ transient. A rate limit still fails the job.
 ### Where the access time goes
 
 A transit access time is door-to-door wall clock, schedule wait included
-([ADR-0004](https://github.com/andrewcgraves/sparks-effect-api/blob/main/docs/adr/0004-transit-isochrone-claim-and-reported-time.md)),
+([ADR-0004](../api/docs/adr/0004-transit-isochrone-claim-and-reported-time.md)),
 so every reachable station with a transit access leg also reports
 `access_walk_secs`, `access_wait_secs` and `access_ride_secs` beside
 `access_secs`, summing to it exactly (SPA-348). `access_secs` is unchanged.

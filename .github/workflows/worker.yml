@@ -1,15 +1,51 @@
-name: CI
+name: Worker
 
+# The routing worker's CI. It runs for changes under `worker/`, to the API's
+# golden fixtures (the contract job diffs them against the worker's copies)
+# and to this file, so a website or API change does not pay for the worker's
+# suite.
+#
+# The same path list appears three times: both triggers below and the
+# `Resolve the image commit` step of the publish job. `worker-release.yml`
+# holds a fourth copy. Change them together — the release finds an image by
+# asking git for the last commit that touched these paths.
+#
 # Tags are deliberately not a trigger here: a release promotes an image this
 # workflow already built and tested on `main`, and rebuilding it would defeat
-# that. See `release.yml`.
+# that. See `worker-release.yml`.
 on:
   push:
     branches: [main]
+    paths:
+      - worker/**
+      - api/internal/routing/testdata/**
+      - api/internal/handler/testdata/**
+      - .github/workflows/worker.yml
   pull_request:
+    paths:
+      - worker/**
+      - api/internal/routing/testdata/**
+      - api/internal/handler/testdata/**
+      - .github/workflows/worker.yml
+  # Run from `main`, this publishes like a push does. It is how a commit whose
+  # push did not publish (the staging gate was still off, or the push's net
+  # diff left the paths above untouched) gets its image.
+  workflow_dispatch:
+
+# Nothing here writes to the repository. A pull request from a fork gets this
+# read-only token and no secrets; the jobs that need more ask for it.
+permissions:
+  contents: read
 
 env:
-  GO_VERSION: "1.26.11"
+  # The package name predates the monorepo and Railway pins `:staging` and
+  # `:prd` on it, so it is spelled out rather than derived from
+  # `github.repository`.
+  IMAGE: ghcr.io/andrewcgraves/sparks-effect-routing-worker
+
+defaults:
+  run:
+    working-directory: worker
 
 jobs:
   check:
@@ -18,9 +54,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The exact patch comes from go.mod's `go` directive. It moves together
+      # with the Dockerfile's golang image.
       - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: worker/go.mod
+          cache-dependency-path: worker/go.sum
 
       - name: Test (with RabbitMQ integration)
         run: make itest
@@ -32,6 +71,7 @@ jobs:
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
+          working-directory: worker
 
       - name: Vulnerability scan
         run: make vulncheck
@@ -42,10 +82,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No setup-go: check-contract is curl and diff. Keep it that way — a
-      # variable that expands `go` anywhere in the Makefile puts a toolchain
-      # download in front of this job.
-      - name: Diff the golden fixtures against sparks-effect-api
+      # No setup-go and no network: check-contract is a diff between two
+      # directories of the same checkout. Keep it that way — a variable that
+      # expands `go` anywhere in the Makefile puts a toolchain download in
+      # front of this job.
+      - name: Diff the golden fixtures against the API
         run: make check-contract
 
   build:
@@ -57,21 +98,57 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: worker/go.mod
+          cache-dependency-path: worker/go.sum
 
       - name: Build
         run: make build
 
+  # Never runs for a pull request, so a fork cannot reach the registry.
+  # STAGING_DEPLOY_ENABLED is a repository variable and the cutover switch:
+  # until it is 'true' this job and the two below are skipped, and nothing is
+  # published, redeployed or written to Linear.
   publish:
     name: Publish Docker image
     needs: [check, build]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.STAGING_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The step below walks history to name the image.
+          fetch-depth: 0
+
+      # A push only starts this workflow when it touches the worker's paths,
+      # so not every commit on `main` has an image. `worker-release.yml` finds
+      # the image for a tag with this same command, and tagging the image with
+      # its answer here is what makes the two agree: usually that is this
+      # commit, but not when the last commit of a push left the paths alone,
+      # and not on a manual run. Nothing under the paths changed in between,
+      # so the build context is the same either way.
+      #
+      # --first-parent keeps the answer on `main` itself rather than on a
+      # merged branch, whose commits were never built.
+      - name: Resolve the image commit
+        id: src
+        run: |
+          set -euo pipefail
+          sha="$(git rev-list -1 --first-parent "$GITHUB_SHA" -- \
+            worker \
+            api/internal/routing/testdata \
+            api/internal/handler/testdata \
+            .github/workflows/worker.yml)"
+          if [[ -z "$sha" ]]; then
+            echo "::error::no commit at or before $GITHUB_SHA touches the worker's paths"
+            exit 1
+          fi
+          {
+            echo "sha=$sha"
+            echo "short=${sha:0:7}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -87,21 +164,22 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE }}
           # `sha-<commit>` is the promotable artifact: immutable, and what
-          # `release.yml` re-tags as `:prd` when a release tag names this
-          # commit. `staging` is a moving tag for whatever the trunk last
-          # built, and what the routing-worker-staging Railway service pins.
-          # No `latest` — a moving tag something deploys from is how
+          # `worker-release.yml` re-tags as `:prd` when a release tag resolves
+          # to this commit. `staging` is a moving tag for whatever the trunk
+          # last built, and what the routing-worker-staging Railway service
+          # pins. No `latest` — a moving tag something deploys from is how
           # production drifts with nobody choosing to move it.
           tags: |
             type=sha
+            type=raw,value=sha-${{ steps.src.outputs.short }}
             type=raw,value=staging
 
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
-          context: .
+          context: worker
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -116,9 +194,15 @@ jobs:
   deploy-staging:
     name: Redeploy the staging Railway service
     needs: publish
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.STAGING_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment: production
+    # This job reads nothing from the repository.
+    permissions: {}
+    # No checkout, so there is no `worker/` directory to run in.
+    defaults:
+      run:
+        working-directory: .
     steps:
       # Skipped with a notice when the token is not set, rather than failing
       # a publish that did in fact push the image.
@@ -141,11 +225,11 @@ jobs:
 
   # Staging is whatever `main` last published. Linear's staging pipeline is a
   # separate stream from production because the two environments can (and do)
-  # hold different commits at the same time — see docs/releases.md.
+  # hold different commits at the same time — see worker/docs/releases.md.
   linear-staging:
     name: Record staging release in Linear
     needs: [check, build, publish]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.STAGING_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -162,11 +246,11 @@ jobs:
       - name: Check for the staging pipeline key
         id: linear
         env:
-          LINEAR_ACCESS_KEY_STAGING: ${{ secrets.LINEAR_ACCESS_KEY_STAGING }}
+          LINEAR_ACCESS_KEY_STAGING: ${{ secrets.WORKER_LINEAR_ACCESS_KEY_STAGING }}
         run: |
           set -euo pipefail
           if [[ -z "${LINEAR_ACCESS_KEY_STAGING:-}" ]]; then
-            echo "::notice::LINEAR_ACCESS_KEY_STAGING is not set — create the Worker Build Staging pipeline in Linear and add its access key as this repository secret"
+            echo "::notice::WORKER_LINEAR_ACCESS_KEY_STAGING is not set — create the Worker Build Staging pipeline in Linear and add its access key as this repository secret"
             echo "configured=false" >> "$GITHUB_OUTPUT"
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
@@ -189,7 +273,10 @@ jobs:
         if: steps.linear.outputs.configured == 'true'
         uses: linear/linear-release-action@v0
         with:
-          access_key: ${{ secrets.LINEAR_ACCESS_KEY_STAGING }}
+          access_key: ${{ secrets.WORKER_LINEAR_ACCESS_KEY_STAGING }}
+          # Only commits that touched the worker belong to this pipeline; the
+          # API and the website record their own.
+          include_paths: "worker/**"
           links: |
             CI run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            Image=https://github.com/${{ github.repository }}/pkgs/container/sparks-effect-routing-worker
+            Image=https://github.com/users/andrewcgraves/packages/container/package/sparks-effect-routing-worker

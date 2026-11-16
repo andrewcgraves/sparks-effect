@@ -1,24 +1,32 @@
-name: Release
+name: Worker release
 
 # Production is reached by tagging a commit, and by nothing else — the same
-# model as sparks-effect-api and the website.
+# model as the API and the website.
 #
-# The tag names a commit that is already on `main` and whose image `main`
-# already built and staging already ran. This workflow never builds: it re-tags
-# that image as `:prd` (and as the release tag itself) and asks Railway to pull
-# it. A tag that does not point into `main`'s history is refused, so a feature
-# branch has no path to production even if someone tags it.
+# The repository holds three services, so a release tag is namespaced:
+# `worker/vMAJOR.MINOR.PATCH`. The image tag it produces stays the bare `vX.Y.Z`.
+#
+# The tag names a commit that is already on `main`. This workflow never builds:
+# it re-tags an image `main` already built as `:prd` (and as the release
+# version) and asks Railway to pull it. A tag that does not point into `main`'s
+# history is refused, so a feature branch has no path to production even if
+# someone tags it.
+#
+# Which image: `worker.yml` is path-filtered, so not every commit on `main` has
+# one. The image promoted is that of the last commit at or before the tag that
+# touched the worker's trigger paths — nothing the image is built from changed
+# between that commit and the tag.
 on:
   push:
-    tags: ["v*"]
+    tags: ["worker/v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to promote, e.g. v1.4.2. Pass an older tag to roll back."
+        description: "Existing release tag to promote, e.g. worker/v1.4.2. Pass an older tag to roll back."
         required: true
         type: string
       base_ref:
-        description: "Optional exclusive git ref for Linear's commit scan (e.g. v0.1.0). Leave empty to scan from the previous git tag."
+        description: "Optional exclusive git ref for Linear's commit scan (e.g. worker/v0.1.0, or a commit SHA). Leave empty to scan from the previous worker/v* tag. Set it for the first monorepo release, which has no previous tag."
         required: false
         type: string
       linear_only:
@@ -28,14 +36,26 @@ on:
         default: false
 
 # Two promotions racing would leave `:prd` pointing at whichever re-tag landed
-# last rather than whichever was asked for last.
+# last rather than whichever was asked for last. The group is per service: the
+# API's and the website's releases move different things.
 concurrency:
-  group: release-production
+  group: worker-release-production
   cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # The package name predates the monorepo and Railway pins `:prd` on it, so
+  # it is spelled out rather than derived from `github.repository`.
+  IMAGE: ghcr.io/andrewcgraves/sparks-effect-routing-worker
 
 jobs:
   promote:
     name: Promote image to production
+    # PRODUCTION_RELEASE_ENABLED is a repository variable and the cutover
+    # switch: until it is 'true' a pushed tag promotes nothing.
+    if: vars.PRODUCTION_RELEASE_ENABLED == 'true'
     runs-on: ubuntu-latest
     # Scopes the Railway credential to production and gives the repo one place
     # to require an approval before prd moves.
@@ -50,7 +70,7 @@ jobs:
           # of production, and it needs the full history to answer.
           fetch-depth: 0
 
-      - name: Resolve the tag and the commit it points at
+      - name: Resolve the tag, its commit and the image commit
         id: target
         env:
           # Empty on a tag push, in which case the pushed tag is the target.
@@ -59,10 +79,12 @@ jobs:
           set -euo pipefail
           tag="${REQUESTED_TAG:-$GITHUB_REF_NAME}"
 
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
-            echo "::error::'$tag' is not a release tag (expected vMAJOR.MINOR.PATCH)"
+          if [[ ! "$tag" =~ ^worker/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$tag' is not a worker release tag (expected worker/vMAJOR.MINOR.PATCH)"
             exit 1
           fi
+          # The image tag and the Linear version stay the bare vX.Y.Z.
+          version="${tag#worker/}"
 
           if ! git fetch --force origin "refs/tags/$tag:refs/tags/$tag"; then
             echo "::error::tag '$tag' does not exist"
@@ -79,10 +101,26 @@ jobs:
             exit 1
           fi
 
+          # The last commit at or before the tag that touched the paths
+          # `worker.yml` triggers on, which is the commit that workflow named
+          # the image after. Same command and same paths as its publish job; keep
+          # them in step.
+          image_sha="$(git rev-list -1 --first-parent "$sha" -- \
+            worker \
+            api/internal/routing/testdata \
+            api/internal/handler/testdata \
+            .github/workflows/worker.yml)"
+          if [[ -z "$image_sha" ]]; then
+            echo "::error::no commit at or before $tag touches the worker's paths — there is no image to promote"
+            exit 1
+          fi
+
           {
             echo "tag=$tag"
+            echo "version=$version"
             echo "sha=$sha"
-            echo "short=${sha:0:7}"
+            echo "image_sha=$image_sha"
+            echo "short=${image_sha:0:7}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
@@ -96,8 +134,7 @@ jobs:
       - name: Re-tag that commit's image as prd
         if: github.event.inputs.linear_only != 'true'
         env:
-          IMAGE: ghcr.io/${{ github.repository }}
-          TAG: ${{ steps.target.outputs.tag }}
+          VERSION: ${{ steps.target.outputs.version }}
           SHORT: ${{ steps.target.outputs.short }}
         run: |
           set -euo pipefail
@@ -111,20 +148,20 @@ jobs:
           # A tag pushed right after the merge lands before main's CI has
           # published, and the API's v0.5.1 failed on exactly that (SPA-503).
           # CI takes a few minutes, so wait up to twenty before refusing.
-          echo "Promoting $src as $TAG"
+          echo "Promoting $src as $VERSION"
           deadline=$(( SECONDS + 20 * 60 ))
           until docker buildx imagetools inspect "$src" > /dev/null 2>&1; do
             if (( SECONDS >= deadline )); then
-              echo "::error::$src was not published within 20 minutes — did main's CI pass for $SHORT?"
+              echo "::error::$src was not published within 20 minutes — did the Worker workflow pass on main for $SHORT? If it never ran for that commit, run it by hand from main (Actions → Worker → Run workflow), then re-run this release"
               exit 1
             fi
             echo "$src is not published yet; waiting for main's CI"
             sleep 20
           done
 
-          # `:prd` is what Railway deploys; `:$TAG` is an immutable record of
-          # what each release was, and what a rollback re-promotes.
-          docker buildx imagetools create --tag "$IMAGE:prd" --tag "$IMAGE:$TAG" "$src"
+          # `:prd` is what Railway deploys; `:$VERSION` is an immutable record
+          # of what each release was, and what a rollback re-promotes.
+          docker buildx imagetools create --tag "$IMAGE:prd" --tag "$IMAGE:$VERSION" "$src"
           docker buildx imagetools inspect "$IMAGE:prd"
 
       # Moving the `:prd` tag does not by itself make Railway pull it, so the
@@ -161,18 +198,18 @@ jobs:
 
       # Production is a different Linear pipeline from staging: the same issue
       # can sit on staging for a while before a tag promotes it, and staging
-      # can already be several commits ahead. See docs/releases.md.
+      # can already be several commits ahead. See worker/docs/releases.md.
       #
       # Secrets cannot be referenced in `if:` (GitHub treats that as a
       # workflow-file error), so the empty check lives in a shell step.
       - name: Check for the production pipeline key
         id: linear
         env:
-          LINEAR_ACCESS_KEY_PRODUCTION: ${{ secrets.LINEAR_ACCESS_KEY_PRODUCTION }}
+          LINEAR_ACCESS_KEY_PRODUCTION: ${{ secrets.WORKER_LINEAR_ACCESS_KEY_PRODUCTION }}
         run: |
           set -euo pipefail
           if [[ -z "${LINEAR_ACCESS_KEY_PRODUCTION:-}" ]]; then
-            echo "::notice::LINEAR_ACCESS_KEY_PRODUCTION is not set — create the 'Routing Worker production' pipeline in Linear and add its access key as a secret on the production environment"
+            echo "::notice::WORKER_LINEAR_ACCESS_KEY_PRODUCTION is not set — create the 'Routing Worker production' pipeline in Linear and add its access key as a secret on the production environment"
             echo "configured=false" >> "$GITHUB_OUTPUT"
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
@@ -192,14 +229,18 @@ jobs:
           echo "CURL_HOME=$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       # Operator base_ref wins. Otherwise the exclusive lower bound is the
-      # previous vMAJOR.MINOR.PATCH tag, so a production release records every
-      # issue since the last tag went to production — including when Linear
-      # has no prior release SHA of its own. See docs/releases.md.
+      # previous worker/vMAJOR.MINOR.PATCH tag, so a production release records
+      # every issue since the last tag went to production — including when
+      # Linear has no prior release SHA of its own. See worker/docs/releases.md.
+      #
+      # The bare v* tags of the old sparks-effect-routing-worker repository were
+      # not imported, so the first monorepo release finds no previous tag. That is
+      # not an error: it falls through to Linear's automatic baseline unless
+      # the run was dispatched with base_ref.
       #
       # Two Linear steps because `base_ref` has no "unset" value once written
       # — passing it empty would scan from nothing rather than letting Linear
-      # pick its automatic baseline (the true first tag, with no previous git
-      # tag to bound from).
+      # pick its automatic baseline.
       - name: Resolve Linear scan base
         id: scan
         env:
@@ -215,44 +256,48 @@ jobs:
             exit 0
           fi
 
-          prev="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${SHA}^" 2>/dev/null || true)"
+          prev="$(git describe --tags --abbrev=0 --match 'worker/v[0-9]*' "${SHA}^" 2>/dev/null || true)"
           if [[ -n "$prev" ]]; then
             echo "base_ref=${prev}" >> "$GITHUB_OUTPUT"
             echo "Scanning from previous tag ${prev}"
           else
             echo "base_ref=" >> "$GITHUB_OUTPUT"
-            echo "No previous tag — Linear will use its automatic baseline"
+            echo "::notice::No previous worker/v* tag — Linear will use its automatic baseline. To choose the range, re-run this workflow for the same tag with linear_only and base_ref set"
           fi
 
       - name: Sync Linear production release
         if: steps.linear.outputs.configured == 'true' && steps.scan.outputs.base_ref == ''
         uses: linear/linear-release-action@v0
         with:
-          access_key: ${{ secrets.LINEAR_ACCESS_KEY_PRODUCTION }}
-          name: Routing Worker ${{ steps.target.outputs.tag }}
-          version: ${{ steps.target.outputs.tag }}
+          access_key: ${{ secrets.WORKER_LINEAR_ACCESS_KEY_PRODUCTION }}
+          name: Routing Worker ${{ steps.target.outputs.version }}
+          version: ${{ steps.target.outputs.version }}
+          # Only commits that touched the worker belong to this pipeline.
+          include_paths: "worker/**"
           links: |
             Commit=${{ github.server_url }}/${{ github.repository }}/commit/${{ steps.target.outputs.sha }}
             CI run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            Image=https://github.com/${{ github.repository }}/pkgs/container/sparks-effect-routing-worker
+            Image=https://github.com/users/andrewcgraves/packages/container/package/sparks-effect-routing-worker
 
       - name: Sync Linear production release with explicit scan base
         if: steps.linear.outputs.configured == 'true' && steps.scan.outputs.base_ref != ''
         uses: linear/linear-release-action@v0
         with:
-          access_key: ${{ secrets.LINEAR_ACCESS_KEY_PRODUCTION }}
-          name: Routing Worker ${{ steps.target.outputs.tag }}
-          version: ${{ steps.target.outputs.tag }}
+          access_key: ${{ secrets.WORKER_LINEAR_ACCESS_KEY_PRODUCTION }}
+          name: Routing Worker ${{ steps.target.outputs.version }}
+          version: ${{ steps.target.outputs.version }}
           base_ref: ${{ steps.scan.outputs.base_ref }}
+          # Only commits that touched the worker belong to this pipeline.
+          include_paths: "worker/**"
           links: |
             Commit=${{ github.server_url }}/${{ github.repository }}/commit/${{ steps.target.outputs.sha }}
             CI run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            Image=https://github.com/${{ github.repository }}/pkgs/container/sparks-effect-routing-worker
+            Image=https://github.com/users/andrewcgraves/packages/container/package/sparks-effect-routing-worker
 
       - name: Summarise
         env:
-          IMAGE: ghcr.io/${{ github.repository }}
           TAG: ${{ steps.target.outputs.tag }}
+          VERSION: ${{ steps.target.outputs.version }}
           SHA: ${{ steps.target.outputs.sha }}
           SHORT: ${{ steps.target.outputs.short }}
           LINEAR_ONLY: ${{ github.event.inputs.linear_only }}
@@ -269,11 +314,11 @@ jobs:
               echo
               echo "- commit: \`$SHA\`"
               echo "- image: \`$IMAGE:sha-$SHORT\`"
-              echo "- now also tagged: \`:prd\`, \`:$TAG\`"
+              echo "- now also tagged: \`:prd\`, \`:$VERSION\`"
             fi
             if [[ -n "${BASE_REF:-}" ]]; then
               echo "- Linear scan: \`${BASE_REF}..HEAD\`"
             else
-              echo "- Linear scan: automatic baseline (no previous git tag)"
+              echo "- Linear scan: automatic baseline (no previous worker/v* tag)"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

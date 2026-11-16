@@ -25,7 +25,7 @@ holding.
 
 Visitors see neither word: the website's copy says *line* for a service,
 *network* for a scenario and *route* for an alignment, recorded in its
-[product vocabulary](https://github.com/andrewcgraves/sparks-effect-website/blob/trunk/CONTEXT.md#product-vocabulary).
+[product vocabulary](../website/CONTEXT.md#product-vocabulary).
 That is deliberate, so do not "correct" the copy back to the words here.
 
 | Term | Model | Lives at | Is |
@@ -418,11 +418,11 @@ minutes.
 
 ## Where the rest of the vocabulary lives
 
-| Repository | Owns |
+| Where | Owns |
 | --- | --- |
-| [`sparks-effect-routing-worker`](https://github.com/andrewcgraves/sparks-effect-routing-worker/blob/main/CONTEXT.md) | Chain vocabulary: chaining, access and egress legs, starter station and starter walk, reached vs reachable, journey (*trip* on the wire, as in `trip_progress`), leg, publication (of a queue message — a service's publication is defined here), the departure clock |
-| [`sparks-effect-website`](https://github.com/andrewcgraves/sparks-effect-website/blob/trunk/CONTEXT.md) | Product vocabulary (line, network, route, splash zone, stop vs station, travel time, starting point); the time-remaining graph: view, lane, through, fork |
-| [`kustomize-config`](https://github.com/andrewcgraves/kustomize-config/blob/main/CONTEXT.md) | Deployment vocabulary: overlay, pin, generation, cycling the map, tileset |
+| [`worker/`](../worker/CONTEXT.md) | Chain vocabulary: chaining, access and egress legs, starter station and starter walk, reached vs reachable, journey (*trip* on the wire, as in `trip_progress`), leg, publication (of a queue message — a service's publication is defined here), the departure clock |
+| [`website/`](../website/CONTEXT.md) | Product vocabulary (line, network, route, splash zone, stop vs station, travel time, starting point); the time-remaining graph: view, lane, through, fork |
+| [`kustomize-config`](https://github.com/andrewcgraves/kustomize-config/blob/main/CONTEXT.md) (a separate repository) | Deployment vocabulary: overlay, pin, generation, cycling the map, tileset |
 
 Decisions — as opposed to definitions — belong in ADRs, not here. A term
 explains what a thing is called; an ADR explains why it works the way it does,

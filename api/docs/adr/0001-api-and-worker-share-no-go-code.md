@@ -13,6 +13,10 @@ and `internal/handler/testdata/worker-store.golden.json` as well as in the
 contract module, because the worker still curls those paths.
 `geo`, `config`, and `logger` remain duplicated, as this decision recorded.
 
+*Note, 2026-11: the API and the worker now live in one repository (`api/` and
+`worker/`). `make check-contract` is a local diff between the two trees, not a
+fetch; the rest of this record is left as written.*
+
 ## Context
 
 The API and the routing worker are separate repositories. They have to agree

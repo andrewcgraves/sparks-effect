@@ -95,7 +95,7 @@ func TestWorkerStoreGolden_matchesContractModuleCopy(t *testing.T) {
 		t.Fatalf("read contract copy: %v", err)
 	}
 	if !bytes.Equal(local, canonical) {
-		t.Error("internal/handler/testdata/worker-store.golden.json drifted from contract/store/testdata/worker-store.golden.json — check-contract curls the internal/ path")
+		t.Error("internal/handler/testdata/worker-store.golden.json drifted from contract/store/testdata/worker-store.golden.json — the worker's check-contract reads the internal/ path")
 	}
 }
 

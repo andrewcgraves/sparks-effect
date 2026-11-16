@@ -1,12 +1,12 @@
 # CONTEXT.md — chain vocabulary
 
-The words this repository uses for the thing it does: taking one origin, one
+The words the worker uses for the thing it does: taking one origin, one
 budget and one compiled graph, and turning them into a reachability surface.
 
 Shared domain vocabulary — scenario, service, station, stop, node, edge, dwell,
 boarding wait, mode vs costing, the error codes, the job statuses — is defined
 once in
-[**sparks-effect-api's `CONTEXT.md`**](https://github.com/andrewcgraves/sparks-effect-api/blob/main/CONTEXT.md).
+[**the API's `CONTEXT.md`**](../api/CONTEXT.md).
 Read that first; this file only adds the terms that exist here and nowhere else.
 
 > Declaration-level doc comments were deliberately removed from the source in
@@ -35,13 +35,13 @@ origin ───────────────▶ station ─────�
 | **Journey** | The graph-side part: everything between stepping onto the first vehicle and stepping off the last, as one `transit.Reached` value. Access time in, ride and dwell and boarding wait accumulated, predecessor chain recorded |
 | **Leg** | One hop of that journey — a single `Edge` traversed, with its service, seconds and dwell. `Legs` on a reachable station is the whole ridden path, oldest first |
 | **Trip** | The wire's word for a journey, not a separate concept. `trip_progress` (`TripProgress`, `tripProgress`) reports the hops a journey began but the budget did not let it finish — from and to slugs, service, route, the chainage span and the `fraction` ridden. Say *journey* in prose and new code; *trip* stays where the wire already spells it. Only `trip_progress`'s trip is the journey: Valhalla's `trip` (the route response `internal/valhalla/breakdown.go` reads) is one Valhalla route, and a GTFS trip is one timetabled vehicle run, and neither is a journey |
-| **Publication** | The act of the API publishing the queue message, and by extension the frozen inputs it carries. "The publication fixed the station positions" means: the graph in the message is immutable, so anything keyed on its compile job id can never go stale. Not to be confused with a **published** service in sparks-effect-api ([ADR-0005](https://github.com/andrewcgraves/sparks-effect-api/blob/main/docs/adr/0005-publishing-an-authored-service.md)): the same freezing one level up, pinning the compile job whose graph every message for that service then carries. This repository never sees that sense; here the word always means the queue message |
+| **Publication** | The act of the API publishing the queue message, and by extension the frozen inputs it carries. "The publication fixed the station positions" means: the graph in the message is immutable, so anything keyed on its compile job id can never go stale. Not to be confused with a **published** service in sparks-effect-api ([ADR-0005](../api/docs/adr/0005-publishing-an-authored-service.md)): the same freezing one level up, pinning the compile job whose graph every message for that service then carries. This repository never sees that sense; here the word always means the queue message |
 
 ## Access time and its split
 
 | Term | Definition |
 | --- | --- |
-| **Access time** | Door-to-door elapsed wall clock for the access leg, from leaving the origin to arriving at the boarding station, including the wait for the first scheduled departure. `access_secs`. It is what Valhalla's `summary.time` says for a depart-at request, and it is the figure the journey is seeded with ([ADR-0004](https://github.com/andrewcgraves/sparks-effect-api/blob/main/docs/adr/0004-transit-isochrone-claim-and-reported-time.md)) |
+| **Access time** | Door-to-door elapsed wall clock for the access leg, from leaving the origin to arriving at the boarding station, including the wait for the first scheduled departure. `access_secs`. It is what Valhalla's `summary.time` says for a depart-at request, and it is the figure the journey is seeded with ([ADR-0004](../api/docs/adr/0004-transit-isochrone-claim-and-reported-time.md)) |
 | **In-motion time** | Walking plus riding with every wait removed: `access_walk_secs + access_ride_secs`. A component of an access time, never a substitute for one. Not the API's **run time** — that is a compiled edge's time in motion with dwell excluded, one level down in the model; in-motion time is a whole access leg and keeps whatever dwell Valhalla's ride includes |
 | **Access split** | The access time as `access_walk_secs`, `access_wait_secs` and `access_ride_secs`, which sum to `access_secs` exactly. Transit access legs only: the matrix that serves walk, bike and drive has no maneuvers to split, so those modes carry none. A leg Valhalla walked end to end is all walk, with an explicit zero wait and zero ride, beside `access_rode_transit: false` |
 | **Access wait** | `access_wait_secs`: every wait on the access leg — for its first scheduled departure, and again at each transfer — the access leg's counterpart of the API's **boarding wait**, measured off Valhalla's timetable rather than charged by a policy. Named to sit beside `board_wait_secs`, and never overlapping it: `access_wait_secs` is inside `access_secs`, while `board_wait_secs` is the boarding wait for the authored service ridden on from the boarding station, which the graph search charges after the access time. Both are reported beside their totals, neither is subtracted from them |

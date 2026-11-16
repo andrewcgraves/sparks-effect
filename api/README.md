@@ -11,8 +11,9 @@ an isochrone is plotted over the graph that job produced.
 The API does not compute isochrones. Valhalla runs ClusterIP-only on the home
 cluster with no ingress, so nothing deployed elsewhere can reach it — the queue
 is the only transport, and the routing fan-out executes inside the cluster in a
-separate repository (SPA-182). This repository's job is to resolve a request
-down to one immutable compiled graph and publish it.
+separate service, the routing worker in [`../worker`](../worker/) (SPA-182).
+The API's job is to resolve a request down to one immutable compiled graph and
+publish it.
 
 ## Pipeline
 
@@ -32,7 +33,7 @@ POST /api/isochrone  →  202 + routing job (200 + an earlier one, on a repeat)
   • otherwise publishes { graph, lat, lng, budget_mins, mode } with publisher confirms
         │
         ▼
-routing worker (separate repo, inside the cluster)
+routing worker (../worker, inside the cluster)
   • Valhalla: access matrix + origin/egress isochrones
   • TransitGraph: Dijkstra over union of service edges (seconds)
   • records the result through authenticated /api/internal/... endpoints
@@ -74,10 +75,10 @@ and there is no error anywhere to find it by. That envelope is pinned by
 `budget_mins` are `omitempty` on the wire; the fixture keeps both non-empty so
 neither the SPA-269 nor the SPA-326 field can hide.
 
-`make check-contract` (and a CI job of the same name) still fetches the
-worker's copies on `main` and diffs both fixtures; it is not part of
-`make dev-workflow` because it needs the network. A prose copy of a
-fixture is a third copy and goes stale.
+`make check-contract` (and a CI job of the same name) diffs both fixtures
+against the worker's copies in `../worker`. It is a local diff — no network
+and no token — and is not part of `make dev-workflow`, which verifies the API
+alone. A prose copy of a fixture is a third copy and goes stale.
 
 The graph travels inline — a few kilobytes for CA HSR, roughly 30 KB for a large
 authored scenario — so the worker needs no database of its own. Publisher
@@ -279,7 +280,7 @@ free-form field, are defined under **Provenance tier** in
 ## Branching and releases
 
 One trunk: `main`. Branch from it, PR into it. Production runs an image promoted
-from the Actions tab — see [`docs/releases.md`](docs/releases.md). Linear
+by an `api/vX.Y.Z` tag — see [`docs/releases.md`](docs/releases.md). Linear
 records which issues landed on staging vs production from those same publishes
 and tags.
 
@@ -851,7 +852,8 @@ CI environments match. Use `make db-up DOCKER=podman` to use podman.
 
 ## Docker
 
-Build and run the API in a container:
+Build and run the API in a container, from this directory (`api/` is the
+build context):
 
 ```sh
 docker build -t sparks-effect-api .
@@ -878,16 +880,17 @@ internal/routing/            confirm-mode AMQP publisher (message types live in 
 
 ## CI
 
-GitHub Actions runs `test`, `vet`, and `lint` on every pull request and on
-pushes to `main` (the nested contract module included), diffs the golden
-fixtures against the worker as its own job (`make check-contract`), then
-builds the binary. The contract job
-needs `GH_CONTRACT_TOKEN` — a PAT that can read
-`sparks-effect-routing-worker` — because that repo is private. A push to
-`main` also builds the Docker image and publishes it to the GitHub
-Container Registry at `ghcr.io/andrewcgraves/sparks-effect-api`, tagged
-`sha-<commit>` (immutable) and `staging` (moving).
+The workflow is `.github/workflows/api.yml` at the repository root. It runs
+`test`, `vet`, and `lint` on pull requests and on pushes to `main` that change
+`api/` or the worker's golden fixtures (the nested contract module included),
+diffs the golden fixtures against the worker as its own job
+(`make check-contract`), then builds the binary. Once the
+`STAGING_DEPLOY_ENABLED` repository variable is `true`, such a push to `main`
+also builds the Docker image and publishes it to the GitHub Container Registry
+at `ghcr.io/andrewcgraves/sparks-effect-api`, tagged `sha-<commit>` (immutable)
+and `staging` (moving).
 
-Promoting from the Actions tab re-tags that same image as `prd` without
-rebuilding it, so production runs the bytes staging ran. There is no `latest`.
+Pushing an `api/vX.Y.Z` tag re-tags that same image as `prd` without rebuilding
+it, so production runs the image CI built and tested. There is no `latest`.
+See [`docs/releases.md`](docs/releases.md).
 See [`docs/releases.md`](docs/releases.md).

@@ -23,8 +23,9 @@ scenario, service, station, stop, node, edge, chainage, offset, dwell, boarding
 wait, interchange, staleness, reach, routing anchor, mode vs costing, the
 error codes and the four job statuses. Read it before naming a new type,
 endpoint, column or seam, and use its words rather than minting synonyms. The
-other three repositories keep a `CONTEXT.md` of their own for terms only they
-use, and link back here for the rest.
+worker (`../worker`), the website (`../website`) and the separate
+`kustomize-config` repository keep a `CONTEXT.md` of their own for terms only
+they use, and link back here for the rest.
 
 Declaration-level doc comments were deliberately removed from this source in
 SPA-307 because they restated their declarations. Domain meaning belongs in
@@ -35,7 +36,9 @@ godoc that only repeats a name.
 ## Branching
 
 One trunk: `main`. Branch from it, PR into it. There is no `prd` branch —
-production is promoted by pushing a `vX.Y.Z` tag on a commit that is already on
-`main`, which re-tags that commit's existing image as `:prd`. Linear staging
-and production pipelines record which issues those publishes and tags contain.
+production is promoted by pushing an `api/vX.Y.Z` tag on a commit that is
+already on `main`, which re-tags the existing image of the API at that commit
+as `:prd`. Linear staging and production pipelines record which issues those
+publishes and tags contain. The workflows are `.github/workflows/api.yml` and
+`api-release.yml` at the repository root; see `docs/releases.md`.
 See `docs/releases.md`.

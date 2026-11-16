@@ -9,6 +9,11 @@ Accepted for this repository's bootstrap. Supersession of
 complete when both consumers import a tagged `sparks-effect-contract` and
 delete their hand copies.
 
+*Note, 2026-11: the API and the worker now live in one repository, which
+supersedes the plan below for a dedicated `sparks-effect-contract` repository.
+The module stays at `api/contract/`, and `make check-contract` is a local diff
+between `api/` and `worker/` rather than a fetch.*
+
 ## Context
 
 ADR-0001 recorded a deliberate choice: the API and routing worker share no Go

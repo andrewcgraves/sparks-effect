@@ -47,8 +47,8 @@ all: build
 # real services is what gates the merge — CI runs it on the PR, and `make itest`
 # reproduces it locally.
 #
-# `check-contract` is deliberately not here: it needs the network, and this
-# target is the offline verification loop.
+# `check-contract` is deliberately not here: it reads the worker's tree, and
+# this target verifies the API alone. CI runs it as a job of its own.
 dev-workflow: test vet lint build
 
 deps:
@@ -220,49 +220,34 @@ tidy:
 	go mod tidy -C contract
 
 # check-contract diffs this copy of the two golden fixtures against the
-# worker's copies on main. The two repositories share no Go code by design;
-# these files are the contract. A human remembering to copy a file
-# across repositories is not an invariant.
+# worker's copies in ../worker. The two services share no Go code by design;
+# these files are the contract. A human remembering to copy a file from one
+# tree to the other is not an invariant.
 #
-# Fetching unpinned `main` is deliberate: what has to hold is agreement
-# with what the other side publishes *now*. A green PR can go red on
-# rerun with no local change.
+# It is a diff between two directories of the same checkout: no network, no
+# token, and whatever branch is checked out is what gets compared, so a
+# change to the contract lands on both sides in one pull request.
 #
-# Not part of `dev-workflow`: it needs the network.
+# Both diffs always run, so drift in the message does not hide drift in the
+# worker-store envelope.
 #
-# The worker repo is private, so raw.githubusercontent.com 404s without
-# credentials. When GH_TOKEN (or GITHUB_TOKEN) can read that repo, it is
-# sent as a Bearer token; CI supplies secrets.GH_CONTRACT_TOKEN. Override
-# WORKER_GOLDEN_URL / WORKER_STORE_GOLDEN_URL to point at a local file://
-# copy when testing the diff itself.
-#
-# Keep the fixtures at these internal/ paths (as well as in contract/) until
-# the worker consumes a tagged module — its check-contract still curls them.
-WORKER_REPO := andrewcgraves/sparks-effect-routing-worker
-WORKER_GOLDEN_URL ?= https://api.github.com/repos/$(WORKER_REPO)/contents/internal/routing/testdata/message.golden.json?ref=main
-WORKER_STORE_GOLDEN_URL ?= https://api.github.com/repos/$(WORKER_REPO)/contents/internal/store/testdata/worker-store.golden.json?ref=main
+# Keep the fixtures at these internal/ paths as well as in contract/ — the
+# worker's check-contract reads them from here.
+WORKER_DIR ?= ../worker
+WORKER_GOLDEN ?= $(WORKER_DIR)/internal/routing/testdata/message.golden.json
+WORKER_STORE_GOLDEN ?= $(WORKER_DIR)/internal/store/testdata/worker-store.golden.json
 
 check-contract:
-	@curl -fsSL \
-		$(if $(or $(GH_TOKEN),$(GITHUB_TOKEN)),-H "Authorization: Bearer $(or $(GH_TOKEN),$(GITHUB_TOKEN))") \
-		-H "Accept: application/vnd.github.raw" \
-		-H "X-GitHub-Api-Version: 2022-11-28" \
-		-o /tmp/worker-message.golden.json \
-		"$(WORKER_GOLDEN_URL)" \
-		|| { echo "failed to fetch the worker's queue-message fixture from $(WORKER_GOLDEN_URL)" >&2; \
-		     echo "if that repo is private, set GH_TOKEN to a token that can read it" >&2; \
-		     exit 1; }
-	diff -u /tmp/worker-message.golden.json internal/routing/testdata/message.golden.json
-	@curl -fsSL \
-		$(if $(or $(GH_TOKEN),$(GITHUB_TOKEN)),-H "Authorization: Bearer $(or $(GH_TOKEN),$(GITHUB_TOKEN))") \
-		-H "Accept: application/vnd.github.raw" \
-		-H "X-GitHub-Api-Version: 2022-11-28" \
-		-o /tmp/worker-store.golden.json \
-		"$(WORKER_STORE_GOLDEN_URL)" \
-		|| { echo "failed to fetch the worker's worker-store fixture from $(WORKER_STORE_GOLDEN_URL)" >&2; \
-		     echo "if that repo is private, set GH_TOKEN to a token that can read it" >&2; \
-		     exit 1; }
-	diff -u /tmp/worker-store.golden.json internal/handler/testdata/worker-store.golden.json
+	@failed=0; \
+	diff -u "$(WORKER_GOLDEN)" internal/routing/testdata/message.golden.json || failed=1; \
+	diff -u "$(WORKER_STORE_GOLDEN)" internal/handler/testdata/worker-store.golden.json || failed=1; \
+	if [ $$failed -ne 0 ]; then \
+		echo >&2; \
+		echo "the API↔worker contract has drifted: '-' is the worker's copy, '+' is the API's." >&2; \
+		echo "make the two fixtures identical and make the wire types on both sides agree with them." >&2; \
+		exit 1; \
+	fi; \
+	echo "golden fixtures match $(WORKER_DIR)"
 
 clean:
 	rm -rf $(BUILD_DIR)
