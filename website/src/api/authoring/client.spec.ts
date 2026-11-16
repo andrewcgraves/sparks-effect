@@ -1,0 +1,476 @@
+// @vitest-environment node
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  ApiError,
+  STOP_PLACEMENT_ERROR_CODE,
+  apiBase,
+  apiRequest,
+  isSessionExpiry,
+  setAuthTokenProvider,
+  setUnauthorizedHandler,
+  stopPlacementFault,
+} from './client'
+import { configureErrorSink, type ErrorReport } from '../../errorReporting'
+
+describe('apiBase', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('defaults to localhost:8080', () => {
+    expect(apiBase()).toBe('http://localhost:8080')
+  })
+
+  it('uses VITE_API_BASE_URL when set', () => {
+    vi.stubEnv('VITE_API_BASE_URL', 'http://custom-api:9000')
+    expect(apiBase()).toBe('http://custom-api:9000')
+  })
+})
+
+describe('apiRequest', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn())
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+  })
+
+  it('prefixes the base URL to the path', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) } as Response)
+    await apiRequest('/api/things')
+    const url = vi.mocked(fetch).mock.calls[0][0] as string
+    expect(url).toBe('http://localhost:8080/api/things')
+  })
+
+  it('does not set Content-Type when there is no body', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) } as Response)
+    await apiRequest('/api/things')
+    const init = vi.mocked(fetch).mock.calls[0][1] as RequestInit
+    const headers = new Headers(init.headers)
+    expect(headers.has('Content-Type')).toBe(false)
+  })
+
+  it('sets Content-Type when there is a body', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) } as Response)
+    await apiRequest('/api/things', { method: 'POST', body: JSON.stringify({ a: 1 }) })
+    const init = vi.mocked(fetch).mock.calls[0][1] as RequestInit
+    const headers = new Headers(init.headers)
+    expect(headers.get('Content-Type')).toBe('application/json')
+  })
+
+  it('does not clobber a caller-provided Content-Type', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) } as Response)
+    await apiRequest('/api/things', {
+      method: 'POST',
+      body: 'raw',
+      headers: { 'Content-Type': 'text/plain' },
+    })
+    const init = vi.mocked(fetch).mock.calls[0][1] as RequestInit
+    const headers = new Headers(init.headers)
+    expect(headers.get('Content-Type')).toBe('text/plain')
+  })
+
+  it('parses JSON on a 200 response', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ ok: 1 }) } as Response)
+    const result = await apiRequest<{ ok: number }>('/api/things')
+    expect(result).toEqual({ ok: 1 })
+  })
+
+  it('returns undefined on a 204 response', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+    const result = await apiRequest('/api/things', { method: 'DELETE' })
+    expect(result).toBeUndefined()
+  })
+
+  it('throws with method, path, and status on a non-ok response', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      json: async () => ({ error: 'not found' }),
+    } as Response)
+    await expect(apiRequest('/api/things/x', { method: 'GET' })).rejects.toThrow(
+      /GET \/api\/things\/x failed: 404: not found/,
+    )
+  })
+
+  it('throws an ApiError carrying the response status', async () => {
+    vi.mocked(fetch).mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: async () => ({ error: 'not found' }),
+    } as Response)
+    await expect(apiRequest('/api/things/x')).rejects.toBeInstanceOf(ApiError)
+
+    let caught: unknown
+    try {
+      await apiRequest('/api/things/x')
+    } catch (err) {
+      caught = err
+    }
+    expect((caught as ApiError).status).toBe(404)
+  })
+
+  it('carries a machine-readable code from the error body, when present', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({ error: 'compiled graph is stale; recompile and retry', code: 'stale_graph' }),
+    } as Response)
+
+    let caught: unknown
+    try {
+      await apiRequest('/api/things/x')
+    } catch (err) {
+      caught = err
+    }
+    expect((caught as ApiError).code).toBe('stale_graph')
+  })
+
+  it('leaves code undefined when the error body has none', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      json: async () => ({ error: 'not found' }),
+    } as Response)
+
+    let caught: unknown
+    try {
+      await apiRequest('/api/things/x')
+    } catch (err) {
+      caught = err
+    }
+    expect((caught as ApiError).code).toBeUndefined()
+  })
+
+  it('carries the structured detail from the error body, when present', async () => {
+    const detail = { fault: 'off_route', route_slug: 'main-line', threshold_m: 500, stops: [] }
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 422,
+      json: async () => ({ error: 'stop "B" is 620 m from route "main-line"', code: 'stop_placement', detail }),
+    } as Response)
+
+    let caught: unknown
+    try {
+      await apiRequest('/api/services')
+    } catch (err) {
+      caught = err
+    }
+    expect((caught as ApiError).detail).toEqual(detail)
+  })
+
+  it('leaves detail undefined when the error body has none', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      json: async () => ({ error: 'not found' }),
+    } as Response)
+
+    let caught: unknown
+    try {
+      await apiRequest('/api/things/x')
+    } catch (err) {
+      caught = err
+    }
+    expect((caught as ApiError).detail).toBeUndefined()
+  })
+
+  it('still throws when the error body is not JSON', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: async () => {
+        throw new Error('invalid json')
+      },
+    } as unknown as Response)
+    await expect(apiRequest('/api/things')).rejects.toThrow(/GET \/api\/things failed: 500/)
+  })
+
+  it('carries a Retry-After in seconds on the error', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 429,
+      headers: new Headers({ 'Retry-After': '30' }),
+      json: async () => ({ error: 'slow down', code: 'rate_limited' }),
+    } as unknown as Response)
+    const caught = await apiRequest('/api/things').catch((err: unknown) => err)
+    expect((caught as ApiError).retryAfterS).toBe(30)
+  })
+
+  it('leaves out a Retry-After it cannot read', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 429,
+      headers: new Headers({ 'Retry-After': 'Wed, 21 Oct 2026 07:28:00 GMT' }),
+      json: async () => ({}),
+    } as unknown as Response)
+    const caught = await apiRequest('/api/things').catch((err: unknown) => err)
+    expect((caught as ApiError).retryAfterS).toBeUndefined()
+  })
+
+  it('sends a X-Trace-Id header', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) } as Response)
+    await apiRequest('/api/things')
+    const init = vi.mocked(fetch).mock.calls[0][1] as RequestInit
+    const headers = new Headers(init.headers)
+    expect(headers.get('X-Trace-Id')).toMatch(/^[0-9a-f-]{36}$/)
+  })
+
+  // One-shot requests still get a unique id each. A job that wants to reuse
+  // one id across enqueue+poll supplies it explicitly (the test below).
+  it('sends a different X-Trace-Id on each request', async () => {
+    vi.mocked(fetch).mockResolvedValue({ ok: true, status: 200, json: async () => ({}) } as Response)
+    await apiRequest('/api/things')
+    await apiRequest('/api/things')
+    const firstHeaders = new Headers(vi.mocked(fetch).mock.calls[0][1]?.headers)
+    const secondHeaders = new Headers(vi.mocked(fetch).mock.calls[1][1]?.headers)
+    expect(firstHeaders.get('X-Trace-Id')).not.toBe(secondHeaders.get('X-Trace-Id'))
+  })
+
+  it('lets an explicit caller X-Trace-Id header win', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) } as Response)
+    await apiRequest('/api/things', { headers: { 'X-Trace-Id': 'caller-trace-id' } })
+    const init = vi.mocked(fetch).mock.calls[0][1] as RequestInit
+    const headers = new Headers(init.headers)
+    expect(headers.get('X-Trace-Id')).toBe('caller-trace-id')
+  })
+})
+
+describe('auth token injection', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn())
+  })
+
+  afterEach(() => {
+    setAuthTokenProvider(null)
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+  })
+
+  function headersOf(): Headers {
+    return vi.mocked(fetch).mock.calls[0][1]?.headers as Headers
+  }
+
+  it('sends no Authorization header when no provider is registered', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+    await apiRequest('/api/services')
+    expect(headersOf().has('Authorization')).toBe(false)
+  })
+
+  it('sends a bearer token supplied by the registered provider', async () => {
+    setAuthTokenProvider(() => 'tok-1')
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+    await apiRequest('/api/services')
+    expect(headersOf().get('Authorization')).toBe('Bearer tok-1')
+  })
+
+  it('omits the header while the provider reports a signed-out user', async () => {
+    setAuthTokenProvider(() => null)
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+    await apiRequest('/api/services')
+    expect(headersOf().has('Authorization')).toBe(false)
+  })
+
+  it('lets an explicit caller Authorization header win', async () => {
+    setAuthTokenProvider(() => 'tok-1')
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: true, status: 204 } as Response)
+    await apiRequest('/api/services', { headers: { Authorization: 'Bearer caller' } })
+    expect(headersOf().get('Authorization')).toBe('Bearer caller')
+  })
+})
+
+describe('unauthorized handler', () => {
+  const unauthorized = { ok: false, status: 401, json: async () => ({ error: 'unauthorized' }) } as Response
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn())
+  })
+
+  afterEach(() => {
+    setAuthTokenProvider(null)
+    setUnauthorizedHandler(null)
+    vi.restoreAllMocks()
+  })
+
+  it('reports a 401 on a request sent with the session token, naming that token', async () => {
+    const onUnauthorized = vi.fn()
+    setAuthTokenProvider(() => 'tok-1')
+    setUnauthorizedHandler(onUnauthorized)
+    vi.mocked(fetch).mockResolvedValueOnce(unauthorized)
+
+    await expect(apiRequest('/api/services')).rejects.toBeInstanceOf(ApiError)
+    expect(onUnauthorized).toHaveBeenCalledExactlyOnceWith('tok-1')
+  })
+
+  it('stays quiet on a 401 from a request sent without a session', async () => {
+    const onUnauthorized = vi.fn()
+    setAuthTokenProvider(() => null)
+    setUnauthorizedHandler(onUnauthorized)
+    vi.mocked(fetch).mockResolvedValueOnce(unauthorized)
+
+    await expect(apiRequest('/api/auth/login', { method: 'POST', body: '{}' })).rejects.toMatchObject({ status: 401 })
+    expect(onUnauthorized).not.toHaveBeenCalled()
+  })
+
+  it('stays quiet when the caller supplied its own Authorization header', async () => {
+    const onUnauthorized = vi.fn()
+    setAuthTokenProvider(() => 'tok-1')
+    setUnauthorizedHandler(onUnauthorized)
+    vi.mocked(fetch).mockResolvedValueOnce(unauthorized)
+
+    await expect(apiRequest('/api/services', { headers: { Authorization: 'Bearer caller' } })).rejects.toMatchObject({
+      status: 401,
+    })
+    expect(onUnauthorized).not.toHaveBeenCalled()
+  })
+
+  it('stays quiet on any other failure from an authenticated request', async () => {
+    const onUnauthorized = vi.fn()
+    setAuthTokenProvider(() => 'tok-1')
+    setUnauthorizedHandler(onUnauthorized)
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 403, json: async () => ({}) } as Response)
+
+    await expect(apiRequest('/api/services')).rejects.toMatchObject({ status: 403 })
+    expect(onUnauthorized).not.toHaveBeenCalled()
+  })
+
+  it('marks the rejection as a session expiry so views can stay quiet about it', async () => {
+    setAuthTokenProvider(() => 'tok-1')
+    vi.mocked(fetch).mockResolvedValueOnce(unauthorized)
+
+    const err = await apiRequest('/api/services').catch((e: unknown) => e)
+    expect(isSessionExpiry(err)).toBe(true)
+  })
+
+  it('does not mark a 401 sent without a session as a session expiry', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(unauthorized)
+
+    const err = await apiRequest('/api/auth/login', { method: 'POST', body: '{}' }).catch((e: unknown) => e)
+    expect(isSessionExpiry(err)).toBe(false)
+  })
+})
+
+describe('stopPlacementFault', () => {
+  const offRouteStop = { seq: 1, name: 'B', slug: 'b', chainage_m: 12000, offset_m: 620 }
+
+  function rejection(detail: unknown, code = STOP_PLACEMENT_ERROR_CODE): ApiError {
+    return new ApiError('POST /api/services failed: 422: rejected', 422, code, detail)
+  }
+
+  it('reads an off-route fault out of the rejection', () => {
+    const fault = stopPlacementFault(
+      rejection({ fault: 'off_route', route_slug: 'main-line', threshold_m: 500, stops: [offRouteStop] }),
+    )
+    expect(fault).toEqual({
+      fault: 'off_route',
+      route_slug: 'main-line',
+      threshold_m: 500,
+      stops: [offRouteStop],
+    })
+  })
+
+  it('reads an order fault naming the adjacent pair', () => {
+    const stops = [offRouteStop, { seq: 2, name: 'C', slug: 'c', chainage_m: 8000, offset_m: 10 }]
+    const fault = stopPlacementFault(rejection({ fault: 'chainage_order', route_slug: 'main-line', stops }))
+    expect(fault?.fault).toBe('chainage_order')
+    expect(fault?.stops.map((s) => s.seq)).toEqual([1, 2])
+  })
+
+  // threshold_m is omitted on an order fault rather than sent as a meaningless
+  // zero, so its absence must not be read as a malformed body.
+  it('accepts an order fault with no threshold', () => {
+    const fault = stopPlacementFault(rejection({ fault: 'chainage_order', route_slug: 'main-line', stops: [] }))
+    expect(fault?.threshold_m).toBeUndefined()
+  })
+
+  // Only fault and stops decide whether the rows can be flagged, so a fault is
+  // still usable without the fields that merely describe it.
+  it('still reads a fault whose descriptive fields are missing', () => {
+    const fault = stopPlacementFault(rejection({ fault: 'off_route', stops: [offRouteStop] }))
+    expect(fault?.stops.map((s) => s.seq)).toEqual([1])
+    expect(fault?.route_slug).toBeUndefined()
+  })
+
+  it('ignores a rejection carrying a different code', () => {
+    const detail = { fault: 'off_route', route_slug: 'main-line', stops: [offRouteStop] }
+    expect(stopPlacementFault(rejection(detail, 'stale_graph'))).toBeNull()
+  })
+
+  it('ignores a rejection carrying no code at all', () => {
+    expect(stopPlacementFault(new ApiError('failed: 422', 422))).toBeNull()
+  })
+
+  // A kind this build does not know is the server having grown a rule we cannot
+  // attribute to a row, so it degrades to the banner rather than guessing.
+  it('ignores an unrecognized fault kind', () => {
+    expect(
+      stopPlacementFault(rejection({ fault: 'nonsense', route_slug: 'main-line', stops: [offRouteStop] })),
+    ).toBeNull()
+  })
+
+  it('ignores a detail whose stops are malformed', () => {
+    expect(
+      stopPlacementFault(rejection({ fault: 'off_route', route_slug: 'main-line', stops: [{ name: 'B' }] })),
+    ).toBeNull()
+  })
+
+  it('ignores a detail that is not an object', () => {
+    expect(stopPlacementFault(rejection('off_route'))).toBeNull()
+    expect(stopPlacementFault(rejection(null))).toBeNull()
+  })
+
+  it('ignores anything that is not an ApiError', () => {
+    expect(stopPlacementFault(new Error('boom'))).toBeNull()
+    expect(stopPlacementFault(undefined)).toBeNull()
+  })
+})
+
+describe('apiRequest error reporting', () => {
+  const reports: ErrorReport[] = []
+
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn())
+    reports.length = 0
+    configureErrorSink((report) => reports.push(report))
+  })
+
+  afterEach(() => {
+    configureErrorSink(() => {})
+    vi.restoreAllMocks()
+  })
+
+  function sentTraceId(): string | null {
+    const init = vi.mocked(fetch).mock.calls[0][1] as RequestInit
+    return new Headers(init.headers).get('X-Trace-Id')
+  }
+
+  it('reports a 5xx with the trace id it was sent under, so it links to the API logs', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: async () => ({ error: 'internal error' }),
+    } as Response)
+
+    await expect(apiRequest('/api/me/scenarios')).rejects.toBeInstanceOf(ApiError)
+
+    expect(reports).toHaveLength(1)
+    expect(reports[0].error).toBeInstanceOf(ApiError)
+    expect(reports[0].context).toEqual({
+      trace_id: sentTraceId(),
+      status: '500',
+      method: 'GET',
+      path: '/api/me/scenarios',
+    })
+  })
+
+  it('does not report a 4xx: the API answered as designed', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 422, json: async () => ({}) } as Response)
+
+    await expect(apiRequest('/api/me/scenarios', { method: 'POST', body: '{}' })).rejects.toBeInstanceOf(ApiError)
+
+    expect(reports).toHaveLength(0)
+  })
+})

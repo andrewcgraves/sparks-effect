@@ -1,0 +1,375 @@
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import { nextTick } from 'vue'
+import { mount, flushPromises } from '@vue/test-utils'
+import AddressAutocomplete from './AddressAutocomplete.vue'
+import * as geocoding from '../api/geocoding'
+import { GeocoderUnavailableError, type AddressMatch, type GeocodingSuggestion } from '../api/geocoding'
+
+const UNAVAILABLE = 'Address search is unavailable. Click the map to choose a point.'
+
+const portlandMatch: AddressMatch = { label: 'Portland, OR, USA', gid: 'whosonfirst:locality:101715829' }
+const chicagoMatch: AddressMatch = { label: 'Chicago, IL, USA', gid: 'whosonfirst:locality:85940195' }
+
+const portlandSuggestion: GeocodingSuggestion = {
+  label: 'Portland, OR, USA',
+  lat: 45.5231,
+  lng: -122.6784,
+}
+
+const chicagoSuggestion: GeocodingSuggestion = {
+  label: 'Chicago, IL, USA',
+  lat: 41.8781,
+  lng: -87.6298,
+}
+
+describe('AddressAutocomplete', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    vi.spyOn(geocoding, 'fetchSuggestions').mockResolvedValue([])
+    vi.spyOn(geocoding, 'lookupPlace').mockResolvedValue(portlandSuggestion)
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('renders a text input', () => {
+    const wrapper = mount(AddressAutocomplete)
+    expect(wrapper.find('input[type="text"]').exists()).toBe(true)
+  })
+
+  it('labels the field "Starting point"', () => {
+    const wrapper = mount(AddressAutocomplete)
+    expect(wrapper.find('label').text()).toContain('Starting point')
+  })
+
+  it('shows no suggestions list initially', () => {
+    const wrapper = mount(AddressAutocomplete)
+    expect(wrapper.find('[data-testid="suggestions"]').exists()).toBe(false)
+  })
+
+  it('calls fetchSuggestions when the user types', async () => {
+    const wrapper = mount(AddressAutocomplete)
+
+    await wrapper.find('input').setValue('Portland')
+    await vi.advanceTimersByTimeAsync(350)
+
+    expect(geocoding.fetchSuggestions).toHaveBeenCalledWith('Portland', expect.any(AbortSignal))
+  })
+
+  it('debounces input: rapid typing only triggers one fetch', async () => {
+    const wrapper = mount(AddressAutocomplete)
+    const input = wrapper.find('input')
+
+    await input.setValue('P')
+    await input.setValue('Po')
+    await input.setValue('Por')
+
+    expect(geocoding.fetchSuggestions).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(350)
+
+    expect(geocoding.fetchSuggestions).toHaveBeenCalledTimes(1)
+    expect(geocoding.fetchSuggestions).toHaveBeenCalledWith('Por', expect.any(AbortSignal))
+  })
+
+  it('shows loading indicator while fetching', async () => {
+    vi.spyOn(geocoding, 'fetchSuggestions').mockReturnValue(new Promise(() => {}))
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('Portland')
+    vi.advanceTimersByTime(350)
+    await nextTick()
+
+    expect(wrapper.find('[data-testid="suggestions-loading"]').exists()).toBe(true)
+  })
+
+  it('displays suggestions returned by the API', async () => {
+    vi.spyOn(geocoding, 'fetchSuggestions').mockResolvedValue([portlandMatch, chicagoMatch])
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('Port')
+    await vi.advanceTimersByTimeAsync(350)
+
+    const list = wrapper.find('[data-testid="suggestions"]')
+    expect(list.exists()).toBe(true)
+    const items = list.findAll('li')
+    expect(items).toHaveLength(2)
+    expect(items[0].text()).toBe('Portland, OR, USA')
+    expect(items[1].text()).toBe('Chicago, IL, USA')
+  })
+
+  it('emits "select" with the looked-up lat/lng when user clicks a suggestion', async () => {
+    vi.spyOn(geocoding, 'fetchSuggestions').mockResolvedValue([portlandMatch])
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('Port')
+    await vi.advanceTimersByTimeAsync(350)
+
+    await wrapper.find('[data-testid="suggestions"] li').trigger('click')
+    await flushPromises()
+
+    expect(geocoding.lookupPlace).toHaveBeenCalledWith(portlandMatch, expect.any(AbortSignal))
+    expect(wrapper.emitted('select')).toHaveLength(1)
+    expect(wrapper.emitted('select')![0][0]).toEqual({
+      label: 'Portland, OR, USA',
+      lat: 45.5231,
+      lng: -122.6784,
+    })
+  })
+
+  it('hides the suggestions list after a selection', async () => {
+    vi.spyOn(geocoding, 'fetchSuggestions').mockResolvedValue([portlandMatch])
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('Port')
+    await vi.advanceTimersByTimeAsync(350)
+
+    await wrapper.find('[data-testid="suggestions"] li').trigger('click')
+
+    expect(wrapper.find('[data-testid="suggestions"]').exists()).toBe(false)
+  })
+
+  it('sets the input value to the selected suggestion label after selection', async () => {
+    vi.spyOn(geocoding, 'fetchSuggestions').mockResolvedValue([portlandMatch])
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('Port')
+    await vi.advanceTimersByTimeAsync(350)
+
+    await wrapper.find('[data-testid="suggestions"] li').trigger('click')
+
+    expect((wrapper.find('input').element as HTMLInputElement).value).toBe('Portland, OR, USA')
+  })
+
+  it('does NOT emit "select" when the user types without choosing a suggestion', async () => {
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('some free text address')
+    await vi.advanceTimersByTimeAsync(350)
+
+    expect(wrapper.emitted('select')).toBeUndefined()
+  })
+
+  it('clears previous selection when user edits the input after a selection', async () => {
+    vi.spyOn(geocoding, 'fetchSuggestions')
+      .mockResolvedValueOnce([portlandMatch])
+      .mockResolvedValue([])
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('Port')
+    await vi.advanceTimersByTimeAsync(350)
+    await wrapper.find('[data-testid="suggestions"] li').trigger('click')
+
+    await wrapper.find('input').setValue('Port modified')
+    await vi.advanceTimersByTimeAsync(350)
+
+    expect(wrapper.emitted('select')).toHaveLength(1)
+  })
+
+  it('does not show suggestions when the API returns an empty list', async () => {
+    vi.spyOn(geocoding, 'fetchSuggestions').mockResolvedValue([])
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('xyzzy')
+    await vi.advanceTimersByTimeAsync(350)
+
+    expect(wrapper.find('[data-testid="suggestions"]').exists()).toBe(false)
+  })
+
+  it('shows empty state in foldout when lookup returns no results', async () => {
+    vi.spyOn(geocoding, 'fetchSuggestions').mockResolvedValue([])
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('xyzzy')
+    await wrapper.find('input').trigger('keydown', { key: 'Enter' })
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="suggestions-empty"]').exists()).toBe(true)
+  })
+
+  it('shows results when Enter is pressed without a prior selection', async () => {
+    vi.spyOn(geocoding, 'fetchSuggestions').mockResolvedValue([portlandMatch])
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('Portland')
+    await wrapper.find('input').trigger('keydown', { key: 'Enter' })
+    await flushPromises()
+
+    expect(geocoding.fetchSuggestions).toHaveBeenCalledWith('Portland', expect.any(AbortSignal))
+    expect(wrapper.find('[data-testid="suggestions"]').exists()).toBe(true)
+  })
+
+  it('does not fetch on Enter when the input is empty', async () => {
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').trigger('keydown', { key: 'Enter' })
+    await flushPromises()
+
+    expect(geocoding.fetchSuggestions).not.toHaveBeenCalled()
+  })
+
+  it('does not search until at least three characters are typed', async () => {
+    const wrapper = mount(AddressAutocomplete)
+
+    await wrapper.find('input').setValue('Po')
+    await vi.advanceTimersByTimeAsync(350)
+    await wrapper.find('input').trigger('keydown', { key: 'Enter' })
+    await flushPromises()
+
+    expect(geocoding.fetchSuggestions).not.toHaveBeenCalled()
+    expect(wrapper.find('[data-testid="suggestions"]').exists()).toBe(false)
+  })
+
+  it('says search is unavailable, not "No results found", when the provider fails', async () => {
+    vi.spyOn(geocoding, 'fetchSuggestions').mockRejectedValue(new GeocoderUnavailableError(429))
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('Diridon')
+    await vi.advanceTimersByTimeAsync(350)
+
+    expect(wrapper.find('[data-testid="suggestions-unavailable"]').text()).toBe(UNAVAILABLE)
+    expect(wrapper.find('[data-testid="suggestions-empty"]').exists()).toBe(false)
+  })
+
+  it('clears the unavailable message once a later search succeeds', async () => {
+    vi.spyOn(geocoding, 'fetchSuggestions')
+      .mockRejectedValueOnce(new GeocoderUnavailableError(500))
+      .mockResolvedValue([portlandMatch])
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('Portl')
+    await vi.advanceTimersByTimeAsync(350)
+    await wrapper.find('input').setValue('Portla')
+    await vi.advanceTimersByTimeAsync(350)
+
+    expect(wrapper.find('[data-testid="suggestions-unavailable"]').exists()).toBe(false)
+    expect(wrapper.findAll('[data-testid="suggestions"] li')).toHaveLength(1)
+  })
+
+  it('says search is unavailable and emits nothing when looking up the picked match fails', async () => {
+    vi.spyOn(geocoding, 'fetchSuggestions').mockResolvedValue([portlandMatch])
+    vi.spyOn(geocoding, 'lookupPlace').mockRejectedValue(new GeocoderUnavailableError(429))
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('Port')
+    await vi.advanceTimersByTimeAsync(350)
+    await wrapper.find('[data-testid="suggestions"] li').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.emitted('select')).toBeUndefined()
+    expect(wrapper.find('[data-testid="suggestions-unavailable"]').text()).toBe(UNAVAILABLE)
+  })
+
+  it('cancels the in-flight search when the user keeps typing, and ignores its late answer', async () => {
+    const signals: AbortSignal[] = []
+    let answerFirst: (matches: AddressMatch[]) => void = () => {}
+    vi.spyOn(geocoding, 'fetchSuggestions')
+      .mockImplementationOnce((_query, signal) => {
+        signals.push(signal!)
+        return new Promise((resolve) => (answerFirst = resolve))
+      })
+      .mockImplementationOnce(async (_query, signal) => {
+        signals.push(signal!)
+        return [chicagoMatch]
+      })
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('Chic')
+    await vi.advanceTimersByTimeAsync(350)
+    await wrapper.find('input').setValue('Chica')
+    await vi.advanceTimersByTimeAsync(350)
+    answerFirst([portlandMatch])
+    await flushPromises()
+
+    expect(signals[0].aborted).toBe(true)
+    expect(signals[1].aborted).toBe(false)
+    const items = wrapper.findAll('[data-testid="suggestions"] li')
+    expect(items.map((item) => item.text())).toEqual(['Chicago, IL, USA'])
+  })
+
+  it('cancels the in-flight search on the next keystroke, before its debounce elapses', async () => {
+    let firstSignal: AbortSignal | undefined
+    vi.spyOn(geocoding, 'fetchSuggestions').mockImplementationOnce((_query, signal) => {
+      firstSignal = signal
+      return new Promise(() => {})
+    })
+
+    const wrapper = mount(AddressAutocomplete)
+    await wrapper.find('input').setValue('Chic')
+    await vi.advanceTimersByTimeAsync(350)
+    await wrapper.find('input').setValue('Chica')
+
+    expect(firstSignal?.aborted).toBe(true)
+  })
+
+  describe('as a combobox a keyboard can drive', () => {
+    async function withSuggestions() {
+      vi.mocked(geocoding.fetchSuggestions).mockResolvedValue([portlandMatch, chicagoMatch])
+      const wrapper = mount(AddressAutocomplete)
+      await wrapper.find('input').setValue('Port')
+      await vi.advanceTimersByTimeAsync(350)
+      await flushPromises()
+      return wrapper
+    }
+
+    it('is a combobox that owns the suggestion listbox', async () => {
+      const wrapper = await withSuggestions()
+      const input = wrapper.get('input')
+      expect(input.attributes('role')).toBe('combobox')
+      expect(input.attributes('aria-expanded')).toBe('true')
+      expect(wrapper.get(`#${input.attributes('aria-controls')}`).attributes('role')).toBe('listbox')
+    })
+
+    it('moves the highlighted option with the arrow keys, wrapping at either end', async () => {
+      const wrapper = await withSuggestions()
+      const input = wrapper.get('input')
+      const options = () => wrapper.findAll('[role="option"]')
+      expect(input.attributes('aria-activedescendant')).toBeUndefined()
+
+      await input.trigger('keydown', { key: 'ArrowDown' })
+      expect(input.attributes('aria-activedescendant')).toBe(options()[0].attributes('id'))
+      expect(options()[0].attributes('aria-selected')).toBe('true')
+
+      await input.trigger('keydown', { key: 'ArrowDown' })
+      await input.trigger('keydown', { key: 'ArrowDown' })
+      expect(input.attributes('aria-activedescendant')).toBe(options()[0].attributes('id'))
+
+      await input.trigger('keydown', { key: 'ArrowUp' })
+      expect(input.attributes('aria-activedescendant')).toBe(options()[1].attributes('id'))
+      expect(options()[0].attributes('aria-selected')).toBe('false')
+    })
+
+    it('chooses the highlighted option on Enter', async () => {
+      vi.mocked(geocoding.lookupPlace).mockResolvedValue(chicagoSuggestion)
+      const wrapper = await withSuggestions()
+      const input = wrapper.get('input')
+      await input.trigger('keydown', { key: 'ArrowDown' })
+      await input.trigger('keydown', { key: 'ArrowDown' })
+      await input.trigger('keydown', { key: 'Enter' })
+      await flushPromises()
+
+      expect(geocoding.lookupPlace).toHaveBeenCalledWith(chicagoMatch, expect.any(AbortSignal))
+      expect(wrapper.emitted('select')).toEqual([[chicagoSuggestion]])
+      expect(wrapper.find('[data-testid="suggestions"]').exists()).toBe(false)
+      expect(input.attributes('aria-expanded')).toBe('false')
+    })
+
+    it('searches on Enter when nothing is highlighted, as before', async () => {
+      const wrapper = await withSuggestions()
+      vi.mocked(geocoding.fetchSuggestions).mockClear()
+      await wrapper.get('input').trigger('keydown', { key: 'Enter' })
+      expect(geocoding.fetchSuggestions).toHaveBeenCalledWith('Port', expect.any(AbortSignal))
+      expect(wrapper.emitted('select')).toBeUndefined()
+    })
+
+    it('closes the suggestions on Escape and keeps what was typed', async () => {
+      const wrapper = await withSuggestions()
+      const input = wrapper.get('input')
+      await input.trigger('keydown', { key: 'ArrowDown' })
+      await input.trigger('keydown', { key: 'Escape' })
+      expect(wrapper.find('[data-testid="suggestions"]').exists()).toBe(false)
+      expect(input.attributes('aria-activedescendant')).toBeUndefined()
+      expect((input.element as HTMLInputElement).value).toBe('Port')
+    })
+  })
+})

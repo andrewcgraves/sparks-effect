@@ -1,0 +1,57 @@
+import { ref, shallowRef } from 'vue'
+import { useJobsStore } from '../stores/jobs'
+import { latestAttempt } from './latestAttempt'
+import { newTraceId, traceHeaders } from '../api/traceId'
+import type { Job, TransitGraph } from '../api/authoring'
+import { authoringFault, type AuthoringNoun } from '../api/authoringFault'
+import { useAnnouncer } from './useToast'
+import { compiledMessage, compilingMessage } from './progressAnnouncements'
+
+export function useCompileJob(
+  compile: (slug: string, init?: RequestInit) => Promise<Job>,
+  noun: AuthoringNoun = 'service',
+) {
+  const jobs = useJobsStore()
+  const compiling = ref(false)
+  const compileError = ref('')
+  // Shallow: a compiled graph carries every route's geometry and is replaced
+  // whole, never edited (SPA-487).
+  const result = shallowRef<TransitGraph | null>(null)
+  const { announce } = useAnnouncer()
+
+  // A compile superseded mid-flight must not resurrect itself when it lands —
+  // or, worse, report its failure over the newer attempt's result.
+  const attempts = latestAttempt()
+
+  async function trigger(slug: string): Promise<void> {
+    const attempt = attempts.begin()
+    compiling.value = true
+    compileError.value = ''
+    announce(compilingMessage(noun))
+    try {
+      // One id for the compile POST and every poll of that job (SPA-205).
+      const traceId = newTraceId()
+      const job = await compile(slug, { headers: traceHeaders(traceId) })
+      const finished = await jobs.track(job.id, { traceId })
+      if (!attempts.isCurrent(attempt)) return
+      result.value = finished.result ?? null
+      announce(compiledMessage(noun))
+    } catch (err) {
+      if (!attempts.isCurrent(attempt)) return
+      compileError.value = authoringFault(err, noun)
+    } finally {
+      // Left alone when superseded: the attempt that replaced this one set it,
+      // and owns clearing it.
+      if (attempts.isCurrent(attempt)) compiling.value = false
+    }
+  }
+
+  function reset(): void {
+    attempts.supersede()
+    compiling.value = false
+    compileError.value = ''
+    result.value = null
+  }
+
+  return { compiling, compileError, result, trigger, reset }
+}

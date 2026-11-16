@@ -1,0 +1,181 @@
+import type { Map, GeoJSONSource } from 'maplibre-gl'
+import type { MapModule } from './mapLifecycle'
+import { readThemeToken } from '../themeTokens'
+import type { SnapCoord as LatLng } from '../api/authoring/types'
+import { addLayerInStack } from './layerStack'
+
+export const RAW_STOP_SOURCE_ID = 'stop-preview-raw-source'
+export const RAW_STOP_LAYER_ID = 'stop-preview-raw'
+export const SNAPPED_STOP_SOURCE_ID = 'stop-preview-snapped-source'
+export const SNAPPED_STOP_LAYER_ID = 'stop-preview-snapped'
+export const LEADER_SOURCE_ID = 'stop-preview-leader-source'
+export const LEADER_LAYER_ID = 'stop-preview-leader'
+
+export interface StopPreviewPair {
+  id: string
+  raw: LatLng
+  snapped?: LatLng | null
+  offRoute?: boolean
+  selected?: boolean
+}
+
+function point(coord: LatLng) {
+  return { type: 'Point' as const, coordinates: [coord.lng, coord.lat] }
+}
+
+function emptyFeatureCollection() {
+  return { type: 'FeatureCollection' as const, features: [] }
+}
+
+function sameCoord(a: LatLng | null | undefined, b: LatLng | null | undefined): boolean {
+  // An absent snap matches only another absent snap.
+  if (!a || !b) return !a && !b
+  return a.lat === b.lat && a.lng === b.lng
+}
+
+function samePairs(a: StopPreviewPair[], b: StopPreviewPair[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every(
+      (pair, index) =>
+        pair.id === b[index].id &&
+        !!pair.offRoute === !!b[index].offRoute &&
+        !!pair.selected === !!b[index].selected &&
+        sameCoord(pair.raw, b[index].raw) &&
+        sameCoord(pair.snapped, b[index].snapped),
+    )
+  )
+}
+
+function snapshot(pairs: StopPreviewPair[]): StopPreviewPair[] {
+  return pairs.map((pair) => ({
+    id: pair.id,
+    raw: { ...pair.raw },
+    snapped: pair.snapped ? { ...pair.snapped } : null,
+    offRoute: !!pair.offRoute,
+    selected: !!pair.selected,
+  }))
+}
+
+export function useStopPreviewLayer(map: Map): { update: (pairs: StopPreviewPair[]) => void } {
+  const rawColor = readThemeToken('--color-ink-muted')
+  const snappedColor = readThemeToken('--color-ink')
+  const offRouteColor = readThemeToken('--color-coral')
+
+  map.addSource(RAW_STOP_SOURCE_ID, { type: 'geojson', data: emptyFeatureCollection() })
+  addLayerInStack(map, {
+    id: RAW_STOP_LAYER_ID,
+    type: 'circle',
+    source: RAW_STOP_SOURCE_ID,
+    // The selected stop is the one its row in the list was picked for, so it
+    // is drawn big enough to find again once the map has moved onto it.
+    paint: {
+      'circle-radius': ['case', ['get', 'selected'], 8, 5],
+      'circle-color': rawColor,
+      'circle-stroke-width': ['case', ['get', 'selected'], 3, 2],
+      'circle-stroke-color': ['case', ['get', 'selected'], snappedColor, '#ffffff'],
+    },
+  })
+
+  map.addSource(LEADER_SOURCE_ID, { type: 'geojson', data: emptyFeatureCollection() })
+  addLayerInStack(map, {
+    id: LEADER_LAYER_ID,
+    type: 'line',
+    source: LEADER_SOURCE_ID,
+    layout: { 'line-join': 'round', 'line-cap': 'round' },
+    paint: {
+      'line-color': ['case', ['get', 'offRoute'], offRouteColor, rawColor],
+      'line-width': 1.5,
+      'line-dasharray': [2, 2],
+    },
+  })
+
+  map.addSource(SNAPPED_STOP_SOURCE_ID, { type: 'geojson', data: emptyFeatureCollection() })
+  addLayerInStack(map, {
+    id: SNAPPED_STOP_LAYER_ID,
+    type: 'circle',
+    source: SNAPPED_STOP_SOURCE_ID,
+    paint: {
+      'circle-radius': 6,
+      'circle-color': ['case', ['get', 'offRoute'], offRouteColor, snappedColor],
+      'circle-stroke-width': 2,
+      'circle-stroke-color': '#ffffff',
+    },
+  })
+
+  // What was last drawn, so an equal-but-new pair list costs nothing. Every
+  // setData rebuilds a layer, which shows as pins flashing and basemap labels
+  // re-colliding — and unrelated form edits hand over a fresh array constantly.
+  // Tied to the sources added above: whatever re-adds them must re-make this
+  // composable too, or the first update after that would be skipped as a no-op.
+  let drawn: StopPreviewPair[] | null = null
+
+  function update(pairs: StopPreviewPair[]): void {
+    if (drawn && samePairs(drawn, pairs)) return
+
+    const rawSource = map.getSource(RAW_STOP_SOURCE_ID) as GeoJSONSource
+    rawSource.setData({
+      type: 'FeatureCollection',
+      features: pairs.map((p) => ({
+        type: 'Feature' as const,
+        properties: { id: p.id, selected: !!p.selected },
+        geometry: point(p.raw),
+      })),
+    })
+
+    const snapped = pairs.filter((p): p is StopPreviewPair & { snapped: LatLng } => !!p.snapped)
+
+    const snappedSource = map.getSource(SNAPPED_STOP_SOURCE_ID) as GeoJSONSource
+    snappedSource.setData({
+      type: 'FeatureCollection',
+      features: snapped.map((p) => ({
+        type: 'Feature' as const,
+        properties: { id: p.id, offRoute: !!p.offRoute },
+        geometry: point(p.snapped),
+      })),
+    })
+
+    const leaderSource = map.getSource(LEADER_SOURCE_ID) as GeoJSONSource
+    leaderSource.setData({
+      type: 'FeatureCollection',
+      features: snapped.map((p) => ({
+        type: 'Feature' as const,
+        properties: { id: p.id, offRoute: !!p.offRoute },
+        geometry: {
+          type: 'LineString' as const,
+          coordinates: [
+            [p.raw.lng, p.raw.lat],
+            [p.snapped.lng, p.snapped.lat],
+          ],
+        },
+      })),
+    })
+
+    // Recorded only once all three sources have taken the data, so a throw
+    // part-way leaves no claim to have drawn something that never landed.
+    drawn = snapshot(pairs)
+  }
+
+  return { update }
+}
+
+export function stopPreviewModule(pairs: () => StopPreviewPair[] | null): MapModule {
+  let layer: { update: (pairs: StopPreviewPair[]) => void } | null = null
+
+  return {
+    deps: pairs,
+    isReady: (styleLoaded) => styleLoaded && pairs() !== null,
+    attach: (map) => {
+      layer = useStopPreviewLayer(map)
+      // isReady has already established there are pairs to draw.
+      layer.update(pairs()!)
+    },
+    // Pairs going away leaves the last drawing up rather than blanking it —
+    // there is no caller that does so, and clearing would be a guess.
+    sync: () => {
+      const current = pairs()
+      if (current) layer?.update(current)
+    },
+    detach: () => { layer = null },
+  }
+}

@@ -1,0 +1,98 @@
+@import '@fontsource-variable/inter';
+@import '@fontsource-variable/open-sans';
+@import 'tailwindcss';
+@import './theme.css';
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body {
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--color-ink);
+  background: var(--color-white);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  margin: 0;
+}
+
+#app {
+  min-height: 100svh;
+}
+
+/* A hairline just off the element, so keyboard focus reads as an edge rather
+   than a halo. It lives in the base layer so that focus-visible utilities on
+   individual elements win over it; unlayered, it would beat every utility
+   regardless of specificity, and FIELD_INPUT_CLASS's outline-none would lose. */
+@layer base {
+  *:focus-visible {
+    outline: var(--focus-ring-width) solid var(--color-focus);
+    outline-offset: var(--focus-ring-offset);
+  }
+}
+
+/* Ink on a coral tint, like a selected choice (SPA-510): white on solid coral
+   is 3.36:1. The tint is 30% rather than the choice's 10% so a selection still
+   stands out from the page around it. */
+::selection {
+  background: color-mix(in srgb, var(--color-coral) 30%, transparent);
+  color: var(--color-ink);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
+.skeleton {
+  background-color: var(--color-placeholder);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgb(255 255 255 / 45%) 50%,
+    transparent 100%
+  );
+  background-repeat: no-repeat;
+  background-size: 50% 100%;
+  animation: skeleton-shimmer 1.6s ease-in-out infinite;
+}
+
+@keyframes skeleton-shimmer {
+  from {
+    background-position: -100% 0;
+  }
+
+  to {
+    background-position: 200% 0;
+  }
+}
+
+/* The global rule above only shortens animations, which would leave the
+   highlight frozen part-way across; a still skeleton has no highlight. */
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+    background-image: none;
+  }
+}
+
+.maplibregl-popup.tooltip-popup .maplibregl-popup-content {
+  background: none;
+  box-shadow: none;
+  padding: 0;
+  border-radius: 0;
+}
+
+.maplibregl-popup.tooltip-popup .maplibregl-popup-tip {
+  display: none;
+}

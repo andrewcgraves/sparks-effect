@@ -1,0 +1,205 @@
+import { describe, it, expect, vi } from 'vitest'
+import type { Map } from 'maplibre-gl'
+import {
+  useStopPreviewLayer,
+  RAW_STOP_SOURCE_ID,
+  RAW_STOP_LAYER_ID,
+  SNAPPED_STOP_SOURCE_ID,
+  SNAPPED_STOP_LAYER_ID,
+  LEADER_SOURCE_ID,
+  LEADER_LAYER_ID,
+} from './useStopPreviewLayer'
+import type { StopPreviewPair } from './useStopPreviewLayer'
+
+function makeMockMap() {
+  const sources: Record<string, { setData: ReturnType<typeof vi.fn> }> = {}
+  const addSource = vi.fn((id: string) => {
+    sources[id] = { setData: vi.fn() }
+  })
+  const getSource = vi.fn((id: string) => sources[id])
+  return {
+    addSource,
+    addLayer: vi.fn(),
+    getSource,
+    getLayer: vi.fn(),
+    sources,
+  }
+}
+
+const pairWithSnap: StopPreviewPair = {
+  id: 'a',
+  raw: { lat: 37.77, lng: -122.41 },
+  snapped: { lat: 37.771, lng: -122.409 },
+  offRoute: false,
+}
+
+const pairOffRoute: StopPreviewPair = {
+  id: 'b',
+  raw: { lat: 38.5, lng: -123.5 },
+  snapped: { lat: 37.9, lng: -122.5 },
+  offRoute: true,
+}
+
+const pairWithoutSnap: StopPreviewPair = {
+  id: 'c',
+  raw: { lat: 37.5, lng: -122.0 },
+  snapped: null,
+}
+
+describe('useStopPreviewLayer', () => {
+  it('adds sources and layers for raw pins, snapped pins, and leader lines', () => {
+    const map = makeMockMap()
+    useStopPreviewLayer(map as unknown as Map)
+
+    expect(map.addSource).toHaveBeenCalledWith(RAW_STOP_SOURCE_ID, expect.objectContaining({ type: 'geojson' }))
+    expect(map.addSource).toHaveBeenCalledWith(SNAPPED_STOP_SOURCE_ID, expect.objectContaining({ type: 'geojson' }))
+    expect(map.addSource).toHaveBeenCalledWith(LEADER_SOURCE_ID, expect.objectContaining({ type: 'geojson' }))
+
+    expect(map.addLayer).toHaveBeenCalledWith(
+      expect.objectContaining({ id: RAW_STOP_LAYER_ID, type: 'circle', source: RAW_STOP_SOURCE_ID }),
+    )
+    expect(map.addLayer).toHaveBeenCalledWith(
+      expect.objectContaining({ id: SNAPPED_STOP_LAYER_ID, type: 'circle', source: SNAPPED_STOP_SOURCE_ID }),
+    )
+    expect(map.addLayer).toHaveBeenCalledWith(
+      expect.objectContaining({ id: LEADER_LAYER_ID, type: 'line', source: LEADER_SOURCE_ID }),
+    )
+  })
+
+  it('update() renders a raw pin feature for every pair, snapped or not', () => {
+    const map = makeMockMap()
+    const layer = useStopPreviewLayer(map as unknown as Map)
+    layer.update([pairWithSnap, pairWithoutSnap])
+
+    const data = map.sources[RAW_STOP_SOURCE_ID].setData.mock.calls[0][0]
+    expect(data.features).toHaveLength(2)
+    expect(data.features[0].geometry.coordinates).toEqual([-122.41, 37.77])
+  })
+
+  it('update() renders a snapped pin only for pairs with a snap result', () => {
+    const map = makeMockMap()
+    const layer = useStopPreviewLayer(map as unknown as Map)
+    layer.update([pairWithSnap, pairWithoutSnap])
+
+    const data = map.sources[SNAPPED_STOP_SOURCE_ID].setData.mock.calls[0][0]
+    expect(data.features).toHaveLength(1)
+    expect(data.features[0].geometry.coordinates).toEqual([-122.409, 37.771])
+  })
+
+  it('update() draws a leader line between raw and snapped for snapped pairs only', () => {
+    const map = makeMockMap()
+    const layer = useStopPreviewLayer(map as unknown as Map)
+    layer.update([pairWithSnap, pairWithoutSnap])
+
+    const data = map.sources[LEADER_SOURCE_ID].setData.mock.calls[0][0]
+    expect(data.features).toHaveLength(1)
+    expect(data.features[0].geometry.coordinates).toEqual([
+      [-122.41, 37.77],
+      [-122.409, 37.771],
+    ])
+  })
+
+  it('tags off-route pairs on both the snapped pin and the leader line', () => {
+    const map = makeMockMap()
+    const layer = useStopPreviewLayer(map as unknown as Map)
+    layer.update([pairWithSnap, pairOffRoute])
+
+    const snappedData = map.sources[SNAPPED_STOP_SOURCE_ID].setData.mock.calls[0][0]
+    const leaderData = map.sources[LEADER_SOURCE_ID].setData.mock.calls[0][0]
+    expect(snappedData.features.find((f: { properties: { id: string } }) => f.properties.id === 'b').properties.offRoute).toBe(true)
+    expect(leaderData.features.find((f: { properties: { id: string } }) => f.properties.id === 'b').properties.offRoute).toBe(true)
+    expect(snappedData.features.find((f: { properties: { id: string } }) => f.properties.id === 'a').properties.offRoute).toBe(false)
+  })
+
+  it('tags the selected pair on its raw pin, and no other', () => {
+    const map = makeMockMap()
+    const layer = useStopPreviewLayer(map as unknown as Map)
+    layer.update([pairWithSnap, { ...pairOffRoute, selected: true }])
+
+    const rawData = map.sources[RAW_STOP_SOURCE_ID].setData.mock.calls[0][0]
+    expect(rawData.features.map((f: { properties: { selected: boolean } }) => f.properties.selected)).toEqual([false, true])
+  })
+
+  // Every setData rebuilds the layer, which reads on screen as a flicker of the
+  // pins and of the basemap labels they collide with. An unrelated form edit
+  // hands over an equal-but-new array, and that must not cost a redraw.
+  describe('redundant updates', () => {
+    function setDataCallCounts(map: ReturnType<typeof makeMockMap>) {
+      return [RAW_STOP_SOURCE_ID, SNAPPED_STOP_SOURCE_ID, LEADER_SOURCE_ID].map(
+        (id) => map.sources[id].setData.mock.calls.length,
+      )
+    }
+
+    it('update() skips setData when an equal but distinct pair list arrives', () => {
+      const map = makeMockMap()
+      const layer = useStopPreviewLayer(map as unknown as Map)
+      layer.update([pairWithSnap, pairOffRoute])
+
+      layer.update([{ ...pairWithSnap, raw: { ...pairWithSnap.raw } }, { ...pairOffRoute }])
+
+      expect(setDataCallCounts(map)).toEqual([1, 1, 1])
+    })
+
+    it('update() redraws when a raw coordinate moves', () => {
+      const map = makeMockMap()
+      const layer = useStopPreviewLayer(map as unknown as Map)
+      layer.update([pairWithSnap])
+
+      layer.update([{ ...pairWithSnap, raw: { lat: 37.78, lng: -122.41 } }])
+
+      expect(setDataCallCounts(map)).toEqual([2, 2, 2])
+      expect(map.sources[RAW_STOP_SOURCE_ID].setData.mock.calls[1][0].features[0].geometry.coordinates).toEqual([
+        -122.41, 37.78,
+      ])
+    })
+
+    it('update() redraws when a snap result arrives for a pending pair', () => {
+      const map = makeMockMap()
+      const layer = useStopPreviewLayer(map as unknown as Map)
+      layer.update([pairWithoutSnap])
+
+      layer.update([{ ...pairWithoutSnap, snapped: { lat: 37.51, lng: -122.01 } }])
+
+      expect(setDataCallCounts(map)).toEqual([2, 2, 2])
+      expect(map.sources[SNAPPED_STOP_SOURCE_ID].setData.mock.calls[1][0].features).toHaveLength(1)
+    })
+
+    it('update() redraws when a pair flips to off-route', () => {
+      const map = makeMockMap()
+      const layer = useStopPreviewLayer(map as unknown as Map)
+      layer.update([pairWithSnap])
+
+      layer.update([{ ...pairWithSnap, offRoute: true }])
+
+      expect(setDataCallCounts(map)).toEqual([2, 2, 2])
+    })
+
+    it('update() redraws when the selection moves', () => {
+      const map = makeMockMap()
+      const layer = useStopPreviewLayer(map as unknown as Map)
+      layer.update([pairWithSnap])
+
+      layer.update([{ ...pairWithSnap, selected: true }])
+
+      expect(setDataCallCounts(map)).toEqual([2, 2, 2])
+    })
+
+    it('update() redraws when a stop is added or removed', () => {
+      const map = makeMockMap()
+      const layer = useStopPreviewLayer(map as unknown as Map)
+      layer.update([pairWithSnap])
+
+      layer.update([pairWithSnap, pairOffRoute])
+      layer.update([pairOffRoute])
+
+      expect(setDataCallCounts(map)).toEqual([3, 3, 3])
+    })
+  })
+
+  it('handles an empty pair list without error', () => {
+    const map = makeMockMap()
+    const layer = useStopPreviewLayer(map as unknown as Map)
+    expect(() => layer.update([])).not.toThrow()
+    expect(map.sources[RAW_STOP_SOURCE_ID].setData.mock.calls[0][0].features).toHaveLength(0)
+  })
+})

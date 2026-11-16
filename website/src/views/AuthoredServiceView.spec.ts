@@ -1,0 +1,697 @@
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import { mount, flushPromises } from '@vue/test-utils'
+import { createPinia, setActivePinia } from 'pinia'
+import { createRouter, createMemoryHistory } from 'vue-router'
+import type { Service, TransitGraph } from '../api/authoring/types'
+import { ApiError } from '../api/authoring/client'
+
+vi.mock('../api/routingStatus', () => ({ fetchRoutingStatus: vi.fn().mockResolvedValue('ok') }))
+
+vi.mock('../api/authoring/services', () => ({
+  fetchService: vi.fn(),
+  fetchServiceGraph: vi.fn(),
+  compileService: vi.fn(),
+  fetchServiceIsochrone: vi.fn(),
+  deleteService: vi.fn(),
+}))
+vi.mock('../api/authoring/scenarios', () => ({
+  fetchMyScenarios: vi.fn(),
+  deleteScenario: vi.fn(),
+}))
+vi.mock('../api/authoring/handovers', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../api/authoring/handovers')>()),
+  fetchMyHandovers: vi.fn(),
+  offerHandover: vi.fn(),
+  cancelHandover: vi.fn(),
+}))
+vi.mock('../api/publications', () => ({
+  fetchServicePublication: vi.fn(),
+  publishService: vi.fn(),
+  unpublishService: vi.fn(),
+}))
+vi.mock('../components/MapView.vue', () => ({
+  default: {
+    props: ['origin', 'isochroneData', 'loading', 'loadingMessage', 'routes', 'stations'],
+    template: '<div data-testid="map" :data-stations="stations.length" :data-routes="routes.length" :data-loading-message="loadingMessage" />',
+  },
+}))
+
+import { breadcrumbTrail } from '../test/breadcrumbs'
+import AuthoredServiceView from './AuthoredServiceView.vue'
+import { seriousA11yViolations } from '../test/axe'
+import {
+  compileService,
+  deleteService,
+  fetchService,
+  fetchServiceGraph,
+  fetchServiceIsochrone,
+} from '../api/authoring/services'
+import { fetchMyScenarios } from '../api/authoring/scenarios'
+import { cancelHandover, fetchMyHandovers, offerHandover, type OutgoingHandover } from '../api/authoring/handovers'
+import { mountSharedHosts } from '../test/sharedHosts'
+import { useConfirmHost } from '../composables/useConfirm'
+import { fetchServicePublication, publishService, type ServicePublication } from '../api/publications'
+import { PUBLISH_COMPILE_FAILED } from '../composables/usePublication'
+import { busyRegion, visibleText } from '../test/loading'
+import { hopCells } from '../test/stationTimes'
+
+const Stub = { template: '<div>stub</div>' }
+
+const graph = {
+  services: [{
+    service_id: 'svc1',
+    wait_secs: 0,
+    edges: [
+      { from_slug: 'a', to_slug: 'b', seconds: 60 },
+      { from_slug: 'b', to_slug: 'a', seconds: 75 },
+    ],
+  }],
+  nodes: [
+    { slug: 'a', lat: 37.7, lng: -122.4, names: ['Union'] },
+    { slug: 'b', lat: 37.5, lng: -122.1, names: ['Midtown'] },
+  ],
+  routes: [{
+    id: 'route-1', slug: 'main-line', name: 'Main Line', mode: 'rail', bidirectional: true,
+    geometry: { type: 'LineString', coordinates: [[-122.4, 37.7], [-122.1, 37.5]] }, segments: [],
+  }],
+} as unknown as TransitGraph
+
+const stubService: Service = {
+  id: 'svc1',
+  slug: 'northbound-express',
+  route_id: 'route-1',
+  name: 'Northbound Express',
+  description: 'Runs the spine',
+  stops: [
+    { name: 'Union', lat: 37.7, lng: -122.4, seq: 0 },
+    { name: 'Midtown', lat: 37.5, lng: -122.1, seq: 1 },
+  ],
+  vehicle: { max_speed_kmh: 320, acceleration_ms2: 1.1, deceleration_ms2: 1.2, dwell_s: 30 },
+  frequency_windows: [{ start_time: '06:00', end_time: '22:00', headway_s: 900 }],
+}
+
+function mountView(slug = 'northbound-express') {
+  const router = createRouter({
+    history: createMemoryHistory(),
+    routes: [
+      { path: '/authoring', name: 'authoring', component: Stub },
+      { path: '/authoring/services/:slug', name: 'service-detail', component: AuthoredServiceView, props: true },
+      { path: '/services/:slug', name: 'published-service', component: Stub },
+    ],
+  })
+  return mount(AuthoredServiceView, { props: { slug }, global: { plugins: [router] } })
+}
+
+describe('AuthoredServiceView', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.mocked(fetchService).mockReset()
+    vi.mocked(fetchServiceGraph).mockReset().mockResolvedValue(graph)
+    vi.mocked(compileService).mockReset()
+    vi.mocked(fetchServiceIsochrone).mockReset()
+    vi.mocked(fetchServicePublication).mockReset().mockRejectedValue(new ApiError('not found', 404))
+    vi.mocked(publishService).mockReset()
+    vi.mocked(deleteService).mockReset().mockResolvedValue()
+    vi.mocked(fetchMyScenarios).mockReset().mockResolvedValue([])
+    vi.mocked(fetchMyHandovers).mockReset().mockResolvedValue({ incoming: [], outgoing: [] })
+    vi.mocked(offerHandover).mockReset().mockResolvedValue()
+    vi.mocked(cancelHandover).mockReset()
+    // useCompileJob polls the job endpoint through the jobs store.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: 'job1', kind: 'compile_user_service', status: 'succeeded', result: graph }),
+    } as Response))
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('has no serious or critical accessibility violations once loaded', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: [
+        { path: '/authoring', name: 'authoring', component: Stub },
+        { path: '/authoring/services/:slug', name: 'service-detail', component: AuthoredServiceView, props: true },
+        { path: '/services/:slug', name: 'published-service', component: Stub },
+      ],
+    })
+    const wrapper = mount(AuthoredServiceView, { props: { slug: 'northbound-express' }, global: { plugins: [router] }, attachTo: document.body })
+    await flushPromises()
+    expect(await seriousA11yViolations(wrapper)).toEqual([])
+    wrapper.unmount()
+  })
+
+  it('shows a page skeleton in the shape of the loaded page, not loading copy, while it loads', () => {
+    vi.mocked(fetchService).mockReturnValue(new Promise(() => {}))
+    const wrapper = mountView()
+    const region = busyRegion(wrapper, 'service-loading')
+    expect(region.find('[data-testid="map-panel-skeleton"]').exists()).toBe(true)
+    expect(region.findAll('[data-testid="card-skeleton"]')).toHaveLength(3)
+    expect(visibleText(region)).toBe('')
+  })
+
+  it('fetches the service named by the slug prop', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    mountView()
+    await flushPromises()
+    expect(fetchService).toHaveBeenCalledWith('northbound-express')
+  })
+
+  it('names the tab after the service once it loads', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    mountView()
+    await flushPromises()
+    expect(document.title).toBe('Northbound Express · Sparks Effect')
+  })
+
+  it('shows the name and slug once loaded', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.text()).toContain('Northbound Express')
+    expect(wrapper.text()).toContain('northbound-express')
+  })
+
+  it('shows the subtext and description once loaded', async () => {
+    vi.mocked(fetchService).mockResolvedValue({
+      ...stubService,
+      subtext: 'Electrified · High-speed rail',
+      description: 'Runs the spine.\n\nStops at every town.',
+    })
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="service-subtext"]').text()).toBe('Electrified · High-speed rail')
+    expect(wrapper.find('[data-testid="service-description"]').text()).toBe('Runs the spine.\n\nStops at every town.')
+  })
+
+  it('leaves out prose the service does not have', async () => {
+    // The API omits empty prose rather than sending an empty string.
+    vi.mocked(fetchService).mockResolvedValue({ ...stubService, description: undefined })
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="service-subtext"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="service-description"]').exists()).toBe(false)
+  })
+
+  it('lists the stops in order', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const wrapper = mountView()
+    await flushPromises()
+    const rows = wrapper.findAll('[data-testid="service-stop-row"]')
+    expect(rows).toHaveLength(2)
+    expect(rows[0].text()).toContain('Union')
+    expect(rows[1].text()).toContain('Midtown')
+  })
+
+  it('orders stops by seq rather than array order', async () => {
+    vi.mocked(fetchService).mockResolvedValue({
+      ...stubService,
+      stops: [
+        { name: 'Midtown', lat: 37.5, lng: -122.1, seq: 1 },
+        { name: 'Union', lat: 37.7, lng: -122.4, seq: 0 },
+      ],
+    })
+    const wrapper = mountView()
+    await flushPromises()
+    const rows = wrapper.findAll('[data-testid="service-stop-row"]')
+    expect(rows[0].text()).toContain('Union')
+    expect(rows[1].text()).toContain('Midtown')
+  })
+
+  it('shows empty states for a service with no stops or frequency windows', async () => {
+    vi.mocked(fetchService).mockResolvedValue({ ...stubService, stops: [], frequency_windows: [] })
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.get('[data-testid="service-stops-empty"]').text()).toContain('Edit it to place stops along its route.')
+    expect(wrapper.get('[data-testid="service-windows-empty"]').text()).toContain('Edit it to say how often it runs.')
+  })
+
+  it('shows the vehicle params and frequency windows', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.text()).toContain('320')
+    expect(wrapper.findAll('[data-testid="service-window-row"]')).toHaveLength(1)
+  })
+
+  it('shows where it sits: the service, under My authoring', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const wrapper = mountView()
+    await flushPromises()
+    expect(breadcrumbTrail(wrapper)).toEqual([
+      ['My authoring', '/authoring'],
+      ['Northbound Express', null],
+    ])
+  })
+
+  it('links to editing the service', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="edit-service"]').attributes('href'))
+      .toBe('/authoring/services/northbound-express/edit')
+  })
+
+  it('shows a not-found state on a 404', async () => {
+    vi.mocked(fetchService).mockRejectedValue(new ApiError('not found', 404))
+    const wrapper = mountView('no-such-service')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="service-not-found"]').exists()).toBe(true)
+  })
+
+  it('shows an error state on a non-404 failure', async () => {
+    vi.mocked(fetchService).mockRejectedValue(new ApiError('boom', 500))
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="service-error"]').exists()).toBe(true)
+  })
+
+  // --- render: map and isochrone (SPA-141) ---
+
+  it('reads the compiled graph and shows the map without recompiling', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const wrapper = mountView()
+    await flushPromises()
+    expect(fetchServiceGraph).toHaveBeenCalledWith('northbound-express')
+    // The graph is persisted on the job row, so a normal visit is one cached
+    // read — recompiling every visit would be pure waste.
+    expect(compileService).not.toHaveBeenCalled()
+    expect(wrapper.find('[data-testid="map"]').exists()).toBe(true)
+    expect(wrapper.findComponent({ name: 'IsochroneForm' }).exists()).toBe(true)
+  })
+
+  it('shows time between stations for the service it compiled', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const wrapper = mountView()
+    await flushPromises()
+
+    const section = wrapper.get('[data-testid="time-between-stations"]')
+    expect(section.get('[data-testid="station-time-group-label"]').text()).toBe('Northbound Express')
+    expect(hopCells(section)[0]).toEqual(['Union', 'Midtown', '1:00'])
+  })
+
+  it('keeps the run times beside the stops and vehicle cards, not below them', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const wrapper = mountView()
+    await flushPromises()
+    // One flowing grid of cards, so they slot in side by side when there's room.
+    const grid = wrapper.get('[data-testid="time-between-stations"]').element.parentElement
+    expect(grid?.className).toContain('grid')
+    expect(grid?.querySelectorAll('[data-testid="service-stop-row"]').length).toBeGreaterThan(0)
+  })
+
+  it('drops the run-time section when the graph never arrives, rather than loading for good', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    vi.mocked(fetchServiceGraph).mockRejectedValue(new ApiError('boom', 500))
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="time-between-stations"]').exists()).toBe(false)
+    // The stops and vehicle cards are unaffected.
+    expect(wrapper.find('[data-testid="service-stop-row"]').exists()).toBe(true)
+  })
+
+  it('shows the return leg\'s own run time when the other terminus is chosen', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.get('[data-testid="direction-toggle-option-1"]').setValue(true)
+    expect(hopCells(wrapper)[0]).toEqual(['Midtown', 'Union', '1:15'])
+  })
+
+  it('draws the service along its route alignment, not chords between stops', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const wrapper = mountView()
+    await flushPromises()
+    const map = wrapper.find('[data-testid="map"]')
+    // The mock MapView reflects its layer counts as data attributes.
+    expect(map.attributes('data-stations')).toBe('2')
+    expect(map.attributes('data-routes')).toBe('1')
+  })
+
+  it('compiles when the service has never compiled, without flashing an error', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    vi.mocked(fetchServiceGraph).mockRejectedValue(new ApiError('no compiled graph', 404))
+    vi.mocked(compileService).mockResolvedValue({ id: 'job1', kind: 'compile_user_service', status: 'queued' })
+    const wrapper = mountView()
+    await flushPromises()
+    expect(compileService).toHaveBeenCalledWith('northbound-express', expect.any(Object))
+    expect(wrapper.find('[data-testid="graph-error"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="map"]').exists()).toBe(true)
+  })
+
+  it('plots an isochrone against the service', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    vi.mocked(fetchServiceIsochrone).mockResolvedValue({ features: [], metadata: { reachable_stations: [], mode: 'walk' } } as never)
+    const wrapper = mountView()
+    await flushPromises()
+
+    wrapper.findComponent({ name: 'IsochroneForm' }).vm.$emit('submit', {
+      lat: 37.7, lng: -122.4, duration: 30, mode: 'walk',
+    })
+    await flushPromises()
+
+    expect(fetchServiceIsochrone).toHaveBeenCalledWith('northbound-express', {
+      lat: 37.7, lng: -122.4, budget_mins: 30, mode: 'walk',
+    }, expect.any(Function))
+  })
+
+  // SPA-467: a visitor waiting on a queued plot is told where they stand.
+  it('tells a waiting visitor how many plots are ahead of theirs', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    vi.mocked(fetchServiceIsochrone).mockImplementation((_slug, _request, onProgress) => {
+      onProgress?.({ status: 'queued', queue_position: 2 })
+      return new Promise(() => {})
+    })
+    const wrapper = mountView()
+    await flushPromises()
+
+    wrapper.findComponent({ name: 'IsochroneForm' }).vm.$emit('submit', {
+      lat: 37.7, lng: -122.4, duration: 30, mode: 'walk',
+    })
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="map"]').attributes('data-loading-message')).toBe('Waiting — 2 ahead of you')
+  })
+
+  it('forwards transit mode when plotting an isochrone', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    vi.mocked(fetchServiceIsochrone).mockResolvedValue({ features: [], metadata: { reachable_stations: [], mode: 'walk' } } as never)
+    const wrapper = mountView()
+    await flushPromises()
+
+    wrapper.findComponent({ name: 'IsochroneForm' }).vm.$emit('submit', {
+      lat: 37.7, lng: -122.4, duration: 30, mode: 'transit',
+    })
+    await flushPromises()
+
+    expect(fetchServiceIsochrone).toHaveBeenCalledWith('northbound-express', {
+      lat: 37.7, lng: -122.4, budget_mins: 30, mode: 'transit',
+    }, expect.any(Function))
+  })
+
+  // Editing the service leaves its graph stale; the shared composable's retry
+  // recovers transparently rather than surfacing it to the user.
+  it('recovers from a stale_graph 409 by recompiling and retrying', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    vi.mocked(compileService).mockResolvedValue({ id: 'job1', kind: 'compile_user_service', status: 'queued' })
+    vi.mocked(fetchServiceIsochrone)
+      .mockRejectedValueOnce(new ApiError('stale', 409, 'stale_graph'))
+      .mockResolvedValueOnce({ features: [], metadata: { reachable_stations: [], mode: 'walk' } } as never)
+    const wrapper = mountView()
+    await flushPromises()
+
+    wrapper.findComponent({ name: 'IsochroneForm' }).vm.$emit('submit', {
+      lat: 37.7, lng: -122.4, duration: 30, mode: 'walk',
+    })
+    await flushPromises()
+
+    expect(compileService).toHaveBeenCalledWith('northbound-express', expect.any(Object))
+    expect(fetchServiceIsochrone).toHaveBeenCalledTimes(2)
+    expect(wrapper.find('[data-testid="graph-error"]').exists()).toBe(false)
+  })
+
+  it('reports a graph read that fails for a reason other than "never compiled"', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    vi.mocked(fetchServiceGraph).mockRejectedValue(new ApiError('boom', 500))
+    const wrapper = mountView()
+    await flushPromises()
+    expect(compileService).not.toHaveBeenCalled()
+    expect(wrapper.find('[data-testid="graph-error"]').exists()).toBe(true)
+  })
+
+  it('reports a failed compile instead of an unusable form', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    vi.mocked(fetchServiceGraph).mockRejectedValue(new ApiError('no compiled graph', 404))
+    vi.mocked(compileService).mockRejectedValue(new ApiError('compile boom', 500))
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.find('[data-testid="compile-error"]').exists()).toBe(true)
+  })
+
+  // A service with no stops still has a page; the map just has no geometry.
+  it('renders a service with no stops without crashing', async () => {
+    vi.mocked(fetchService).mockResolvedValue({ ...stubService, stops: [] })
+    vi.mocked(fetchServiceGraph).mockResolvedValue({ services: [] } as unknown as TransitGraph)
+    const wrapper = mountView()
+    await flushPromises()
+    const map = wrapper.find('[data-testid="map"]')
+    expect(map.exists()).toBe(true)
+    expect(map.attributes('data-stations')).toBe('0')
+    expect(map.attributes('data-routes')).toBe('0')
+    expect(wrapper.find('[data-testid="service-stops-empty"]').exists()).toBe(true)
+  })
+
+  // The render is the reason the page gets opened, so it sits above the text.
+  it('puts the map above the stops and vehicle sections', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const wrapper = mountView()
+    await flushPromises()
+    // findAll returns document order, so the first hit tells us which came first.
+    const ordered = wrapper.findAll('[data-testid="map"], [data-testid="service-stop-row"]')
+    expect(ordered[0].attributes('data-testid')).toBe('map')
+  })
+
+  // --- publishing (SPA-360) ---
+
+  it('shows whether the service is published', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const wrapper = mountView()
+    await flushPromises()
+    expect(fetchServicePublication).toHaveBeenCalledWith('northbound-express')
+    expect(wrapper.get('[data-testid="publication"]').attributes('data-state')).toBe('unpublished')
+  })
+
+  it('compares the publication against the draft\'s own updated_at', async () => {
+    vi.mocked(fetchService).mockResolvedValue({ ...stubService, updated_at: '2026-09-21T08:00:00Z' })
+    vi.mocked(fetchServicePublication).mockResolvedValue({ published_at: '2026-09-20T12:00:00Z' } as never)
+    const wrapper = mountView()
+    await flushPromises()
+    expect(wrapper.get('[data-testid="publication"]').attributes('data-state')).toBe('changed')
+  })
+
+  it('publishes a stale service by compiling it through the page\'s own compile', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    vi.mocked(compileService).mockResolvedValue({ id: 'job1', kind: 'compile_user_service', status: 'queued' })
+    vi.mocked(publishService)
+      .mockRejectedValueOnce(new ApiError('stale', 409, 'stale_graph'))
+      .mockResolvedValueOnce({ published_at: '2026-09-21T09:00:00Z' } as never)
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.get('[data-testid="publish-button"]').trigger('click')
+    await flushPromises()
+
+    expect(compileService).toHaveBeenCalledWith('northbound-express', expect.any(Object))
+    expect(publishService).toHaveBeenCalledTimes(2)
+    expect(wrapper.get('[data-testid="publication"]').attributes('data-state')).toBe('current')
+  })
+
+  it('reports a compile fault met while publishing where every compile fault goes', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    vi.mocked(compileService).mockRejectedValue(new Error('compile boom'))
+    vi.mocked(publishService).mockRejectedValue(new ApiError('stale', 409, 'stale_graph'))
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.get('[data-testid="publish-button"]').trigger('click')
+    await flushPromises()
+
+    expect(publishService).toHaveBeenCalledTimes(1)
+    expect(wrapper.get('[data-testid="publication"]').attributes('data-state')).toBe('unpublished')
+    // The control points at the fault; the reason itself is on the preview's
+    // existing error surface, not repeated in a second one.
+    expect(wrapper.get('[data-testid="publication-error"]').text()).toBe(PUBLISH_COMPILE_FAILED)
+    expect(wrapper.get('[data-testid="fetch-error"]').text()).toBe('Something went wrong. Please try again.')
+  })
+
+  it('keeps Delete behind a secondary menu', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const wrapper = mountView()
+    await flushPromises()
+    const menu = wrapper.get('[data-testid="service-actions"]')
+    expect(menu.element.tagName).toBe('DETAILS')
+    expect(menu.get('[data-testid="delete-service"]').text()).toBe('Delete line')
+  })
+
+  it('asks before deleting, and deletes nothing when declined', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const { pending, settle } = useConfirmHost()
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-testid="delete-service"]').trigger('click')
+    await flushPromises()
+    expect(pending.value?.title).toBe("Delete 'Northbound Express'?")
+    settle(false)
+    await flushPromises()
+    expect(deleteService).not.toHaveBeenCalled()
+  })
+
+  it('warns that a published service\'s public page will stop working', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    vi.mocked(fetchServicePublication).mockResolvedValue({ published_at: '2026-09-01T00:00:00Z' } as ServicePublication)
+    const { pending, settle } = useConfirmHost()
+    const wrapper = mountView()
+    await flushPromises()
+    await wrapper.get('[data-testid="delete-service"]').trigger('click')
+    await flushPromises()
+    expect(pending.value?.body).toContain('Its public page will stop working.')
+    settle(false)
+  })
+
+  it('deletes once confirmed and goes to My authoring', async () => {
+    vi.mocked(fetchService).mockResolvedValue(stubService)
+    const { settle } = useConfirmHost()
+    const wrapper = mountView()
+    await wrapper.vm.$router.push('/authoring/services/northbound-express')
+    await flushPromises()
+    await wrapper.get('[data-testid="delete-service"]').trigger('click')
+    await flushPromises()
+    settle(true)
+    await flushPromises()
+    expect(deleteService).toHaveBeenCalledWith('northbound-express')
+    expect(wrapper.vm.$router.currentRoute.value.path).toBe('/authoring')
+  })
+
+  describe('transferring the line', () => {
+    let hosts: ReturnType<typeof mountSharedHosts>
+
+    const pendingOffer: OutgoingHandover = {
+      id: 'h1',
+      service_slug: 'northbound-express',
+      service_name: 'Northbound Express',
+      to_name: 'Ada',
+      status: 'pending',
+      created_at: '2026-10-01T12:00:00Z',
+      expires_at: '2026-10-15T12:00:00Z',
+    }
+
+    const OFFER_SENT = "Offer sent. If they have an account, they'll see it on their authoring page."
+
+    beforeEach(() => {
+      vi.mocked(fetchService).mockResolvedValue(stubService)
+      hosts = mountSharedHosts()
+    })
+
+    afterEach(() => {
+      hosts.unmount()
+    })
+
+    async function openTransfer() {
+      const wrapper = mountView()
+      await flushPromises()
+      await wrapper.get('[data-testid="offer-handover"]').trigger('click')
+      await flushPromises()
+      return wrapper
+    }
+
+    it('offers a Transfer… action beside Edit', async () => {
+      const wrapper = mountView()
+      await flushPromises()
+      expect(wrapper.get('[data-testid="offer-handover"]').text()).toBe('Transfer…')
+    })
+
+    it('asks for their email and says plainly what a transfer does', async () => {
+      await openTransfer()
+      expect(hosts.dialogOpen()).toBe(true)
+      expect(hosts.dialog().text()).toContain(
+        "They'll see this on their authoring page and can accept it. The public page keeps its address. You'll lose access once they accept.",
+      )
+      expect((hosts.email().element as HTMLInputElement).type).toBe('email')
+    })
+
+    it('sends nothing when the dialog is cancelled', async () => {
+      await openTransfer()
+      await hosts.cancelButton().trigger('click')
+      await flushPromises()
+      expect(offerHandover).not.toHaveBeenCalled()
+      expect(hosts.toasts()).toEqual([])
+    })
+
+    // The API answers an unknown address exactly as it answers a real one, and
+    // so must the page.
+    it.each([
+      ['an account', { incoming: [], outgoing: [pendingOffer] }],
+      ['no account', { incoming: [], outgoing: [] }],
+    ])('says the same thing once sent, whether the address has %s', async (_, afterwards) => {
+      const wrapper = await openTransfer()
+      vi.mocked(fetchMyHandovers).mockResolvedValue(afterwards)
+      await hosts.email().setValue('someone@example.com')
+      await hosts.confirmButton().trigger('click')
+      await flushPromises()
+      expect(offerHandover).toHaveBeenCalledWith('northbound-express', 'someone@example.com')
+      expect(hosts.toasts()).toEqual([OFFER_SENT])
+      expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    })
+
+    it('shows a pending offer with who it is waiting on and when it expires, in place of Transfer…', async () => {
+      vi.mocked(fetchMyHandovers).mockResolvedValue({ incoming: [], outgoing: [pendingOffer] })
+      const wrapper = mountView()
+      await flushPromises()
+      const pending = wrapper.get('[data-testid="pending-handover"]')
+      expect(pending.text()).toContain('Waiting for Ada to accept this line.')
+      expect(pending.text()).toMatch(/expires .*2026/i)
+      expect(wrapper.find('[data-testid="offer-handover"]').exists()).toBe(false)
+    })
+
+    it('ignores pending offers for other lines', async () => {
+      vi.mocked(fetchMyHandovers).mockResolvedValue({
+        incoming: [],
+        outgoing: [{ ...pendingOffer, service_slug: 'another-line' }],
+      })
+      const wrapper = mountView()
+      await flushPromises()
+      expect(wrapper.find('[data-testid="pending-handover"]').exists()).toBe(false)
+    })
+
+    it('asks before cancelling a pending offer, and keeps it when declined', async () => {
+      vi.mocked(fetchMyHandovers).mockResolvedValue({ incoming: [], outgoing: [pendingOffer] })
+      const wrapper = mountView()
+      await flushPromises()
+      await wrapper.get('[data-testid="cancel-handover"]').trigger('click')
+      await flushPromises()
+      expect(hosts.dialog().text()).toContain('Ada')
+      await hosts.cancelButton().trigger('click')
+      await flushPromises()
+      expect(cancelHandover).not.toHaveBeenCalled()
+    })
+
+    it('cancels a pending offer once confirmed, and offers Transfer… again', async () => {
+      vi.mocked(fetchMyHandovers).mockResolvedValue({ incoming: [], outgoing: [pendingOffer] })
+      vi.mocked(cancelHandover).mockResolvedValue({ ...pendingOffer, status: 'cancelled' })
+      const wrapper = mountView()
+      await flushPromises()
+      vi.mocked(fetchMyHandovers).mockResolvedValue({ incoming: [], outgoing: [] })
+      await wrapper.get('[data-testid="cancel-handover"]').trigger('click')
+      await flushPromises()
+      await hosts.confirmButton().trigger('click')
+      await flushPromises()
+      expect(cancelHandover).toHaveBeenCalledWith('h1')
+      expect(hosts.toasts()).toEqual(['Transfer cancelled'])
+      expect(wrapper.find('[data-testid="pending-handover"]').exists()).toBe(false)
+      expect(wrapper.find('[data-testid="offer-handover"]').exists()).toBe(true)
+    })
+
+    it('explains, without sending a second offer, when one is already pending', async () => {
+      vi.mocked(offerHandover).mockRejectedValue(new ApiError('conflict', 409))
+      await openTransfer()
+      await hosts.email().setValue('someone@example.com')
+      await hosts.confirmButton().trigger('click')
+      await flushPromises()
+      expect(hosts.toasts()).toEqual(['Not sent: this line already has a transfer waiting to be accepted.'])
+    })
+
+    it('explains an offer to the owner\'s own address', async () => {
+      vi.mocked(offerHandover).mockRejectedValue(new ApiError('unprocessable', 422))
+      await openTransfer()
+      await hosts.email().setValue('me@example.com')
+      await hosts.confirmButton().trigger('click')
+      await flushPromises()
+      expect(hosts.toasts()).toEqual(["Not sent: that's your own address."])
+    })
+  })
+})

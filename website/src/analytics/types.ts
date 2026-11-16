@@ -1,0 +1,9 @@
+export type AnalyticsEvent =
+  | { type: 'page_view'; path: string }
+  | { type: 'origin_search'; query: string; resultCount: number }
+  | { type: 'mode_toggle'; mode: string }
+  | { type: 'isochrone_request'; travelMode: string; durationMinutes: number }
+  | { type: 'isochrone_error'; travelMode: string; durationMinutes: number; status: number | null }
+  | { type: 'embed_load'; embedder: string | null }
+
+export type AnalyticsSink = (event: AnalyticsEvent) => void

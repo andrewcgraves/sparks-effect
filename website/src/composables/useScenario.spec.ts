@@ -1,0 +1,180 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { isReactive } from 'vue'
+import { flushPromises } from '@vue/test-utils'
+import { useScenario } from './useScenario'
+import type { ScenarioDetail } from '../api/scenarios'
+
+vi.mock('../api/scenarios', () => ({
+  fetchScenario: vi.fn(),
+}))
+
+import { fetchScenario } from '../api/scenarios'
+
+const stubDetail: ScenarioDetail = {
+  id: 's1',
+  slug: 'ca-hsr',
+  name: 'CA HSR',
+  subtext: 'Electrified · High-speed rail · Greenfield',
+  description: 'California High-Speed Rail',
+  status: 'active',
+  routes: [
+    {
+      id: 'r1',
+      scenario_id: 's1',
+      name: 'Main Line',
+      mode: 'hsr',
+      geometry: { type: 'LineString', coordinates: [[-122.4, 37.7], [-121.9, 37.3]] },
+      bidirectional: true,
+    },
+  ],
+  stations: [
+    {
+      id: 'st1',
+      scenario_id: 's1',
+      slug: 'sf',
+      name: 'San Francisco',
+      location: { type: 'Point', coordinates: [-122.4194, 37.7749] },
+      platform_height: '0',
+    },
+  ],
+  services: [
+    {
+      id: 'svc1',
+      name: 'Northbound Express',
+      vehicle_type: {
+        id: 'vt1',
+        name: 'High-Speed Rail',
+        propulsion: 'electric',
+        max_speed_kmh: 320,
+      },
+      direction: 'northbound',
+      provenance: 'calibrated',
+      stop_count: 2,
+      frequency_windows: [
+        { id: 'fw1', service_id: 'svc1', start_time: '06:00', end_time: '22:00', headway_s: 3600 },
+      ],
+    },
+  ],
+}
+
+describe('useScenario', () => {
+  beforeEach(() => {
+    vi.mocked(fetchScenario).mockClear()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('calls fetchScenario with the given slug', () => {
+    vi.mocked(fetchScenario).mockResolvedValueOnce(stubDetail)
+    useScenario('ca-hsr')
+    expect(fetchScenario).toHaveBeenCalledOnce()
+    expect(fetchScenario).toHaveBeenCalledWith('ca-hsr')
+  })
+
+  it('starts with empty routes, stations, and services', () => {
+    vi.mocked(fetchScenario).mockResolvedValueOnce(stubDetail)
+    const { routes, stations, services } = useScenario('ca-hsr')
+    expect(routes.value).toEqual([])
+    expect(stations.value).toEqual([])
+    expect(services.value).toEqual([])
+  })
+
+  it('is loading until the fetch settles', async () => {
+    vi.mocked(fetchScenario).mockResolvedValueOnce(stubDetail)
+    const { loading } = useScenario('ca-hsr')
+    expect(loading.value).toBe(true)
+    await flushPromises()
+    expect(loading.value).toBe(false)
+  })
+
+  it('stops loading when the fetch rejects, so the page can fall back', async () => {
+    vi.mocked(fetchScenario).mockRejectedValueOnce(new Error('boom'))
+    const { loading } = useScenario('ca-hsr')
+    await flushPromises()
+    expect(loading.value).toBe(false)
+  })
+
+  it('says the scenario failed to load, and only when it did', async () => {
+    vi.mocked(fetchScenario).mockRejectedValueOnce(new Error('404'))
+    const missing = useScenario('nope')
+    vi.mocked(fetchScenario).mockResolvedValueOnce(stubDetail)
+    const found = useScenario('ca-hsr')
+    expect(missing.failed.value).toBe(false)
+    await flushPromises()
+    expect(missing.failed.value).toBe(true)
+    expect(found.failed.value).toBe(false)
+  })
+
+  it('populates routes after fetch resolves', async () => {
+    vi.mocked(fetchScenario).mockResolvedValueOnce(stubDetail)
+    const { routes } = useScenario('ca-hsr')
+    await flushPromises()
+    expect(routes.value).toEqual(stubDetail.routes)
+  })
+
+  it('populates stations after fetch resolves', async () => {
+    vi.mocked(fetchScenario).mockResolvedValueOnce(stubDetail)
+    const { stations } = useScenario('ca-hsr')
+    await flushPromises()
+    expect(stations.value).toEqual(stubDetail.stations)
+  })
+
+  // Deep reactivity would proxy every coordinate pair of every route, and the
+  // ridden-line maths walks them all on each plot (SPA-487).
+  it('does not make the routes or stations deeply reactive', async () => {
+    vi.mocked(fetchScenario).mockResolvedValueOnce(stubDetail)
+    const { routes, stations } = useScenario('ca-hsr')
+    await flushPromises()
+    expect(isReactive(routes.value[0])).toBe(false)
+    expect(isReactive(routes.value[0].geometry.coordinates)).toBe(false)
+    expect(isReactive(stations.value[0])).toBe(false)
+  })
+
+  it('populates services after fetch resolves', async () => {
+    vi.mocked(fetchScenario).mockResolvedValueOnce(stubDetail)
+    const { services } = useScenario('ca-hsr')
+    await flushPromises()
+    expect(services.value).toEqual(stubDetail.services)
+  })
+
+  it('populates the subtext and description after fetch resolves', async () => {
+    vi.mocked(fetchScenario).mockResolvedValueOnce(stubDetail)
+    const { subtext, description } = useScenario('ca-hsr')
+    await flushPromises()
+    expect(subtext.value).toBe('Electrified · High-speed rail · Greenfield')
+    expect(description.value).toBe('California High-Speed Rail')
+  })
+
+  it('reads the plot label, and a missing one as empty', async () => {
+    vi.mocked(fetchScenario).mockResolvedValueOnce({
+      ...stubDetail,
+      plot_label: 'Show a {minutes}-minute HSR ride and {mode}',
+    })
+    const first = useScenario('ca-hsr')
+    await flushPromises()
+    expect(first.plotLabel.value).toBe('Show a {minutes}-minute HSR ride and {mode}')
+
+    vi.mocked(fetchScenario).mockResolvedValueOnce(stubDetail)
+    const second = useScenario('ca-hsr')
+    await flushPromises()
+    expect(second.plotLabel.value).toBe('')
+  })
+
+  it('reads a missing subtext as empty', async () => {
+    vi.mocked(fetchScenario).mockResolvedValueOnce({ ...stubDetail, subtext: undefined })
+    const { subtext } = useScenario('ca-hsr')
+    await flushPromises()
+    expect(subtext.value).toBe('')
+  })
+
+  it('leaves refs empty when fetch rejects', async () => {
+    vi.mocked(fetchScenario).mockRejectedValueOnce(new Error('network error'))
+    const { routes, stations, services } = useScenario('ca-hsr')
+    await flushPromises()
+    expect(routes.value).toEqual([])
+    expect(stations.value).toEqual([])
+    expect(services.value).toEqual([])
+  })
+})

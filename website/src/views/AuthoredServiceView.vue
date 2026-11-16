@@ -1,0 +1,328 @@
+<script setup lang="ts">
+import { computed, watch } from 'vue'
+import { compileService, fetchService, fetchServiceGraph, fetchServiceIsochrone } from '../api/authoring/services'
+import type { Service } from '../api/authoring/types'
+import { useOwnedDetail } from '../composables/useOwnedDetail'
+import { isochroneWaitMessage } from '../api/isochroneFault'
+import { useAuthoredGraph } from '../composables/useAuthoredGraph'
+import { useRoutingStatus } from '../composables/useRoutingStatus'
+import { usePageTitle } from '../composables/usePageTitle'
+import { useServiceDeletion } from '../composables/useDeletion'
+import { expiryDate, useHandovers } from '../composables/useHandovers'
+import ScenarioPreviewPanel from '../components/ScenarioPreviewPanel.vue'
+import PublicationControl from '../components/PublicationControl.vue'
+import TimeBetweenStations from '../components/TimeBetweenStations.vue'
+import { graphStationTimeGroups } from '../components/stationTimes'
+import { ACTION_LINK_CLASS } from '../components/linkStyles'
+import { SECONDARY_BUTTON_CLASS } from '../components/buttonStyles'
+import BreadcrumbTrail from '../components/BreadcrumbTrail.vue'
+import { AUTHORING_CRUMB } from '../components/crumbs'
+import DeleteMenu from '../components/DeleteMenu.vue'
+import PageSkeleton from '../components/PageSkeleton.vue'
+import PageHeader from '../components/PageHeader.vue'
+
+const props = defineProps<{ slug: string }>()
+
+const { item: service, loading, notFound, error } = useOwnedDetail<Service>(fetchService, props.slug)
+
+usePageTitle(() => service.value?.name)
+
+const stops = computed(() => [...(service.value?.stops ?? [])].sort((a, b) => a.seq - b.seq))
+
+const { offline: routingOffline } = useRoutingStatus()
+
+const {
+  compiling,
+  compileError,
+  graph,
+  graphFailed,
+  loadGraph,
+  triggerCompile,
+  origin,
+  isochroneData,
+  isochroneError,
+  isochroneProgress,
+  isochroneFormLoading,
+  nearMisses,
+  realisedClusters,
+  mapStations,
+  mapRoutes,
+  onOriginChange,
+  handleIsochroneSubmit,
+} = useAuthoredGraph(() => props.slug, {
+  compile: compileService,
+  fetchGraph: fetchServiceGraph,
+  isochrone: fetchServiceIsochrone,
+}, { offline: () => routingOffline.value })
+
+const services = computed(() => (service.value ? [service.value] : []))
+
+const stationTimeGroups = computed(() => graphStationTimeGroups(graph.value, services.value))
+
+const stationTimesFailed = computed(() => Boolean(graphFailed.value || (compileError.value && !graph.value)))
+
+// Publishing compiles through the page's own compile, so the graph it pins is
+// the one this page then draws, and a compile fault is reported where every
+// other one here is.
+async function recompile(slug: string): Promise<boolean> {
+  await triggerCompile(slug)
+  return !compileError.value
+}
+
+const { deleting, confirmAndDelete } = useServiceDeletion()
+
+const handovers = useHandovers()
+const pendingHandover = computed(() => handovers.outgoingFor(props.slug))
+
+watch(service, (loaded) => {
+  if (loaded) void loadGraph(loaded.slug)
+}, { immediate: true })
+</script>
+
+<template>
+  <main class="flex-1 p-(--page-padding)">
+    <BreadcrumbTrail :items="[AUTHORING_CRUMB, { label: service?.name ?? 'Line' }]" />
+
+    <PageSkeleton
+      v-if="loading"
+      label="Loading line"
+      subtitle
+      :cards="3"
+      class="mt-8"
+      data-testid="service-loading"
+    />
+
+    <template v-else-if="notFound">
+      <PageHeader
+        class="mt-8"
+        title="Line not found"
+      />
+      <p
+        class="t-body mt-3 text-ink-muted"
+        data-testid="service-not-found"
+      >
+        No line of yours matches "{{ props.slug }}".
+      </p>
+    </template>
+
+    <template v-else-if="error">
+      <PageHeader
+        class="mt-8"
+        title="Something went wrong"
+      />
+      <p
+        class="t-body mt-3 text-ink-muted"
+        role="alert"
+        data-testid="service-error"
+      >
+        Failed to load this line. Please try again.
+      </p>
+    </template>
+
+    <template v-else-if="service">
+      <PageHeader
+        class="mt-8"
+        :title="service.name"
+        :subtitle="service.subtext"
+        subtitle-testid="service-subtext"
+        :slug="service.slug"
+      >
+        <template #actions>
+          <router-link
+            :to="`/authoring/services/${service.slug}/edit`"
+            :class="ACTION_LINK_CLASS"
+            data-testid="edit-service"
+          >
+            Edit
+          </router-link>
+          <button
+            v-if="!pendingHandover"
+            type="button"
+            :class="ACTION_LINK_CLASS"
+            :disabled="handovers.busy.value"
+            data-testid="offer-handover"
+            @click="handovers.offer(service)"
+          >
+            Transfer…
+          </button>
+          <DeleteMenu
+            noun="service"
+            :deleting="deleting"
+            @delete="confirmAndDelete(service)"
+          />
+        </template>
+      </PageHeader>
+      <p
+        v-if="service.description"
+        class="t-body mt-3 max-w-[720px] whitespace-pre-line text-ink-muted"
+        data-testid="service-description"
+      >
+        {{ service.description }}
+      </p>
+
+      <div
+        v-if="pendingHandover"
+        class="mt-6 flex max-w-[720px] flex-wrap items-center justify-between gap-3 rounded-(--radius-box) border border-border bg-surface p-4"
+        data-testid="pending-handover"
+      >
+        <p class="t-meta text-ink">
+          Waiting for {{ pendingHandover.to_name }} to accept this line.
+          The offer expires {{ expiryDate(pendingHandover) }}.
+        </p>
+        <button
+          type="button"
+          :class="SECONDARY_BUTTON_CLASS"
+          :disabled="handovers.busy.value"
+          data-testid="cancel-handover"
+          @click="handovers.cancel(pendingHandover)"
+        >
+          Cancel transfer
+        </button>
+      </div>
+
+      <PublicationControl
+        :slug="service.slug"
+        :updated-at="service.updated_at"
+        :compiling="compiling"
+        :recompile="recompile"
+      />
+
+      
+      <p
+        v-if="compiling && !graph"
+        class="t-note mt-8 text-ink-muted"
+        data-testid="compiling-status"
+      >
+        Compiling this line…
+      </p>
+      <p
+        v-else-if="graphFailed"
+        class="t-error mt-8"
+        role="alert"
+        data-testid="graph-error"
+      >
+        Couldn't load this line's latest build.
+      </p>
+      
+      <p
+        v-else-if="compileError && !graph"
+        class="t-error mt-8"
+        role="alert"
+        data-testid="compile-error"
+      >
+        {{ compileError }}
+      </p>
+
+      <ScenarioPreviewPanel
+        v-else
+        :origin="origin"
+        :isochrone-data="isochroneData"
+        :loading="isochroneFormLoading"
+        :loading-message="isochroneWaitMessage(isochroneProgress)"
+        :error="isochroneError || compileError || null"
+        :near-misses="nearMisses"
+        :realised-clusters="realisedClusters"
+        :services="services"
+        :map-stations="mapStations"
+        :map-routes="mapRoutes"
+        :status-note="compiling ? 'This line changed — recompiling…' : null"
+        @submit="handleIsochroneSubmit"
+        @origin-change="onOriginChange"
+      />
+
+      
+      <div class="mt-8 grid grid-cols-[repeat(auto-fill,minmax(320px,1fr))] items-start gap-4">
+        <section class="rounded-(--radius-box) border border-border bg-surface p-4">
+          <h2 class="font-display text-h3 text-ink-true">
+            Stops
+          </h2>
+          <p
+            v-if="stops.length === 0"
+            class="t-note mt-3 text-ink-muted"
+            data-testid="service-stops-empty"
+          >
+            This line has no stops yet. Edit it to place stops along its route.
+          </p>
+          <ol
+            v-else
+            class="mt-3 flex flex-col gap-2"
+          >
+            <li
+              v-for="stop in stops"
+              :key="stop.seq"
+              class="t-meta flex justify-between gap-3 text-ink"
+              data-testid="service-stop-row"
+            >
+              <span>{{ stop.seq + 1 }}. {{ stop.name }}</span>
+              <span class="text-ink-muted">{{ stop.lat.toFixed(4) }}, {{ stop.lng.toFixed(4) }}</span>
+            </li>
+          </ol>
+        </section>
+
+        <TimeBetweenStations
+          v-if="!stationTimesFailed"
+          :groups="stationTimeGroups"
+          :loading="!graph"
+        />
+
+        <section class="rounded-(--radius-box) border border-border bg-surface p-4">
+          <h2 class="font-display text-h3 text-ink-true">
+            Vehicle
+          </h2>
+          <dl class="t-meta mt-3 flex flex-col gap-1 text-ink">
+            <div class="flex justify-between gap-3">
+              <dt class="text-ink-muted">
+                Max speed
+              </dt>
+              <dd>{{ service.vehicle.max_speed_kmh }} km/h</dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="text-ink-muted">
+                Acceleration
+              </dt>
+              <dd>{{ service.vehicle.acceleration_ms2 }} m/s²</dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="text-ink-muted">
+                Deceleration
+              </dt>
+              <dd>{{ service.vehicle.deceleration_ms2 }} m/s²</dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="text-ink-muted">
+                Dwell
+              </dt>
+              <dd>{{ service.vehicle.dwell_s }} s</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="rounded-(--radius-box) border border-border bg-surface p-4">
+          <h2 class="font-display text-h3 text-ink-true">
+            Frequency
+          </h2>
+          <p
+            v-if="service.frequency_windows.length === 0"
+            class="t-note mt-3 text-ink-muted"
+            data-testid="service-windows-empty"
+          >
+            This line has no timetable yet. Edit it to say how often it runs.
+          </p>
+          <ul
+            v-else
+            class="mt-3 flex flex-col gap-1"
+          >
+            <li
+              v-for="(window, index) in service.frequency_windows"
+              :key="index"
+              class="t-meta text-ink"
+              data-testid="service-window-row"
+            >
+              {{ window.start_time }}–{{ window.end_time }}, every {{ Math.round(window.headway_s / 60) }} min
+            </li>
+          </ul>
+        </section>
+      </div>
+    </template>
+  </main>
+</template>

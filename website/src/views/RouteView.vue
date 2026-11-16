@@ -1,0 +1,111 @@
+<script setup lang="ts">
+import { computed } from 'vue'
+import AllLinesLink from '../components/AllLinesLink.vue'
+import MapView from '../components/MapView.vue'
+import PageSkeleton from '../components/PageSkeleton.vue'
+import { fetchRoute } from '../api/authoring/routes'
+import type { Route } from '../api/authoring'
+import { useOwnedDetail } from '../composables/useOwnedDetail'
+import { usePageTitle } from '../composables/usePageTitle'
+import type { Route as ScenarioRoute } from '../api/scenarios'
+import PageHeader from '../components/PageHeader.vue'
+
+const props = defineProps<{ slug: string }>()
+
+const { item: route, loading, notFound, error } = useOwnedDetail<Route>(fetchRoute, props.slug)
+
+usePageTitle(() => route.value?.name)
+
+const mapRoutes = computed<ScenarioRoute[]>(() => {
+  if (!route.value) return []
+  return [{
+    id: route.value.id,
+    scenario_id: route.value.scenario_id ?? '',
+    name: route.value.name,
+    mode: route.value.mode,
+    geometry: route.value.geometry,
+    bidirectional: route.value.bidirectional,
+  }]
+})
+</script>
+
+<template>
+  <main class="flex-1 p-(--page-padding)">
+    <div class="mb-8">
+      <AllLinesLink />
+    </div>
+
+    <PageSkeleton
+      v-if="loading"
+      label="Loading route"
+      data-testid="route-loading"
+    />
+
+    <template v-else-if="notFound">
+      <PageHeader title="Route not found" />
+      <p class="t-body mt-3 text-ink-muted">
+        No route matches "{{ props.slug }}".
+      </p>
+    </template>
+
+    <template v-else-if="error">
+      <PageHeader title="Something went wrong" />
+      <p class="t-body mt-3 text-ink-muted">
+        Failed to load this route. Please try again.
+      </p>
+    </template>
+
+    <template v-else-if="route">
+      <PageHeader :title="route.name" />
+
+      <div class="mt-8 grid grid-cols-1 items-start gap-4 lg:grid-cols-[2fr_1fr]">
+        <div class="h-[70vh]">
+          <MapView
+            label="Route map"
+            :loading="false"
+            :isochrone-data="null"
+            :routes="mapRoutes"
+            :stations="[]"
+            hide-isochrone-legend
+          />
+        </div>
+
+        <section class="rounded-(--radius-box) border border-border bg-surface p-4">
+          <h2 class="font-display text-h3 text-ink-true">
+            Segment physics
+          </h2>
+          <table class="t-meta mt-3 w-full text-ink">
+            <thead>
+              <tr class="text-ink-muted">
+                <th class="text-left font-normal">
+                  Segment
+                </th>
+                <th class="text-left font-normal">
+                  Cant
+                </th>
+                <th class="text-left font-normal">
+                  Curve radius
+                </th>
+                <th class="text-left font-normal">
+                  Grade
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="(segment, index) in route.segments"
+                :key="index"
+                data-testid="route-segment-row"
+              >
+                <td>{{ index + 1 }}</td>
+                <td>{{ segment.cant_mm }} mm</td>
+                <td>{{ segment.curve_radius_m > 0 ? `${segment.curve_radius_m} m` : 'Tangent' }}</td>
+                <td>{{ segment.grade_pct }}%</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+      </div>
+    </template>
+  </main>
+</template>

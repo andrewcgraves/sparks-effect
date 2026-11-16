@@ -1,0 +1,50 @@
+<script setup lang="ts" generic="T extends string | number">
+import { SELECTED_CHOICE_CLASS } from './buttonStyles'
+
+withDefaults(
+  defineProps<{
+    modelValue: T
+    options: readonly T[]
+    label: string
+    formatOption?: (value: T) => string
+    name?: string
+    testid?: string
+  }>(),
+  {
+    formatOption: (value: T) => String(value),
+    name: 'segmented-control',
+    testid: 'segmented-control',
+  },
+)
+
+const emit = defineEmits<{
+  'update:modelValue': [value: T]
+}>()
+</script>
+
+<template>
+  <div
+    class="inline-flex flex-wrap gap-1 rounded-(--radius-selector) border border-border bg-surface p-1"
+    role="radiogroup"
+    :aria-label="label"
+    :data-testid="testid"
+  >
+    <label
+      v-for="option in options"
+      :key="option"
+      class="t-meta cursor-pointer rounded-(--radius-selector) border px-3 py-1.5 transition-colors duration-200 ease-(--ease-smooth) has-focus-visible:outline-(length:--focus-ring-width) has-focus-visible:outline-offset-(--focus-ring-offset) has-focus-visible:outline-focus"
+      :class="option === modelValue ? SELECTED_CHOICE_CLASS : 'border-transparent text-ink-muted hover:text-ink'"
+    >
+      <input
+        type="radio"
+        :name="name"
+        class="sr-only"
+        :value="option"
+        :checked="option === modelValue"
+        :data-testid="`${testid}-option-${option}`"
+        @change="emit('update:modelValue', option)"
+      >
+      {{ formatOption(option) }}
+    </label>
+  </div>
+</template>

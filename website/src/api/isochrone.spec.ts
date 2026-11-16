@@ -1,0 +1,180 @@
+// @vitest-environment node
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { fetchIsochrone, type IsochroneRequest } from './isochrone'
+import { ApiError } from './authoring/client'
+import type { ChainResponse } from '../fixtures/isochrone'
+
+const validRequest: IsochroneRequest = {
+  lat: 37.3382,
+  lng: -121.8863,
+  budget_mins: 90,
+  mode: 'walk',
+  scenario_slug: 'ca-hsr',
+}
+
+const mockChainResponse: ChainResponse = {
+  type: 'FeatureCollection',
+  features: [],
+  metadata: {
+    reachable_stations: [],
+    origin_budget_mins: 90,
+    compile_job_id: 'compile-1',
+    mode: 'walk',
+    wait_model: 'half-headway',
+    origin_iso_available: true,
+  },
+}
+
+function enqueueThenSucceed(): void {
+  vi.mocked(fetch)
+    .mockResolvedValueOnce({ ok: true, status: 202, json: async () => ({ id: 'rj1' }) } as Response)
+    .mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: 'rj1', status: 'succeeded', result: mockChainResponse }),
+    } as Response)
+}
+
+describe('fetchIsochrone', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn())
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+    vi.unstubAllGlobals()
+  })
+
+  it('sends a POST request to /api/isochrone', async () => {
+    enqueueThenSucceed()
+
+    await fetchIsochrone(validRequest)
+
+    const [url, init] = vi.mocked(fetch).mock.calls[0]
+    expect(url).toContain('/api/isochrone')
+    expect(init?.method).toBe('POST')
+  })
+
+  it('sends the request body as JSON', async () => {
+    enqueueThenSucceed()
+
+    await fetchIsochrone(validRequest)
+
+    const [, init] = vi.mocked(fetch).mock.calls[0]
+    expect(JSON.parse(init?.body as string)).toEqual(validRequest)
+    expect(new Headers(init?.headers).get('Content-Type')).toBe('application/json')
+  })
+
+  it('sends transit as the mode when asked', async () => {
+    enqueueThenSucceed()
+    await fetchIsochrone({ ...validRequest, mode: 'transit' })
+    const [, init] = vi.mocked(fetch).mock.calls[0]
+    expect(JSON.parse(init?.body as string).mode).toBe('transit')
+  })
+
+  it('defaults base URL to http://localhost:8080 when VITE_API_BASE_URL is unset', async () => {
+    enqueueThenSucceed()
+
+    await fetchIsochrone(validRequest)
+
+    const [url] = vi.mocked(fetch).mock.calls[0]
+    expect(url).toBe('http://localhost:8080/api/isochrone')
+  })
+
+  it('uses VITE_API_BASE_URL when set', async () => {
+    vi.stubEnv('VITE_API_BASE_URL', 'https://api.example.com')
+    enqueueThenSucceed()
+
+    await fetchIsochrone(validRequest)
+
+    const [url] = vi.mocked(fetch).mock.calls[0]
+    expect(url).toBe('https://api.example.com/api/isochrone')
+  })
+
+  it('returns the chain the routing job succeeded with', async () => {
+    enqueueThenSucceed()
+
+    const result = await fetchIsochrone(validRequest)
+
+    expect(result).toEqual(mockChainResponse)
+  })
+
+  it('throws an ApiError carrying the status when the enqueue is rejected', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 500 } as Response)
+
+    await expect(fetchIsochrone(validRequest)).rejects.toThrow('500')
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1)
+  })
+
+  it('sets the status property on the thrown ApiError', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({ ok: false, status: 422 } as Response)
+
+    await fetchIsochrone(validRequest).then(
+      () => { throw new Error('expected rejection') },
+      (err: unknown) => {
+        expect(err).toBeInstanceOf(ApiError)
+        expect((err as ApiError).status).toBe(422)
+      },
+    )
+  })
+
+  // SPA-290: a seeded isochrone used to arrive in a second envelope that kept
+  // only the status, so the code and detail that name the fault were reachable
+  // only through `cause`. One envelope, and the whole vocabulary survives.
+  it('keeps the error code and detail of a refused enqueue', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 422,
+      json: async () => ({
+        error: 'too far',
+        code: 'origin_out_of_range',
+        detail: { nearest_station_km: 60.6, max_reach_km: 2.5 },
+      }),
+    } as Response)
+
+    await fetchIsochrone(validRequest).then(
+      () => { throw new Error('expected rejection') },
+      (err: unknown) => {
+        expect(err).toBeInstanceOf(ApiError)
+        expect((err as ApiError).code).toBe('origin_out_of_range')
+        expect((err as ApiError).detail).toEqual({ nearest_station_km: 60.6, max_reach_km: 2.5 })
+      },
+    )
+  })
+
+  // A rejected poll is still this request failing, and it reaches callers the
+  // same way a rejected enqueue does.
+  it('reports a rejected poll as an ApiError carrying the poll status', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: true, status: 202, json: async () => ({ id: 'rj1' }) } as Response)
+      .mockResolvedValueOnce({ ok: false, status: 404, json: async () => ({}) } as Response)
+
+    await fetchIsochrone(validRequest).then(
+      () => { throw new Error('expected rejection') },
+      (err: unknown) => {
+        expect(err).toBeInstanceOf(ApiError)
+        expect((err as ApiError).status).toBe(404)
+      },
+    )
+  })
+
+  it('throws when the routing job fails', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce({ ok: true, status: 202, json: async () => ({ id: 'rj1' }) } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ id: 'rj1', status: 'failed', error: 'valhalla unreachable' }),
+      } as Response)
+
+    await expect(fetchIsochrone(validRequest)).rejects.toThrow(/valhalla unreachable/)
+  })
+
+  it('throws when the network request fails', async () => {
+    vi.mocked(fetch).mockRejectedValueOnce(new Error('network error'))
+
+    await expect(fetchIsochrone(validRequest)).rejects.toThrow('network error')
+  })
+})

@@ -1,0 +1,97 @@
+import { apiRequest } from './authoring/client'
+
+export type Provenance = 'computed' | 'calibrated' | 'frozen'
+
+export interface Route {
+  id: string
+  scenario_id: string
+  name: string
+  mode: string
+  geometry: { type: 'LineString'; coordinates: number[][] }
+  bidirectional: boolean
+}
+
+export interface Station {
+  id: string
+  scenario_id: string
+  slug: string
+  name: string
+  location: { type: 'Point'; coordinates: [number, number] }
+  platform_height: string
+}
+
+export interface VehicleTypeSummary {
+  id: string
+  name: string
+  propulsion: string
+  max_speed_kmh: number
+}
+
+export interface FrequencyWindow {
+  id: string
+  service_id: string
+  start_time: string
+  end_time: string
+  headway_s: number
+}
+
+export interface Service {
+  id: string
+  route_id?: string
+  name: string
+  vehicle_type: VehicleTypeSummary
+  direction: string
+  provenance: Provenance
+  stop_count: number
+  frequency_windows: FrequencyWindow[]
+}
+
+export interface SegmentTime {
+  from: string
+  to: string
+  run_seconds: number
+  reverse_run_seconds?: number
+  route_id?: string
+}
+
+export interface TravelTimes {
+  scenario_slug: string
+  provenance: Provenance
+  source: string
+  segments: SegmentTime[]
+}
+
+export interface ScenarioDetail {
+  id: string
+  slug: string
+  name: string
+  subtext?: string
+  plot_label?: string
+  description: string
+  status: string
+  routes: Route[]
+  stations: Station[]
+  services: Service[]
+}
+
+export function fetchScenario(scenarioSlug: string): Promise<ScenarioDetail> {
+  return apiRequest<ScenarioDetail>(`/api/scenarios/${scenarioSlug}`)
+}
+
+export function fetchScenarioTravelTimes(scenarioSlug: string): Promise<TravelTimes> {
+  return apiRequest<TravelTimes>(`/api/scenarios/${scenarioSlug}/travel-times`)
+}
+
+export interface ScenarioSummary {
+  slug: string
+  name: string
+  subtext?: string
+  description: string
+}
+
+// The curated list only: GET /api/scenarios never serves an owned scenario, and
+// a published service is a different model with its own index
+// (listPublishedServices).
+export function listCuratedScenarios(): Promise<ScenarioSummary[]> {
+  return apiRequest<ScenarioSummary[]>('/api/scenarios')
+}
