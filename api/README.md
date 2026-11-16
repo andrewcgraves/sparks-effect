@@ -270,6 +270,12 @@ height (or a per-stop override) and folded into `Edge.Seconds`. `DwellS` is
 the dwell *part* of `Seconds`, not an extra addend. See **Dwell** (and **Run
 time** for the seed-field semantics) in [`CONTEXT.md`](CONTEXT.md).
 
+`ca-hsr`'s Phase 1 segments are a fit to the 2026 Business Plan's all-stop
+matrix, plus one exception: a direct `sf` → `los-angeles` segment that only
+the **HSR Nonstop** rides, timed to the Prop 1A target of 2h40 each way
+(SPA-534). The HSR Express and HSR Local never take it, because the compiler
+walks the segment path with the fewest hops between consecutive stops.
+
 ### Provenance tiers
 
 Services carry a provenance tier that gates which editor levers are honest. The
@@ -286,7 +292,7 @@ and tags.
 
 ## Requirements
 
-- [Go](https://go.dev/dl/) 1.26.10+
+- [Go](https://go.dev/dl/) 1.26.11+
 - [Docker](https://www.docker.com/) (optional; for containerized runs and the
   database integration tests — podman also works)
 - `golangci-lint` (installed automatically by `make lint` if missing)
