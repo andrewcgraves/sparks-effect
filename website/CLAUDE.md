@@ -19,9 +19,9 @@ route map's ridden / unridden / unfinished line states, and the time-remaining
 graph's view / row / lane / through / fork. Shared domain vocabulary (scenario,
 service, station, node, edge, dwell, boarding wait, mode vs costing, the error
 codes, the job statuses) is defined once in
-[sparks-effect-api's `CONTEXT.md`](https://github.com/andrewcgraves/sparks-effect-api/blob/main/CONTEXT.md),
+[the API's `CONTEXT.md`](../api/CONTEXT.md),
 and chain vocabulary in
-[sparks-effect-routing-worker's](https://github.com/andrewcgraves/sparks-effect-routing-worker/blob/main/CONTEXT.md).
+[the worker's](../worker/CONTEXT.md).
 Use those words; do not mint synonyms. Visitor copy follows the Product
 vocabulary table in `CONTEXT.md`: product words (line, network, route, splash
 zone) in anything a person reads, domain words in identifiers, test ids, router
@@ -39,7 +39,9 @@ must include the identifier in the subject, e.g. `SPA-84: add authoring API clie
 
 ## Branching
 
-One trunk: `trunk`. Branch from it, PR into it. No `prd` branch here —
-production is promoted by pushing a `vX.Y.Z` tag on a commit that is already on
-`trunk`, which promotes the Vercel build that commit already produced. See
-`docs/releases.md`.
+One trunk: `main`, shared with the API (`../api`) and the worker (`../worker`).
+Branch from it, PR into it. No `prd` branch here — production is promoted by
+pushing a `website/vX.Y.Z` tag on a commit that is already on `main`, which
+promotes the Vercel build of the website that commit already had. The workflows
+are `.github/workflows/website.yml` and `website-release.yml` at the repository
+root. See `docs/releases.md`.

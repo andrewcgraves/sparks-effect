@@ -22,7 +22,7 @@ describe('VEHICLE_PRESETS', () => {
   })
 
   it('anchors high-speed rail on the seeded CA HSR vehicle', () => {
-    // sparks-effect-api/internal/transit/data/scenarios/ca-hsr/vehicle_types.yaml,
+    // api/internal/transit/data/scenarios/ca-hsr/vehicle_types.yaml,
     // Siemens Venture EMU: 320 km/h, 0.5 / 0.65 m/s², 90 s level-boarding dwell.
     expect(presetVehicle('high_speed_rail')).toEqual({
       max_speed_kmh: 320,

@@ -1,27 +1,31 @@
-name: Release
+name: Website release
 
-# Production is reached by tagging a commit, and by nothing else.
+# The website's production is reached by tagging a commit, and by nothing else.
 #
-# The tag names a commit that is already on `trunk` and that Vercel already
-# built and served as staging. This workflow never builds: it points Vercel's
-# production domains at that existing deployment. A tag that does not point
-# into `trunk`'s history is refused, so a feature branch has no path to
-# production even if someone tags it.
+# The tag is `website/vMAJOR.MINOR.PATCH` — namespaced because the API and the
+# worker release from this repository too. It names a commit that is already on
+# `main`, whose website Vercel already built and served as staging. This
+# workflow never builds: it points Vercel's production domains at that existing
+# deployment. A tag that does not point into `main`'s history is refused, so a
+# feature branch has no path to production even if someone tags it.
 #
-# Vercel's own git integration must not treat `trunk` as the production branch —
+# Vercel's own git integration must not treat `main` as the production branch —
 # otherwise a merge ships to production behind this workflow's back. See
-# `docs/releases.md`.
+# `website/docs/releases.md`.
+#
+# Only tag pushes and manual runs trigger this, never a pull request, so a fork
+# cannot reach the Vercel or Linear credentials.
 on:
   push:
-    tags: ["v*"]
+    tags: ["website/v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to promote, e.g. v1.4.2. Pass an older tag to roll back."
+        description: "Existing release tag to promote, e.g. website/v1.4.2. Pass an older tag to roll back."
         required: true
         type: string
       base_ref:
-        description: "Optional exclusive git ref for Linear's commit scan (e.g. v0.1.0). Leave empty to scan from the previous git tag."
+        description: "Optional exclusive git ref for Linear's commit scan (e.g. website/v0.1.0, or a commit SHA for the first monorepo release). Leave empty to scan from the previous website/v* tag."
         required: false
         type: string
       linear_only:
@@ -33,12 +37,18 @@ on:
 # Two promotions racing would leave production on whichever alias switch landed
 # last rather than whichever was asked for last.
 concurrency:
-  group: release-production
+  group: website-release-production
   cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   promote:
     name: Promote deployment to production
+    # The PRODUCTION_RELEASE_ENABLED repository variable is the cutover switch:
+    # until it is 'true' a tag push or a manual run does nothing at all.
+    if: vars.PRODUCTION_RELEASE_ENABLED == 'true'
     runs-on: ubuntu-latest
     # Scopes the Vercel credential to production and gives the repo one place to
     # require an approval before prd moves.
@@ -67,8 +77,8 @@ jobs:
           set -euo pipefail
           tag="${REQUESTED_TAG:-$GITHUB_REF_NAME}"
 
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
-            echo "::error::'$tag' is not a release tag (expected vMAJOR.MINOR.PATCH)"
+          if [[ ! "$tag" =~ ^website/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$tag' is not a website release tag (expected website/vMAJOR.MINOR.PATCH)"
             exit 1
           fi
 
@@ -81,48 +91,86 @@ jobs:
           # the ref directly would hand the tag object's own SHA to the checks.
           sha="$(git rev-list -n 1 "refs/tags/$tag")"
 
-          git fetch --no-tags origin trunk
-          if ! git merge-base --is-ancestor "$sha" origin/trunk; then
-            echo "::error::$tag points at $sha, which is not on trunk — refusing to promote"
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "::error::$tag points at $sha, which is not on main — refusing to promote"
             exit 1
           fi
+
+          # Vercel's Ignored Build Step skips a commit that changed nothing
+          # under website/, so the tagged commit may have no deployment of its
+          # own. What staging served for it is the build of the last commit at
+          # or before the tag that touched website/.
+          website_sha="$(git rev-list -1 "$sha" -- website)"
+          if [[ -z "$website_sha" ]]; then
+            echo "::error::no commit at or before $tag touches website/"
+            exit 1
+          fi
+
+          # Vercel builds only the newest commit of a push. When one push
+          # carried that website commit together with later commits that left
+          # website/ alone, the build is recorded against one of those later
+          # commits instead. They are tried after it, oldest first; each has
+          # the same website/ tree as the tag, so the build is the same either
+          # way.
+          tree="$(git rev-parse "$sha:website")"
+          candidates="$website_sha"
+          while read -r commit; do
+            if [[ "$(git rev-parse "$commit:website" 2>/dev/null)" == "$tree" ]]; then
+              candidates="$candidates $commit"
+            fi
+          done < <(git rev-list --reverse --ancestry-path "$website_sha..$sha" | head -n 50)
 
           {
             echo "tag=$tag"
             echo "sha=$sha"
+            echo "website_sha=$website_sha"
+            echo "candidates=$candidates"
           } >> "$GITHUB_OUTPUT"
 
       - name: Find the deployment Vercel built from that commit
         if: github.event.inputs.linear_only != 'true'
         id: deployment
         env:
-          SHA: ${{ steps.target.outputs.sha }}
+          WEBSITE_SHA: ${{ steps.target.outputs.website_sha }}
+          CANDIDATES: ${{ steps.target.outputs.candidates }}
         run: |
           set -euo pipefail
-          query="projectId=$VERCEL_PROJECT_ID&state=READY&limit=100&meta-githubCommitSha=$SHA"
-          # A personal account's org id is a user id, which this endpoint rejects
-          # as a teamId; only a team's belongs on the query.
-          if [[ "$VERCEL_ORG_ID" == team_* ]]; then
-            query="$query&teamId=$VERCEL_ORG_ID"
-          fi
+          uid=""
+          url=""
+          built_sha=""
+          for candidate in $CANDIDATES; do
+            query="projectId=$VERCEL_PROJECT_ID&state=READY&limit=100&meta-githubCommitSha=$candidate"
+            # A personal account's org id is a user id, which this endpoint
+            # rejects as a teamId; only a team's belongs on the query.
+            if [[ "$VERCEL_ORG_ID" == team_* ]]; then
+              query="$query&teamId=$VERCEL_ORG_ID"
+            fi
 
-          response="$(curl -sS --fail-with-body \
-            -H "Authorization: Bearer $VERCEL_TOKEN" \
-            "https://api.vercel.com/v6/deployments?$query")"
+            response="$(curl -sS --fail-with-body \
+              -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v6/deployments?$query")"
 
-          # Newest first: a commit can have been deployed more than once (a
-          # retried build), and the last successful one is what staging served.
-          uid="$(jq -r '[.deployments[]] | sort_by(.created) | reverse | .[0].uid // empty' <<<"$response")"
-          url="$(jq -r '[.deployments[]] | sort_by(.created) | reverse | .[0].url // empty' <<<"$response")"
+            # Newest first: a commit can have been deployed more than once (a
+            # retried build), and the last successful one is what staging served.
+            uid="$(jq -r '[.deployments[]] | sort_by(.created) | reverse | .[0].uid // empty' <<<"$response")"
+            url="$(jq -r '[.deployments[]] | sort_by(.created) | reverse | .[0].url // empty' <<<"$response")"
+
+            if [[ -n "$uid" ]]; then
+              built_sha="$candidate"
+              break
+            fi
+          done
 
           if [[ -z "$uid" ]]; then
-            echo "::error::no ready Vercel deployment for $SHA — nothing built from that commit to promote"
+            echo "::error::no ready Vercel deployment for $WEBSITE_SHA (the last commit to touch website/) or any later commit up to the tag — nothing built to promote"
             exit 1
           fi
 
           {
             echo "uid=$uid"
             echo "url=$url"
+            echo "built_sha=$built_sha"
           } >> "$GITHUB_OUTPUT"
 
       # Promoted over HTTP rather than with `vercel promote`: before it will act,
@@ -135,8 +183,8 @@ jobs:
       #
       # Which call promotes depends on what the deployment was built as, exactly
       # as the CLI decides it. /promote only accepts a deployment already built
-      # for production and answers 422 for anything else, and `trunk` is the
-      # staging branch here — see docs/releases.md.
+      # for production and answers 422 for anything else, and `main` is the
+      # staging branch here — see website/docs/releases.md.
       - name: Promote it to production
         if: github.event.inputs.linear_only != 'true'
         env:
@@ -213,8 +261,8 @@ jobs:
           else
             # Built for staging, so Vercel will only move it to production by
             # creating a production deployment from it — the same request
-            # `vercel promote --yes` makes. Per docs/releases.md this is
-            # byte-for-byte only while `trunk` builds with production's
+            # `vercel promote --yes` makes. Per website/docs/releases.md this is
+            # byte-for-byte only while `main` builds with production's
             # environment variables; otherwise Vercel rebuilds here.
             echo "::notice::$UID was built for '${target:-preview}', creating a production deployment from it"
 
@@ -254,9 +302,9 @@ jobs:
             fi
           fi
 
-      # Linear scans this working tree, so it must be the promoted commit —
-      # not `trunk`. A tag push already checks out that SHA; workflow_dispatch
-      # of an older tag would otherwise scan trunk HEAD and attach issues
+      # Linear scans this working tree, so it must be the tagged commit —
+      # not `main`. A tag push already checks out that SHA; workflow_dispatch
+      # of an older tag would otherwise scan main HEAD and attach issues
       # that are not in the promoted deployment.
       - name: Check out the promoted commit
         env:
@@ -265,32 +313,37 @@ jobs:
 
       # Production is a different Linear pipeline from staging: the same issue
       # can sit on staging for a while before a tag promotes it, and staging
-      # can already be several commits ahead. See docs/releases.md.
+      # can already be several commits ahead. See website/docs/releases.md.
       #
       # Secrets cannot be referenced in `if:` (GitHub treats that as a
       # workflow-file error), so the empty check lives in a shell step.
       - name: Check for the production pipeline key
         id: linear
         env:
-          LINEAR_ACCESS_KEY_PRODUCTION: ${{ secrets.LINEAR_ACCESS_KEY_PRODUCTION }}
+          LINEAR_ACCESS_KEY_PRODUCTION: ${{ secrets.WEBSITE_LINEAR_ACCESS_KEY_PRODUCTION }}
         run: |
           set -euo pipefail
           if [[ -z "${LINEAR_ACCESS_KEY_PRODUCTION:-}" ]]; then
-            echo "::notice::LINEAR_ACCESS_KEY_PRODUCTION is not set — add the Website Build Production access key as a secret on the production environment"
+            echo "::notice::WEBSITE_LINEAR_ACCESS_KEY_PRODUCTION is not set — add the Website Build Production access key as a secret on the production environment"
             echo "configured=false" >> "$GITHUB_OUTPUT"
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
       # Operator base_ref wins. Otherwise the exclusive lower bound is the
-      # previous vMAJOR.MINOR.PATCH tag, so a production release records every
-      # issue since the last tag went to production — including when Linear
-      # has no prior release SHA of its own. See docs/releases.md.
+      # previous website/vMAJOR.MINOR.PATCH tag, so a production release
+      # records every issue since the last tag went to production — including
+      # when Linear has no prior release SHA of its own. See
+      # website/docs/releases.md.
+      #
+      # The first release from this repository has no previous tag: the old
+      # repository's bare v* tags were not imported. That is not an error. The
+      # scan then starts at the `base_ref` input if one was given, and at
+      # Linear's automatic baseline otherwise.
       #
       # Two Linear steps because `base_ref` has no "unset" value once written
       # — passing it empty would scan from nothing rather than letting Linear
-      # pick its automatic baseline (the true first tag, with no previous git
-      # tag to bound from).
+      # pick its automatic baseline.
       - name: Resolve Linear scan base
         id: scan
         env:
@@ -306,7 +359,7 @@ jobs:
             exit 0
           fi
 
-          prev="$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${SHA}^" 2>/dev/null || true)"
+          prev="$(git describe --tags --abbrev=0 --match 'website/v[0-9]*' "${SHA}^" 2>/dev/null || true)"
           if [[ -n "$prev" ]]; then
             echo "base_ref=${prev}" >> "$GITHUB_OUTPUT"
             echo "Scanning from previous tag ${prev}"
@@ -319,9 +372,11 @@ jobs:
         if: steps.linear.outputs.configured == 'true' && steps.scan.outputs.base_ref == ''
         uses: linear/linear-release-action@v0
         with:
-          access_key: ${{ secrets.LINEAR_ACCESS_KEY_PRODUCTION }}
+          access_key: ${{ secrets.WEBSITE_LINEAR_ACCESS_KEY_PRODUCTION }}
           name: ${{ steps.target.outputs.tag }}
           version: ${{ steps.target.outputs.tag }}
+          # Only commits that touched the website belong to this pipeline.
+          include_paths: "website/**"
           links: |
             Commit=${{ github.server_url }}/${{ github.repository }}/commit/${{ steps.target.outputs.sha }}
             CI run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -330,9 +385,11 @@ jobs:
         if: steps.linear.outputs.configured == 'true' && steps.scan.outputs.base_ref != ''
         uses: linear/linear-release-action@v0
         with:
-          access_key: ${{ secrets.LINEAR_ACCESS_KEY_PRODUCTION }}
+          access_key: ${{ secrets.WEBSITE_LINEAR_ACCESS_KEY_PRODUCTION }}
           name: ${{ steps.target.outputs.tag }}
           version: ${{ steps.target.outputs.tag }}
+          # Only commits that touched the website belong to this pipeline.
+          include_paths: "website/**"
           base_ref: ${{ steps.scan.outputs.base_ref }}
           links: |
             Commit=${{ github.server_url }}/${{ github.repository }}/commit/${{ steps.target.outputs.sha }}
@@ -344,6 +401,7 @@ jobs:
           SHA: ${{ steps.target.outputs.sha }}
           URL: ${{ steps.deployment.outputs.url }}
           UID: ${{ steps.deployment.outputs.uid }}
+          BUILT_SHA: ${{ steps.deployment.outputs.built_sha }}
           LINEAR_ONLY: ${{ github.event.inputs.linear_only }}
           BASE_REF: ${{ steps.scan.outputs.base_ref }}
         run: |
@@ -357,11 +415,11 @@ jobs:
               echo "### Promoted \`$TAG\` to production"
               echo
               echo "- commit: \`$SHA\`"
-              echo "- deployment: \`$UID\` (https://$URL)"
+              echo "- deployment: \`$UID\` (https://$URL), built from \`$BUILT_SHA\`"
             fi
             if [[ -n "${BASE_REF:-}" ]]; then
               echo "- Linear scan: \`${BASE_REF}..HEAD\`"
             else
-              echo "- Linear scan: automatic baseline (no previous git tag)"
+              echo "- Linear scan: automatic baseline (no previous website/v* tag)"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

@@ -5,10 +5,10 @@ Words that mean something specific in this repository and nowhere else.
 Shared domain vocabulary — scenario, service, station, stop, node, edge, dwell,
 boarding wait, mode vs costing, the error codes, the job statuses — is defined
 once in
-[**sparks-effect-api's `CONTEXT.md`**](https://github.com/andrewcgraves/sparks-effect-api/blob/main/CONTEXT.md).
+[**the API's `CONTEXT.md`**](../api/CONTEXT.md).
 Chain vocabulary — access leg, egress leg, journey, leg, reached vs reachable,
 starter walk — is defined in
-[**sparks-effect-routing-worker's `CONTEXT.md`**](https://github.com/andrewcgraves/sparks-effect-routing-worker/blob/main/CONTEXT.md),
+[**the worker's `CONTEXT.md`**](../worker/CONTEXT.md),
 and arrives here verbatim as the `metadata` block of a chain response
 (`src/fixtures/isochrone.ts`). Read those first; this file only adds what is
 local.

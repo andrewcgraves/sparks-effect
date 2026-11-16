@@ -5,8 +5,10 @@ walking, biking, transit, and driving from an imaginary transit line, talking to
 
 ## Branching and releases
 
-One trunk: `trunk`. Branch from it, PR into it. Production is promoted in Vercel
-from an existing build — see [`docs/releases.md`](docs/releases.md).
+This directory is the website's part of the `sparks-effect` monorepo, next to
+the API (`../api`) and the worker (`../worker`). One trunk: `main`. Branch from
+it, PR into it. Production is promoted in Vercel from an existing build by a
+`website/vX.Y.Z` tag — see [`docs/releases.md`](docs/releases.md).
 
 ## Prerequisites
 
@@ -130,7 +132,7 @@ built at all.
 
 ### Configuration
 
-Set in Vercel for the Production environment, which `trunk` (staging) is built
+Set in Vercel for the Production environment, which `main` (staging) is built
 with as well. Values come from the app's page in Frontend Observability:
 
 | Variable | Where it is used |
@@ -407,4 +409,6 @@ A curated scenario or a published service can be framed by another site:
 - `middleware.ts` — Vercel Routing Middleware for link previews, carrying the security headers onto the pages it answers (above)
 - `api/` — Vercel Functions for `/robots.txt` and `/sitemap.xml` (above)
 - `src/` — Vue application source
-- `.github/workflows/ci.yml` — CI: a production-dependency `npm audit`, lint + test on every push/PR, then build
+- `../.github/workflows/website.yml` — CI, at the repository root: a production-dependency `npm audit`, lint + test, then build, on every push/PR that changes `website/`
+- `../.github/workflows/website-release.yml` — promotes a `website/vX.Y.Z` tag to production
+- `scripts/vercel-ignore-build.sh` — Vercel's Ignored Build Step: skips the build for a commit that changed nothing under `website/`

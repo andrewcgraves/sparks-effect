@@ -1,9 +1,27 @@
-name: CI
+name: Website
 
+# The website's CI. It only runs for changes under `website/` (or to this
+# file), so an API or worker change does not pay for a frontend build.
 on:
   push:
-    branches: [trunk]
+    branches: [main]
+    paths:
+      - website/**
+      - .github/workflows/website.yml
   pull_request:
+    paths:
+      - website/**
+      - .github/workflows/website.yml
+  workflow_dispatch:
+
+# Nothing here writes to the repository. A pull request from a fork gets this
+# read-only token and no secrets.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: website
 
 jobs:
   # One job rather than two. The build used to live in a separate job that
@@ -18,8 +36,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version-file: .nvmrc
+          node-version-file: website/.nvmrc
           cache: npm
+          cache-dependency-path: website/package-lock.json
       - run: npm ci
       # Fails on a high or critical advisory in what ships to browsers.
       # --omit=dev leaves out the build and test toolchain, whose advisories
@@ -30,14 +49,18 @@ jobs:
       # `build` is `vue-tsc -b && vite build`, so this covers the typecheck too.
       - run: npm run build
 
-  # Staging is whatever `trunk` last passed CI (Vercel already deploys it).
-  # Linear's staging pipeline is a separate stream from production because
-  # the two environments can hold different commits at the same time —
-  # see docs/releases.md.
+  # Staging is whatever `main` last passed CI with a change under `website/`
+  # (Vercel already deploys it). Linear's staging pipeline is a separate stream
+  # from production because the two environments can hold different commits at
+  # the same time — see website/docs/releases.md.
+  #
+  # Never runs for a pull request, so a fork cannot reach the Linear key. The
+  # STAGING_DEPLOY_ENABLED repository variable is the cutover switch: until it
+  # is 'true' this job is skipped and nothing is written to Linear.
   linear-staging:
     name: Record staging release in Linear
     needs: [ci]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/trunk'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.STAGING_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -54,11 +77,11 @@ jobs:
       - name: Check for the staging pipeline key
         id: linear
         env:
-          LINEAR_ACCESS_KEY_STAGING: ${{ secrets.LINEAR_ACCESS_KEY_STAGING }}
+          LINEAR_ACCESS_KEY_STAGING: ${{ secrets.WEBSITE_LINEAR_ACCESS_KEY_STAGING }}
         run: |
           set -euo pipefail
           if [[ -z "${LINEAR_ACCESS_KEY_STAGING:-}" ]]; then
-            echo "::notice::LINEAR_ACCESS_KEY_STAGING is not set — create the Website Build Staging pipeline key and add it as this repository secret"
+            echo "::notice::WEBSITE_LINEAR_ACCESS_KEY_STAGING is not set — create the Website Build Staging pipeline key and add it as this repository secret"
             echo "configured=false" >> "$GITHUB_OUTPUT"
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
@@ -68,6 +91,9 @@ jobs:
         if: steps.linear.outputs.configured == 'true'
         uses: linear/linear-release-action@v0
         with:
-          access_key: ${{ secrets.LINEAR_ACCESS_KEY_STAGING }}
+          access_key: ${{ secrets.WEBSITE_LINEAR_ACCESS_KEY_STAGING }}
+          # Only commits that touched the website belong to this pipeline; the
+          # API and the worker record their own.
+          include_paths: "website/**"
           links: |
             CI run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
