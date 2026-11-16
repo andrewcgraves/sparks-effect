@@ -667,7 +667,44 @@ func assertMultimodalOptions(t *testing.T, body map[string]any) {
 	if ped["transit_start_end_max_distance"] != float64(valhalla.TransitStartEndMaxDistanceM) {
 		t.Errorf("transit_start_end_max_distance = %v, want %d", ped["transit_start_end_max_distance"], valhalla.TransitStartEndMaxDistanceM)
 	}
-	assertPedestrianCostingOptionsValhallaHonours(t, ped)
+	assertCostingOptionsValhallaHonours(t, "pedestrian", ped, pedestrianCostingOptionsValhallaHonours, "SPA-297")
+	assertTransitCostingPicksTheFastestRoute(t, opts)
+}
+
+var transitCostingOptionsValhallaHonours = map[string]struct{}{
+	"mode_factor":      {},
+	"wheelchair":       {},
+	"bicycle":          {},
+	"use_bus":          {},
+	"use_rail":         {},
+	"use_transfers":    {},
+	"transfer_cost":    {},
+	"transfer_penalty": {},
+	"filters":          {},
+}
+
+func assertTransitCostingPicksTheFastestRoute(t *testing.T, opts map[string]any) {
+	t.Helper()
+	// Literals from SPA-559, not the client's constants: 0.5 normalises every
+	// factor to 1.0, and a zero transfer penalty lets cost track elapsed time.
+	transit, _ := opts["transit"].(map[string]any)
+	if transit == nil {
+		t.Fatal("costing_options.transit missing (SPA-559)")
+	}
+	want := map[string]float64{
+		"use_bus":          0.5,
+		"use_rail":         0.5,
+		"use_transfers":    0.5,
+		"transfer_penalty": 0,
+	}
+	for key, w := range want {
+		if got, ok := transit[key].(float64); !ok || got != w {
+			t.Errorf("costing_options.transit.%s = %v, want %v (SPA-559)", key, transit[key], w)
+		}
+	}
+	// The allowlist is Valhalla 3.8.3's ParseTransitCostOptions
+	// (src/sif/transitcost.cc).
+	assertCostingOptionsValhallaHonours(t, "transit", transit, transitCostingOptionsValhallaHonours, "SPA-559")
 }
 
 var pedestrianCostingOptionsValhallaHonours = map[string]struct{}{
@@ -690,11 +727,11 @@ var pedestrianCostingOptionsValhallaHonours = map[string]struct{}{
 	"elevator_penalty":               {},
 }
 
-func assertPedestrianCostingOptionsValhallaHonours(t *testing.T, ped map[string]any) {
+func assertCostingOptionsValhallaHonours(t *testing.T, costing string, opts map[string]any, honoured map[string]struct{}, ticket string) {
 	t.Helper()
-	for key := range ped {
-		if _, ok := pedestrianCostingOptionsValhallaHonours[key]; !ok {
-			t.Errorf("costing_options.pedestrian.%s is not a key Valhalla's pedestrian costing engine reads; unknown keys are dropped silently (SPA-297)", key)
+	for key := range opts {
+		if _, ok := honoured[key]; !ok {
+			t.Errorf("costing_options.%s.%s is not a key Valhalla's %s costing engine reads; unknown keys are dropped silently (%s)", costing, key, costing, ticket)
 		}
 	}
 }

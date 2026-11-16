@@ -173,6 +173,41 @@ func TestAcceptanceSunsetRouteBoardsAService(t *testing.T) {
 }
 
 var (
+	twentyFifthAndAnza        = valhalla.LatLng{Lat: 37.7783, Lng: -122.4845}
+	financialDistrict         = valhalla.LatLng{Lat: 37.790, Lng: -122.397}
+	maxRichmondToDowntownSecs = 50 * 60
+)
+
+func TestAcceptanceRichmondPinReachesDowntownInBusTime(t *testing.T) {
+	// On production tiles at Mon 08:00 the 38R does this in 39.8 min and the
+	// N Judah Valhalla's default transit costing chose in 62.5 (SPA-559). The
+	// ceiling sits between the two. Operators reads "Muni" for both lines, so
+	// the time is the only thing that tells them apart.
+	client := acceptanceClient(t)
+	at := acceptanceDeparture(t)
+
+	route, err := client.Route(context.Background(), valhalla.RouteRequest{
+		Origin:      twentyFifthAndAnza,
+		Destination: financialDistrict,
+		Costing:     valhalla.CostingMultimodal,
+		DepartAt:    at,
+	})
+	if err != nil {
+		t.Fatalf("Route(25th Ave & Anza to the Financial District) departing %s: %v", at.Format(time.RFC3339), err)
+	}
+	t.Logf("25th Ave & Anza to the Financial District: %d s, operators %q", route.Time, route.Operators)
+	if !route.RodeTransit {
+		t.Fatalf("25th Ave & Anza to the Financial District departing %s walked the whole way (%d s, %.1f km)",
+			at.Format(time.RFC3339), route.Time, route.DistanceKm)
+	}
+	if route.Time > maxRichmondToDowntownSecs {
+		t.Errorf("25th Ave & Anza to the Financial District departing %s took %d s, want at most %d s; "+
+			"the 38R runs it in about 40 min, so costing_options.transit is not reaching Valhalla (SPA-559)",
+			at.Format(time.RFC3339), route.Time, maxRichmondToDowntownSecs)
+	}
+}
+
+var (
 	sanJoseState       = valhalla.LatLng{Lat: 37.3352, Lng: -121.8811}
 	santaTeresaStation = valhalla.LatLng{Lat: 37.2357, Lng: -121.7890}
 )

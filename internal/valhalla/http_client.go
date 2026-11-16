@@ -31,6 +31,11 @@ const (
 
 const TransitStartEndMaxDistanceM = 10000
 
+const (
+	transitNeutralPreference   = 0.5
+	transitTransferPenaltySecs = 0
+)
+
 const IsochroneDenoise = 0
 
 const dateTimeDepartAt = 1
@@ -108,9 +113,24 @@ func attachMultimodalOptions(body map[string]any, costing Costing, departAt time
 		"type":  dateTimeDepartAt,
 		"value": departAt.Format(dateTimeLayout),
 	}
+	// Valhalla returns the cheapest path by cost, not the fastest, and an
+	// isochrone keeps the seconds of the cheapest-cost label. Its default
+	// transit costing (use_bus 0.3, use_rail 0.6, use_transfers 0.3,
+	// transfer_penalty 300) prices a bus second at 2.89x a rail second and a
+	// transfer at ~14 minutes, so bus-served pins got slow rail routes and
+	// shrunken isochrones (SPA-559). At 0.5 every factor normalises to
+	// 1.0 and, with no transfer penalty, cost tracks elapsed time: a transfer
+	// still costs its 15 s transfer_cost and Valhalla still adds its real
+	// 60 s, so the cheapest path becomes the fastest one.
 	body["costing_options"] = map[string]any{
 		"pedestrian": map[string]any{
 			"transit_start_end_max_distance": TransitStartEndMaxDistanceM,
+		},
+		"transit": map[string]any{
+			"use_bus":          transitNeutralPreference,
+			"use_rail":         transitNeutralPreference,
+			"use_transfers":    transitNeutralPreference,
+			"transfer_penalty": transitTransferPenaltySecs,
 		},
 	}
 	return nil
