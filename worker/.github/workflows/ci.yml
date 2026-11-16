@@ -1,0 +1,195 @@
+name: CI
+
+# Tags are deliberately not a trigger here: a release promotes an image this
+# workflow already built and tested on `main`, and rebuilding it would defeat
+# that. See `release.yml`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  GO_VERSION: "1.26.11"
+
+jobs:
+  check:
+    name: Test, lint, vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Test (with RabbitMQ integration)
+        run: make itest
+
+      - name: Vet
+        run: make vet
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+
+      - name: Vulnerability scan
+        run: make vulncheck
+
+  contract:
+    name: API↔worker contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No setup-go: check-contract is curl and diff. Keep it that way — a
+      # variable that expands `go` anywhere in the Makefile puts a toolchain
+      # download in front of this job.
+      - name: Diff the golden fixtures against sparks-effect-api
+        run: make check-contract
+
+  build:
+    name: Build
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build
+        run: make build
+
+  publish:
+    name: Publish Docker image
+    needs: [check, build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # `sha-<commit>` is the promotable artifact: immutable, and what
+          # `release.yml` re-tags as `:prd` when a release tag names this
+          # commit. `staging` is a moving tag for whatever the trunk last
+          # built, and what the routing-worker-staging Railway service pins.
+          # No `latest` — a moving tag something deploys from is how
+          # production drifts with nobody choosing to move it.
+          tags: |
+            type=sha
+            type=raw,value=staging
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  # Moving `:staging` does not by itself make Railway pull it. Railway's own
+  # image auto-update polls GHCR and catches up within hours; this job is what
+  # makes a merge land on staging within a minute. It is its own job, not a
+  # step of `publish`, because the Railway token lives on the `production`
+  # GitHub environment (both worker services share one Railway environment,
+  # so one project token covers them) and the image publish should not wait
+  # on anything that environment ever requires.
+  deploy-staging:
+    name: Redeploy the staging Railway service
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      # Skipped with a notice when the token is not set, rather than failing
+      # a publish that did in fact push the image.
+      - name: Redeploy routing-worker-staging
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RAILWAY_TOKEN:-}" ]]; then
+            echo "::notice::RAILWAY_TOKEN is not set — image is tagged :staging; add a Railway project token to the production GitHub environment, or wait for Railway's image auto-update"
+            exit 0
+          fi
+
+          npm install --global @railway/cli
+
+          # The token is scoped to one Railway environment and that
+          # environment holds both worker services, so the service name is
+          # what keeps this off production.
+          railway redeploy --service routing-worker-staging --yes
+
+  # Staging is whatever `main` last published. Linear's staging pipeline is a
+  # separate stream from production because the two environments can (and do)
+  # hold different commits at the same time — see docs/releases.md.
+  linear-staging:
+    name: Record staging release in Linear
+    needs: [check, build, publish]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # linear-release-action scans commits since the last Linear release,
+          # which needs the full history.
+          fetch-depth: 0
+
+      # Secrets cannot be referenced in `if:` (GitHub treats that as a
+      # workflow-file error), so the empty check lives in a shell step and
+      # gates the action via an output, same idea as RAILWAY_TOKEN.
+      - name: Check for the staging pipeline key
+        id: linear
+        env:
+          LINEAR_ACCESS_KEY_STAGING: ${{ secrets.LINEAR_ACCESS_KEY_STAGING }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${LINEAR_ACCESS_KEY_STAGING:-}" ]]; then
+            echo "::notice::LINEAR_ACCESS_KEY_STAGING is not set — create the Worker Build Staging pipeline in Linear and add its access key as this repository secret"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # install.sh inside linear-release-action downloads its CLI with a bare
+      # curl and no retry, so a single connection reset from github.com fails
+      # the job (curl exit 35). curl reads $CURL_HOME/.curlrc before its own
+      # arguments, and the action's composite steps inherit $GITHUB_ENV, so
+      # this makes every curl in the action retry without forking it.
+      - name: Retry the Linear CLI download on transient network errors
+        if: steps.linear.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'retry = 5' 'retry-all-errors' 'retry-delay = 3' 'retry-max-time = 120' \
+            > "$RUNNER_TEMP/.curlrc"
+          echo "CURL_HOME=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Sync Linear staging release
+        if: steps.linear.outputs.configured == 'true'
+        uses: linear/linear-release-action@v0
+        with:
+          access_key: ${{ secrets.LINEAR_ACCESS_KEY_STAGING }}
+          links: |
+            CI run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Image=https://github.com/${{ github.repository }}/pkgs/container/sparks-effect-routing-worker
