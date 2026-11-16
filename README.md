@@ -328,9 +328,11 @@ collected.
 ### Liveness
 
 `GET /healthz` on the same listener answers 200 when the AMQP connection and
-channel are open and either no job is in progress or the current one started
-less than `WORKER_STUCK_AFTER` ago (a Go duration, default `10m`). Otherwise it
-answers 503 with the reason as plain text. The Deployment's liveness probe
+channel are open, either no job is in progress or the current one started
+less than `WORKER_STUCK_AFTER` ago (a Go duration, default `10m`), and Valhalla
+answers `GET /status` within 2 seconds. Otherwise it answers 503 with the reason
+as plain text. With `VALHALLA_SYNTHETIC=true` there is no Valhalla to ask, so
+that part always passes. The Deployment's liveness probe
 points at it, so a consumer that is connected but stuck gets restarted, and the
 message it had prefetched is redelivered because it was never acked.
 
@@ -340,6 +342,16 @@ has to exceed the longest real chain (SPA-436 measures it), or the probe kills
 healthy work. API reachability is deliberately not part of the check: an API
 outage already surfaces as transient job failures, and restarting every worker
 because the API is down would not bring it back.
+
+Valhalla is checked because a worker that holds its queue but cannot route
+fails every job it takes. The API is to ask `/healthz` over Railway's private
+network whether routing works (SPA-551), which the 30-second check-in to the
+API cannot tell it. The probe asks only when the broker and stuck-job checks have
+already passed, so a broken worker costs Valhalla nothing. On Railway nothing
+restarts the worker on a failing `/healthz`, since the service sets no
+healthcheck path. If one is ever set, note that a Valhalla outage would then
+fail every worker deploy, and restarting the worker would not bring Valhalla
+back.
 
 A `trace_id` field is attached to every log line written while a job is being
 processed, so one isochrone can be followed across both services on one value.

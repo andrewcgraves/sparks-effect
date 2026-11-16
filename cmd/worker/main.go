@@ -157,7 +157,7 @@ func run(cfg config.Config, log *logger.Logger) error {
 	consumer := worker.NewConsumer(cfg.AMQPURL, cfg.RoutingQueue, cfg.DeadLetterQueue, cfg.MaxRetries, handler, log, metrics.Process)
 	defer consumer.Close()
 
-	monitor := health.New(consumer, cfg.StuckAfter, time.Now)
+	monitor := health.New(consumer, routingClient, cfg.StuckAfter, time.Now)
 	consumer.TrackJobs(monitor)
 	metrics.Process.ObserveJobInProgress(monitor.InProgress)
 

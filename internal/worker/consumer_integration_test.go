@@ -69,7 +69,7 @@ func (h *harness) run(t *testing.T, maxRetries int) (stop, kill func()) {
 	handler := worker.NewHandler(h.store, h.client, valhalla.DefaultLimits(), cache, logger.Discard(), h.metrics)
 	consumer := worker.NewConsumer(h.url, testQueue, testDeadLetter, maxRetries, handler, logger.Discard(), h.metrics)
 	if h.stuckAfter > 0 {
-		h.health = health.New(consumer, h.stuckAfter, time.Now)
+		h.health = health.New(consumer, nil, h.stuckAfter, time.Now)
 		consumer.TrackJobs(h.health)
 	}
 
