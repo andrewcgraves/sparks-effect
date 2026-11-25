@@ -69,7 +69,7 @@ func normalizeBaseURL(raw string) (string, error) {
 }
 
 func (c *Client) ping(ctx context.Context) error {
-	resp, err := c.do(ctx, http.MethodGet, pathWorkerReady, nil)
+	resp, _, err := c.do(ctx, http.MethodGet, pathWorkerReady, nil)
 	if err != nil {
 		return fmt.Errorf("store: pinging API: %w", err)
 	}
@@ -133,7 +133,7 @@ type jobFailedBody struct {
 }
 
 func (c *Client) transition(ctx context.Context, path, jobID string, body any) error {
-	resp, err := c.do(ctx, http.MethodPost, path, body)
+	resp, sent, err := c.do(ctx, http.MethodPost, path, body)
 	if err != nil {
 		return fmt.Errorf("store: updating routing job %s: %w", jobID, err)
 	}
@@ -143,6 +143,8 @@ func (c *Client) transition(ctx context.Context, path, jobID string, body any) e
 		return nil
 	case http.StatusNotFound:
 		return fmt.Errorf("%w: %s", ErrJobNotFound, jobID)
+	case http.StatusRequestEntityTooLarge:
+		return fmt.Errorf("%w: updating routing job %s: %d bytes", ErrBodyTooLarge, jobID, sent)
 	default:
 		return fmt.Errorf("store: updating routing job %s: status %d: %s", jobID, resp.StatusCode, readErrorBody(resp.Body))
 	}
@@ -172,7 +174,7 @@ func (c *Client) Get(ctx context.Context, keys []IsochroneKey) (map[IsochroneKey
 		return found, nil
 	}
 
-	resp, err := c.do(ctx, http.MethodPost, pathCacheLookup, cacheLookupRequest{Keys: keys})
+	resp, _, err := c.do(ctx, http.MethodPost, pathCacheLookup, cacheLookupRequest{Keys: keys})
 	if err != nil {
 		return nil, fmt.Errorf("store: reading isochrone cache: %w", err)
 	}
@@ -196,35 +198,43 @@ func (c *Client) Put(ctx context.Context, entries []CachedIsochrone) error {
 		return nil
 	}
 
-	resp, err := c.do(ctx, http.MethodPost, pathCachePut, cachePutRequest{Entries: entries})
+	resp, sent, err := c.do(ctx, http.MethodPost, pathCachePut, cachePutRequest{Entries: entries})
 	if err != nil {
 		return fmt.Errorf("store: writing isochrone cache: %w", err)
 	}
 	defer drain(resp.Body)
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		return fmt.Errorf("%w: writing isochrone cache: %d bytes", ErrBodyTooLarge, sent)
+	}
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("store: writing isochrone cache: status %d: %s", resp.StatusCode, readErrorBody(resp.Body))
 	}
 	return nil
 }
 
-func (c *Client) do(ctx context.Context, method, path string, body any) (*http.Response, error) {
+func (c *Client) do(ctx context.Context, method, path string, body any) (*http.Response, int, error) {
+	// The byte count is what a 413 reports, so the next body the API turns
+	// away says how far past its cap it was (SPA-561).
 	var rdr io.Reader
+	sent := 0
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			return nil, fmt.Errorf("marshal request: %w", err)
+			return nil, 0, fmt.Errorf("marshal request: %w", err)
 		}
 		rdr = bytes.NewReader(b)
+		sent = len(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, rdr)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	return c.httpClient.Do(req)
+	resp, err := c.httpClient.Do(req)
+	return resp, sent, err
 }
 
 func drain(r io.ReadCloser) {

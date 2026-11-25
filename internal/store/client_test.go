@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -607,5 +608,41 @@ func TestHeartbeatReportsAFailedBeatAndKeepsGoing(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatalf("saw %d failed beats, want 2: a failure must not stop the heartbeat", i)
 		}
+	}
+}
+
+func TestRefusedBodiesAreTooLargeAndSayHowBig(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/internal/worker" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := store.Connect(context.Background(), srv.URL, "any", 0)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	result := json.RawMessage(`{"pad":"` + strings.Repeat("x", 1000) + `"}`)
+	err = client.MarkSucceeded(context.Background(), testJobID, store.Succeeded{Result: result})
+	if !errors.Is(err, store.ErrBodyTooLarge) {
+		t.Fatalf("MarkSucceeded against a 413 = %v, want ErrBodyTooLarge", err)
+	}
+	if errors.Is(err, store.ErrJobNotFound) {
+		t.Error("a 413 was reported as ErrJobNotFound; the job would be discarded unfailed")
+	}
+	if !strings.Contains(err.Error(), " bytes") {
+		t.Errorf("error %q does not say how big the refused body was", err)
+	}
+
+	err = client.Put(context.Background(), []store.CachedIsochrone{{
+		Key:      store.IsochroneKey{CompileJobID: "c1", StationSlug: "north", Mode: "drive", ContourMins: 240},
+		Geometry: result,
+	}})
+	if !errors.Is(err, store.ErrBodyTooLarge) {
+		t.Fatalf("Put against a 413 = %v, want ErrBodyTooLarge", err)
 	}
 }

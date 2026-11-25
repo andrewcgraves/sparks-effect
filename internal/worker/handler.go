@@ -145,6 +145,11 @@ func (h *Handler) handle(ctx context.Context, msg routing.Message, decodeErr err
 			h.log.Warn(ctx, "routing: job has no row to complete; discarding", "job_id", msg.RoutingJobID)
 			return Result{Outcome: OutcomePermanent, JobID: msg.RoutingJobID, Err: err}
 		}
+		// A retry would route the whole chain again only to send the same
+		// bytes, while the visitor waits for nothing (SPA-561).
+		if errors.Is(err, store.ErrBodyTooLarge) {
+			return h.fail(ctx, msg.RoutingJobID, fmt.Errorf("routing: result too large to save: %w", err))
+		}
 
 		return Result{Outcome: OutcomeTransient, JobID: msg.RoutingJobID, Err: err}
 	}
@@ -178,7 +183,8 @@ func isPermanent(err error) bool {
 		errors.Is(err, isochrone.ErrInvalidMode),
 
 		errors.Is(err, isochrone.ErrRoutingRejected),
-		errors.Is(err, store.ErrJobNotFound):
+		errors.Is(err, store.ErrJobNotFound),
+		errors.Is(err, store.ErrBodyTooLarge):
 		return true
 	default:
 		return false
