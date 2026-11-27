@@ -1,5 +1,73 @@
 {
   "attribution": {
     "sessionUrl": false
+  },
+  "permissions": {
+    "allow": [
+      "Bash(make *)",
+      "Bash(go test *)",
+      "Bash(npm ci *)",
+      "Bash(npm run *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(git branch)",
+      "Bash(git branch -a)",
+      "Bash(git branch -r)",
+      "Bash(git branch -v)",
+      "Bash(git branch -vv)",
+      "Bash(git branch --list)",
+      "Bash(git branch --show-current)",
+      "Bash(git rev-parse *)",
+      "Bash(git ls-files *)",
+      "Bash(git blame *)",
+      "Bash(git merge-base *)",
+      "Bash(git describe *)",
+      "Bash(git remote -v)",
+      "Bash(git worktree list *)",
+      "Bash(git stash list *)"
+    ],
+    "deny": [
+      "Bash(git tag *)",
+      "Bash(git update-ref refs/tags/*)",
+      "Bash(git push *--tags*)",
+      "Bash(git push *--mirror*)",
+      "Bash(git push *refs/tags/*)",
+      "Bash(git push *api/v*)",
+      "Bash(git push *worker/v*)",
+      "Bash(git push *website/v*)",
+      "Bash(git push * v*)",
+      "Bash(gh release create *)",
+      "Bash(gh api *refs/tags*)",
+      "Bash(gh api *git/tags*)",
+      "Bash(railway *)",
+      "Bash(npx railway *)",
+      "Bash(npx @railway/cli *)",
+      "Bash(vercel *)",
+      "Bash(npx vercel *)",
+      "Bash(gh variable *)",
+      "Bash(gh secret *)",
+      "Bash(gh api *variables*)",
+      "Bash(gh api *secrets*)",
+      "Bash(gh api *rulesets*)",
+      "Bash(gh api *branches/*/protection*)",
+      "Bash(gh repo edit *)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash",
+            "args": ["${CLAUDE_PROJECT_DIR}/.claude/hooks/format-edited-file.sh"],
+            "timeout": 30
+          }
+        ]
+      }
+    ]
   }
 }
