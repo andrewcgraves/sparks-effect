@@ -124,6 +124,9 @@ jobs:
       # merged branch, whose commits were never built.
       - name: Resolve the image commit
         id: src
+        # The paths below are relative to the repository root, not to `worker/`
+        # (this workflow's default): from there they match nothing.
+        working-directory: .
         run: |
           set -euo pipefail
           sha="$(git rev-list -1 --first-parent "$GITHUB_SHA" -- \
