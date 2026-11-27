@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -471,6 +472,24 @@ func TestHandle_storeFailuresAreTransient(t *testing.T) {
 			t.Errorf("Outcome = %v, want transient — the chain succeeded, only the write failed", res.Outcome)
 		}
 	})
+}
+
+// The API answers the same bytes the same way, so a refused result fails the
+// job at once rather than routing the chain again on every retry (SPA-561).
+func TestHandle_resultTooLargeToSaveFailsTheJob(t *testing.T) {
+	s := &fakeStore{succeededErr: fmt.Errorf("%w: updating routing job j: 9000000 bytes", store.ErrBodyTooLarge)}
+	res := newHandler(s, valhalla.NewSyntheticClient()).Handle(context.Background(), goldenMessage(t))
+
+	if res.Outcome != worker.OutcomePermanent {
+		t.Errorf("Outcome = %v, want permanent (err %v)", res.Outcome, res.Err)
+	}
+	states, _, errMsg := s.snapshot()
+	if len(states) == 0 || states[len(states)-1] != store.StatusFailed {
+		t.Errorf("states = %v, want to end at failed", states)
+	}
+	if !strings.Contains(errMsg, "too large to save") {
+		t.Errorf("failure message = %q, want it to name the refused save", errMsg)
+	}
 }
 
 func TestHandle_missingRowIsPermanent(t *testing.T) {

@@ -16,6 +16,8 @@ const (
 
 var ErrJobNotFound = errors.New("store: routing job not found")
 
+var ErrBodyTooLarge = errors.New("store: API refused the request body as too large")
+
 type RoutingJobStore interface {
 	MarkRunning(ctx context.Context, jobID string) error
 	MarkSucceeded(ctx context.Context, jobID string, done Succeeded) error
