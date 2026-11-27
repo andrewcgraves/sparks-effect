@@ -11,6 +11,39 @@ Read the service's own `CLAUDE.md` before working in it; its rules apply to
 everything under that directory. Run commands from the service directory
 (`make -C api test`), not from the root.
 
+## Repo map
+
+- `api/`, `worker/`, `website/`: the three services, each with its own
+  `CLAUDE.md`.
+- `.github/`: workflows, CODEOWNERS, the PR and issue templates, and the
+  rulesets as JSON in `.github/rulesets/`.
+- `scripts/`: repository scripts, such as the import from the old repos.
+- `docs/`: the cutover from the old per-service repositories.
+
+## Commands
+
+- `make help` (or `make`): list the root targets.
+- `make prepush`: run before every push. Lint, unit tests and build for every
+  service, plus `make check-contract`. No Docker; a few minutes.
+- `make ci`: `make prepush` plus the API and worker Docker integration tests.
+  Run it when a change touches code the integration tests cover: the API's
+  Postgres persistence and migrations, and the RabbitMQ queue on either side.
+- `make doctor`: check that Go, Node and Docker match what the services ask for.
+
+## Pull requests
+
+Fill in every heading of `.github/pull_request_template.md`. A body passed with
+`gh pr create --body` skips the template, so write its headings into the body.
+Say what changed and how it was checked; leave out process notes.
+
+## What agents never do
+
+- Create or push tags. Tags release to production.
+- Set repository variables or secrets, or change repository settings.
+- Run `railway` or `vercel` commands.
+- Edit or apply rulesets.
+- Copy anything from `kustomize-config`.
+
 ## What is shared
 
 - **Workflows** live only in the root `.github/workflows/`, one CI and one

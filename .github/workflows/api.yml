@@ -1,34 +1,25 @@
 name: API
 
-# The API's CI. It runs for changes under `api/`, to the worker's golden
-# fixtures (the contract job diffs them against the API's copies) and to this
-# file, so a website or worker change does not pay for the API's suite.
+# The API's CI. `ci.yml` calls it for changes under `api/`, to the worker's
+# golden fixtures (the contract job diffs them against the API's copies) and
+# to this file, so a website or worker change does not pay for the API's
+# suite. A called workflow sees the caller's event, so `github.event_name` and
+# `github.ref` below are those of the push or pull request that started
+# `ci.yml`.
 #
-# The same path list appears three times: both triggers below and the
-# `Resolve the image commit` step of the publish job. `api-release.yml` holds
-# a fourth copy. Change them together — the release finds an image by asking
-# git for the last commit that touched these paths.
+# The same path list appears twice: the `api` filter of `ci.yml`'s `changes`
+# job and the `Resolve the image commit` step of the publish job.
+# `api-release.yml` holds a third copy. Change them together — the release
+# finds an image by asking git for the last commit that touched these paths.
 #
 # Tags are deliberately not a trigger here: a release promotes an image this
 # workflow already built and tested on `main`, and rebuilding it would defeat
 # that. See `api-release.yml`.
 on:
-  push:
-    branches: [main]
-    paths:
-      - api/**
-      - worker/internal/routing/testdata/**
-      - worker/internal/store/testdata/**
-      - .github/workflows/api.yml
-  pull_request:
-    paths:
-      - api/**
-      - worker/internal/routing/testdata/**
-      - worker/internal/store/testdata/**
-      - .github/workflows/api.yml
+  workflow_call:
   # Run from `main`, this publishes like a push does. It is how a commit whose
   # push did not publish (the staging gate was still off, or the push's net
-  # diff left the paths above untouched) gets its image.
+  # diff left the paths in `ci.yml` untouched) gets its image.
   workflow_dispatch:
 
 # Nothing here writes to the repository. A pull request from a fork gets this
@@ -51,12 +42,12 @@ jobs:
     name: Test, lint, vet
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The exact patch comes from go.mod's `go` directive, which is the floor
       # every toolchain must meet. It moves together with the Dockerfile's
       # golang image.
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: api/go.mod
           cache-dependency-path: api/go.sum
@@ -76,7 +67,7 @@ jobs:
         run: make vet
 
       - name: Lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.12.2
           working-directory: api
@@ -98,7 +89,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # No setup-go and no network: check-contract is a diff between two
       # directories of the same checkout.
@@ -110,9 +101,9 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: api/go.mod
           cache-dependency-path: api/go.sum
@@ -133,7 +124,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The step below walks history to name the image.
           fetch-depth: 0
@@ -167,10 +158,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -178,7 +169,7 @@ jobs:
 
       - name: Extract image metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
           # `sha-<commit>` is the promotable artifact: immutable, and what
@@ -192,7 +183,7 @@ jobs:
             type=raw,value=staging
 
       - name: Build and push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: api
           push: true
@@ -212,7 +203,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # linear-release-action scans commits since the last Linear release,
           # which needs the full history.
@@ -249,7 +240,7 @@ jobs:
 
       - name: Sync Linear staging release
         if: steps.linear.outputs.configured == 'true'
-        uses: linear/linear-release-action@v0
+        uses: linear/linear-release-action@cfd42077dccdc0c26a38589934e2aa11046f57b7 # v0.18.3
         with:
           access_key: ${{ secrets.API_LINEAR_ACCESS_KEY_STAGING }}
           # Only commits that touched the API belong to this pipeline; the

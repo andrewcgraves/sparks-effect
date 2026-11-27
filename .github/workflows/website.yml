@@ -1,17 +1,12 @@
 name: Website
 
-# The website's CI. It only runs for changes under `website/` (or to this
-# file), so an API or worker change does not pay for a frontend build.
+# The website's CI. `ci.yml` only calls it for changes under `website/` (or to
+# this file), so an API or worker change does not pay for a frontend build. A
+# called workflow sees the caller's event, so `github.event_name` and
+# `github.ref` below are those of the push or pull request that started
+# `ci.yml`.
 on:
-  push:
-    branches: [main]
-    paths:
-      - website/**
-      - .github/workflows/website.yml
-  pull_request:
-    paths:
-      - website/**
-      - .github/workflows/website.yml
+  workflow_call:
   workflow_dispatch:
 
 # Nothing here writes to the repository. A pull request from a fork gets this
@@ -33,8 +28,8 @@ jobs:
   ci:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: website/.nvmrc
           cache: npm
@@ -65,7 +60,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # linear-release-action scans commits since the last Linear release,
           # which needs the full history.
@@ -89,7 +84,7 @@ jobs:
 
       - name: Sync Linear staging release
         if: steps.linear.outputs.configured == 'true'
-        uses: linear/linear-release-action@v0
+        uses: linear/linear-release-action@cfd42077dccdc0c26a38589934e2aa11046f57b7 # v0.18.3
         with:
           access_key: ${{ secrets.WEBSITE_LINEAR_ACCESS_KEY_STAGING }}
           # Only commits that touched the website belong to this pipeline; the

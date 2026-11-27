@@ -1,0 +1,121 @@
+name: CI
+
+# The one entry point for the services' CI. The `changes` job decides which
+# services a push or pull request touched, and each service's own workflow
+# (`api.yml`, `worker.yml`, `website.yml`) is called only when it did, so each
+# runs once per event. `ci-ok` is the single required check: it is green only
+# when no job failed or was cancelled, and a service that was skipped because
+# nothing of it changed counts as fine.
+#
+# The service workflows' publish and staging jobs still gate themselves on
+# `github.event_name`, `github.ref` and the STAGING_DEPLOY_ENABLED repository
+# variable. A called workflow sees this workflow's event and `vars`, so those
+# conditions mean what they did when each workflow had its own triggers.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Runs every service, whatever changed. Run from `main`, the service
+  # workflows publish as they would on a push (while STAGING_DEPLOY_ENABLED is
+  # 'true'). To run one service alone, run its own workflow by hand.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels the run it supersedes. On `main`,
+# every run has its own group, so no run is ever cancelled or held back by
+# another: each push's publish must happen.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      api: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.api == 'true' }}
+      worker: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.worker == 'true' }}
+      website: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.website == 'true' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          persist-credentials: false
+      # Each list is the service's former `on.push.paths` / `on.pull_request.paths`,
+      # unchanged. The API and worker lists must also match the `Resolve the
+      # image commit` step of that service's workflow and its release workflow.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          filters: |
+            api:
+              - 'api/**'
+              - 'worker/internal/routing/testdata/**'
+              - 'worker/internal/store/testdata/**'
+              - '.github/workflows/api.yml'
+            worker:
+              - 'worker/**'
+              - 'api/internal/routing/testdata/**'
+              - 'api/internal/handler/testdata/**'
+              - '.github/workflows/worker.yml'
+            website:
+              - 'website/**'
+              - '.github/workflows/website.yml'
+
+  api:
+    name: API
+    needs: changes
+    if: needs.changes.outputs.api == 'true'
+    # A called workflow's jobs can only narrow what the caller grants, and
+    # api.yml's publish job asks for packages: write.
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/api.yml
+    secrets: inherit
+
+  worker:
+    name: Worker
+    needs: changes
+    if: needs.changes.outputs.worker == 'true'
+    # worker.yml's publish job asks for packages: write.
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/worker.yml
+    secrets: inherit
+
+  website:
+    name: Website
+    needs: changes
+    if: needs.changes.outputs.website == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/website.yml
+    secrets: inherit
+
+  ci-ok:
+    if: always()
+    needs:
+      - changes
+      - api
+      - worker
+      - website
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check results of all jobs
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<<"$NEEDS" >/dev/null; then
+            echo "::error::At least one CI job failed or was cancelled."
+            exit 1
+          fi

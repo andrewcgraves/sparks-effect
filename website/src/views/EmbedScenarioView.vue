@@ -46,7 +46,10 @@ const {
   progress: isochroneProgress,
   generate,
   show: showIsochrone,
-} = useIsochrone(() => stations.value, { offline: () => offline.value })
+} = useIsochrone(() => stations.value, {
+  offline: () => offline.value,
+  hasExamples: () => hasExamples.value === true,
+})
 
 async function plot(payload: IsochronePayload): Promise<void> {
   selectedPrerenderedId.value = null
@@ -91,7 +94,7 @@ const siteHref = computed(() => fullPageHref(window.location.origin, { kind: 'sc
     <EmbedUnavailable v-if="failed" />
     <template v-else>
       <MapView
-        label="Splash zone map"
+        label="Travel zone map"
         :without-map="PLOT_WITHOUT_MAP"
         flush
         hide-isochrone-legend
