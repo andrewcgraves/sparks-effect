@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
+import { createPinia, setActivePinia } from 'pinia'
 import CopyEmbedButton from './CopyEmbedButton.vue'
+import { useAuthStore } from '../stores/auth'
 import { mountSharedHosts } from '../test/sharedHosts'
 import { testRouterAt } from '../test/router'
 import { seriousA11yViolations } from '../test/axe'
@@ -12,6 +14,9 @@ describe('CopyEmbedButton', () => {
   const writeText = vi.fn()
 
   beforeEach(() => {
+    window.localStorage.clear()
+    setActivePinia(createPinia())
+    useAuthStore().signIn('tok-1', { id: 'u1', email: 'a@example.com' })
     hosts = mountSharedHosts()
     execCommand.mockReset()
     writeText.mockReset().mockResolvedValue(undefined)
@@ -34,6 +39,18 @@ describe('CopyEmbedButton', () => {
     await wrapper.get('[data-testid="copy-embed"]').trigger('click')
     return wrapper
   }
+
+  // SPA-563: kept for signed-in accounts until embeds launch to everyone.
+  it('shows nothing to a visitor who is not signed in', async () => {
+    useAuthStore().signOut()
+    const router = await testRouterAt('/scenario/ca-hsr')
+    const wrapper = mount(CopyEmbedButton, {
+      props: { target: { kind: 'scenario', slug: 'ca-hsr' }, name: 'X' },
+      global: { plugins: [router] },
+    })
+    expect(wrapper.find('[data-testid="copy-embed"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="copy-embed-options"]').exists()).toBe(false)
+  })
 
   it('offers the code only once asked, as two snippets and a hint', async () => {
     const router = await testRouterAt('/scenario/ca-hsr')
@@ -59,7 +76,7 @@ describe('CopyEmbedButton', () => {
     expect(writeText).toHaveBeenCalledWith(
       `<iframe src="${window.location.origin}/embed/scenario/ca-hsr?at=37.3382%2C-121.8863&amp;mode=transit&amp;mins=60"\n` +
       '  width="100%" height="480" loading="lazy" style="border:0"\n' +
-      '  title="California High-Speed Rail splash zone on Sparks Effect"></iframe>',
+      '  title="California High-Speed Rail travel zone on Sparks Effect"></iframe>',
     )
     expect(hosts.toasts()).toEqual(['Embed code copied'])
   })
