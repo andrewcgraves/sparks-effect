@@ -99,7 +99,7 @@ by hand in the project:
   `main`. If it is, every merge ships to production behind the workflow's back,
   which is the thing this setup exists to prevent. Keep production pointed at a
   branch nobody pushes; production then only ever moves by promotion.
-- **Ignored Build Step** (Settings → Git): choose *Run my Bash script* and
+- **Ignored Build Step** (Settings → Build and Deployment): choose *Run my Bash script* and
   paste
 
   ```sh
@@ -111,7 +111,8 @@ by hand in the project:
   (skip) when nothing under `website/` differs from `VERCEL_GIT_PREVIOUS_SHA`,
   the commit of the last deployment Vercel made for the branch, and exits 1
   (build) otherwise. It also builds when that SHA is unset or is not in
-  Vercel's clone.
+  Vercel's clone, and it always builds a production deployment, so the
+  release workflow's production rebuild of a preview is never cancelled.
 - `main`'s deployments should be built with the same environment variables
   production uses. Vercel rebuilds on promotion when a deployment was built for
   a different environment, and a rebuild is no longer the artifact staging ran.

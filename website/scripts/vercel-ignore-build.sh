@@ -9,11 +9,20 @@
 # deployment, a previous commit missing from Vercel's shallow clone, or a git
 # error.
 #
+# A production deployment always builds. The Website release workflow only
+# asks for one when it needs a production build of a preview, and that build's
+# previous SHA is the same commit, so the diff check would cancel it.
+#
 # Vercel runs this with the project's Root Directory (website) as the working
 # directory. The setting to paste is in docs/releases.md.
 
 # The directory above this script is website/, wherever it was called from.
 cd "$(dirname "$0")/.." || exit 1
+
+if [[ "${VERCEL_ENV:-}" == "production" ]]; then
+  echo "Production deployment: building."
+  exit 1
+fi
 
 previous="${VERCEL_GIT_PREVIOUS_SHA:-}"
 
